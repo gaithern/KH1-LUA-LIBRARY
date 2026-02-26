@@ -1,0 +1,53 @@
+title: KH1 Standalone Lua Library
+originalAuthor: Gicu
+description: Lua Library Independent of Rando
+dependencies:
+assets:
+- name: scripts/io_packages/EGSGlobal_1_0_0_10.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/EGSGlobal_1_0_0_10.lua
+- name: scripts/io_packages/EGSGlobal_1_0_0_8.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/EGSGlobal_1_0_0_8.lua
+- name: scripts/io_packages/EGSGlobal_1_0_0_9.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/EGSGlobal_1_0_0_9.lua
+- name: scripts/io_packages/EGSJP_1_0_0_10.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/EGSJP_1_0_0_10.lua
+- name: scripts/io_packages/EGSJP_1_0_0_8.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/EGSJP_1_0_0_8.lua
+- name: scripts/io_packages/EGSJP_1_0_0_9.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/EGSJP_1_0_0_9.lua
+- name: scripts/io_packages/kh1_lua_library.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/kh1_lua_library.lua
+- name: scripts/io_packages/SteamGlobal_1_0_0_1.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/SteamGlobal_1_0_0_1.lua
+- name: scripts/io_packages/SteamGlobal_1_0_0_2.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/SteamGlobal_1_0_0_2.lua
+- name: scripts/io_packages/SteamJP_1_0_0_1.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/SteamJP_1_0_0_1.lua
+- name: scripts/io_packages/SteamJP_1_0_0_2.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/SteamJP_1_0_0_2.lua
+- name: scripts/io_packages/VersionCheck.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/VersionCheck.lua
