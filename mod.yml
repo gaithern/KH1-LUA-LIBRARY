@@ -1,7 +1,6 @@
 title: KH1 Standalone Lua Library
 originalAuthor: Gicu
 description: Lua Library Independent of Rando
-dependencies:
 assets:
 - name: scripts/io_packages/EGSGlobal_1_0_0_10.lua
   method: copy
