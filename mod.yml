@@ -1,6 +1,6 @@
-title: KH1 Standalone Lua Library
+title: KH1 Lua Library
 originalAuthor: Gicu
-description: Lua Library Independent of Rando
+description: Library of Lua functions for use in rando and other mods
 assets:
 - name: scripts/io_packages/EGSGlobal_1_0_0_10.lua
   method: copy
