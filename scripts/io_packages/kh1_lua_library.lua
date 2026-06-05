@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global
 -- ################################################################################################### --
 -- #  ____  __.___ ___  ____  .____                   .____    ._____.                               # --
 -- # |    |/ _/   |   \/_   | |    |    __ _______    |    |   |__\_ |______________ _______ ___.__. # --
@@ -17,7 +18,7 @@
 -- ########### --
 -- # Helpers # --
 -- ########### --
-function byte_to_bits(byte)
+local function byte_to_bits(byte)
     local bits = {}
     for i = 0, 7 do
         bits[i + 1] = (byte >> i) & 1  -- LSB first
@@ -25,7 +26,7 @@ function byte_to_bits(byte)
     return bits
 end
 
-function bits_to_byte(bits)
+local function bits_to_byte(bits)
     assert(#bits == 8, "bits_to_byte expects exactly 8 bits")
     local byte = 0
     for i = 1, 8 do
@@ -34,24 +35,24 @@ function bits_to_byte(bits)
     return byte
 end
 
-function ReadBits(address, absolute)
+local function ReadBits(address, absolute)
     if absolute == nil then absolute = false end
     return byte_to_bits(ReadByte(address, absolute))
 end
 
-function ReadBit(address, bit_num, absolute)
+local function ReadBit(address, bit_num, absolute)
     if absolute == nil then absolute = false end
     return byte_to_bits(ReadByte(address, absolute))[bit_num]
 end
 
-function WriteBit(address, bit_num, value, absolute)
+local function WriteBit(address, bit_num, value, absolute)
     if absolute == nil then absolute = false end
     local bits = ReadBits(address, absolute)
     bits[bit_num] = (value ~= 0) and 1 or 0
     WriteByte(address, bits_to_byte(bits), absolute)
 end
 
-function contains(tbl, val)
+local function contains(tbl, val)
     for _, v in ipairs(tbl) do
         if v == val then
             return true
@@ -60,7 +61,7 @@ function contains(tbl, val)
     return false
 end
 
-function index(tbl, val)
+local function get_index(tbl, val)
     for k, v in ipairs(tbl) do
         if v == val then
             return k
@@ -69,7 +70,7 @@ function index(tbl, val)
     return nil
 end
 
-function merge_tables(t1, t2)
+local function merge_tables(t1, t2)
     for _, value in ipairs(t2) do
         table.insert(t1, value)
     end
@@ -79,43 +80,43 @@ end
 -- ########### --
 -- # Getters # --
 -- ########### --
-function get_world()
+local function get_world()
     return ReadByte(world)
 end
 
-function get_room()
+local function get_room()
     return ReadByte(room)
 end
 
-function get_animation_speed()
+local function get_animation_speed()
     return ReadFloat(GetPointer(soraHUD - 0xA94) + 0x284, true)
 end
 
-function get_current_animation()
+local function get_current_animation()
     return ReadByte(ReadLong(soraPointer)+0x164, true)
 end
 
-function get_ground_combo_length_limit()
+local function get_ground_combo_length_limit()
     return ReadByte(soraHP + 0x98)
 end
 
-function get_air_combo_length_limit()
+local function get_air_combo_length_limit()
     return ReadByte(soraHP + 0x99)
 end
 
-function get_animation_time()
+local function get_animation_time()
     return ReadFloat(ReadLong(soraPointer)+0x16C, true)
 end
 
-function get_stock()
+local function get_stock()
     return ReadArray(inventory, 255)
 end
 
-function get_stock_at_index(index)
+local function get_stock_at_index(index)
     return ReadByte(inventory + index - 1)
 end
 
-function get_sora_abilities()
+local function get_sora_abilities()
     local abilities = {}
     local i = 0
     while ReadByte(soraCurAbilities + i) ~= 0 and i <= 48 do
@@ -128,8 +129,8 @@ function get_sora_abilities()
     return abilities
 end
 
-function get_shared_abilities()
-    shared_abilities = {}
+local function get_shared_abilities()
+    local shared_abilities = {}
     local i = 0
     while ReadByte(sharedAbilities + i) ~= 0 and i <= 8 do
         local shared_ability_value_bits = byte_to_bits(ReadByte(sharedAbilities + i))
@@ -141,7 +142,7 @@ function get_shared_abilities()
     return shared_abilities
 end
 
-function get_equipped_sora_abilities()
+local function get_equipped_sora_abilities()
     local abilities = {}
     local i = 0
     while ReadByte(soraCurAbilities + i) ~= 0 and i <= 48 do
@@ -156,7 +157,7 @@ function get_equipped_sora_abilities()
     return abilities
 end
 
-function get_equipped_shared_abilities()
+local function get_equipped_shared_abilities()
     local shared_abilities = {}
     local i = 0
     while ReadByte(sharedAbilities + i) ~= 0 and i <= 48 do
@@ -171,41 +172,41 @@ function get_equipped_shared_abilities()
     return shared_abilities
 end
 
-function get_soras_accessory_slots()
+local function get_soras_accessory_slots()
     return ReadByte(maxHP + 0x16)
 end
 
-function get_soras_equipped_accessories()
+local function get_soras_equipped_accessories()
     return ReadArray(maxHP + 0x17, get_soras_accessory_slots())
 end
 
-function get_inputs()
+local function get_inputs()
     return ReadArray(inputAddress, 4)
 end
 
-function get_spell_effectiveness(spell)
+local function get_spell_effectiveness(spell)
     local memory_location = nil
-        if spell == "Fire"     then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x00
-    elseif spell == "Fira"     then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x01
-    elseif spell == "Firaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x02
-    elseif spell == "Blizzard" then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x03
-    elseif spell == "Blizzara" then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x04
-    elseif spell == "Blizzaga" then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x05
-    elseif spell == "Thunder"  then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x06
-    elseif spell == "Thundara" then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x07
-    elseif spell == "Thundaga" then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x08
-    elseif spell == "Cure"     then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x09
-    elseif spell == "Cura"     then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x0A
-    elseif spell == "Curaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x0B
-    elseif spell == "Gravity"  then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x0C
-    elseif spell == "Gravira"  then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x0D
-    elseif spell == "Graviga"  then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x0E
-    elseif spell == "Stop"     then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x0F
-    elseif spell == "Stopra"   then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x10
-    elseif spell == "Stopga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x11
-    elseif spell == "Aero"     then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x12
-    elseif spell == "Aerora"   then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x13
-    elseif spell == "Aeroga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + 0x14 end
+        if spell == "Fire"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x00)
+    elseif spell == "Fira"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x01)
+    elseif spell == "Firaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x02)
+    elseif spell == "Blizzard" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x03)
+    elseif spell == "Blizzara" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x04)
+    elseif spell == "Blizzaga" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x05)
+    elseif spell == "Thunder"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x06)
+    elseif spell == "Thundara" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x07)
+    elseif spell == "Thundaga" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x08)
+    elseif spell == "Cure"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x09) - 0x34
+    elseif spell == "Cura"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x0A) - 0x34
+    elseif spell == "Curaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x0B) - 0x34
+    elseif spell == "Gravity"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x0C)
+    elseif spell == "Gravira"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x0D)
+    elseif spell == "Graviga"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x0E)
+    elseif spell == "Stop"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x0F)
+    elseif spell == "Stopra"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x10)
+    elseif spell == "Stopga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x11)
+    elseif spell == "Aero"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x12)
+    elseif spell == "Aerora"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x13)
+    elseif spell == "Aeroga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x14) end
     if memory_location then
         return ReadByte(memory_location)
     else
@@ -213,11 +214,11 @@ function get_spell_effectiveness(spell)
     end
 end
 
-function get_current_hits()
+local function get_current_hits()
     return ReadByte(currentHits)
 end
 
-function get_sora_pos()
+local function get_sora_pos()
     --Returns a table of Sora's X,Y,Z Coords
     local pos = {}
     local currSoraPointer = GetPointer(soraPointer)
@@ -227,34 +228,38 @@ function get_sora_pos()
     return pos
 end
 
+local function get_gummi_qty_at_index(index)
+    return ReadByte(gummiInventory + index - 1)
+end
+
 -- ########### --
 -- # Setters # --
 -- ########### --
-function set_animation_speed(animation_speed)
+local function set_animation_speed(animation_speed)
     WriteFloat(GetPointer(soraHUD - 0xA94) + 0x284, animation_speed, true)
 end
 
-function set_ground_combo_length_limit(ground_combo_length_limit)
+local function set_ground_combo_length_limit(ground_combo_length_limit)
     WriteByte(soraHP + 0x98, ground_combo_length_limit)
 end
 
-function set_air_combo_length_limit(air_combo_length_limit)
+local function set_air_combo_length_limit(air_combo_length_limit)
     WriteByte(soraHP + 0x99, air_combo_length_limit)
 end
 
-function set_stock_at_index(index, qty)
-    WriteByte(inventory + index - 1, qty)
+local function set_stock_at_index(index, qty)
+    WriteByte(inventory + index - 1, math.min(qty, 99))
 end
 
-function set_sora_walk_speed(walk_speed)
+local function set_sora_walk_speed(walk_speed)
     WriteFloat(zantHack - 0x2862, walk_speed)
 end
 
-function set_sora_run_speed(run_speed)
+local function set_sora_run_speed(run_speed)
     WriteFloat(zantHack - 0x285B, run_speed)
 end
 
-function set_spell_effectiveness(spell, value)
+local function set_spell_effectiveness(spell, value)
     local memory_location = nil
         if spell == "Fire"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x00 * 0x70)
     elseif spell == "Fira"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x01 * 0x70)
@@ -282,7 +287,7 @@ function set_spell_effectiveness(spell, value)
     end
 end
 
-function set_spell_cost(spell, value)
+local function set_spell_cost(spell, value)
     local possible_magic_costs = {15,30,100,200,300}
     if possible_magic_costs[value] then
         local memory_location = nil
@@ -313,25 +318,29 @@ function set_spell_cost(spell, value)
     end
 end    
 
-function set_attack_animation_data(index, animation_data)
+local function set_attack_animation_data(index, animation_data)
     WriteArray(anims + (index * 20), animation_data)
 end
 
-function set_command_data(index, command_data)
+local function set_command_data(index, command_data)
     WriteArray(ReadLong(commandMenuPointer) + 16 * (index - 1), command_data, true)
+end
+
+local function set_gummi_qty_at_index(index, qty)
+    WriteByte(gummiInventory + index - 1, math.min(qty, 99))
 end
 
 -- ############ --
 -- # Advanced # --
 -- ############ --
-function make_sora_actionable()
+local function make_sora_actionable()
     -- Sets a flag on Sora's object that makes him actionable
-    sora_flags = byte_to_bits(ReadByte(ReadLong(soraPointer), true))
+    local sora_flags = byte_to_bits(ReadByte(ReadLong(soraPointer), true))
     sora_flags[3] = 0
     WriteByte(ReadLong(soraPointer), bits_to_byte(sora_flags), true)
 end
 
-function calculate_ground_combo_limit()
+local function calculate_ground_combo_limit()
     -- Calculates what Sora's ground combo limit should be, based on his abilities equipped
     local ground_combo_length = 3
     local equipped_abilities = get_equipped_sora_abilities()
@@ -343,7 +352,7 @@ function calculate_ground_combo_limit()
     return ground_combo_length
 end
 
-function calculate_air_combo_limit()
+local function calculate_air_combo_limit()
     -- Calculates what Sora's air combo limit should be, based on his abilities equipped
     local air_combo_length_limit = 3
     local equipped_abilities = get_equipped_sora_abilities()
@@ -355,7 +364,7 @@ function calculate_air_combo_limit()
     return air_combo_length_limit
 end
 
-function enable_ability(ability)
+local function enable_ability(ability)
     -- Enables an ability even if Sora doesn't have it or it isn't equipped
     local memory_location = nil
     
@@ -389,7 +398,7 @@ function enable_ability(ability)
     end
 end    
 
-function force_scan(on)
+local function force_scan(on)
     if on then
         WriteArray(zantHack - 0x227C, {0x90,0x90,0x90,0x90,0x90,0x90})
     else
@@ -397,7 +406,7 @@ function force_scan(on)
     end
 end
 
-function force_combo_master(on)
+local function force_combo_master(on)
     if on then
         WriteByte(zantHack + 0x6FB, 0x71)
         WriteByte(zantHack + 0x6FB + 0x18, 0x82)
@@ -407,7 +416,7 @@ function force_combo_master(on)
     end
 end
 
-function allow_summon_anywhere(on)
+local function allow_summon_anywhere(on)
     if on then
         WriteByte(summonanywhere1, 0x72)
         WriteByte(summonanywhere2, 0x72)
@@ -419,7 +428,7 @@ function allow_summon_anywhere(on)
     end
 end
 
-function allow_midair_dodge_roll_guard(on)
+local function allow_midair_dodge_roll_guard(on)
     if on then
         WriteByte(zantHack + 0xC08, 0x82)
     else
@@ -427,7 +436,7 @@ function allow_midair_dodge_roll_guard(on)
     end
 end
 
-function allow_air_items(on)
+local function allow_air_items(on)
     if on then
         WriteByte(airitems1, 0x73)
         WriteByte(airitems2, 0x73)
@@ -437,13 +446,13 @@ function allow_air_items(on)
     end
 end
 
-function multiply_summon_time(mult)
-    vanilla_value = 3000
-    new_value = math.floor(vanilla_value * mult)
+local function multiply_summon_time(mult)
+    local vanilla_value = 3000
+    local new_value = math.floor(vanilla_value * mult)
     WriteInt(summonTime, new_value)
 end
 
-function show_prompt(input_title, input_party, duration, colour)
+local function show_prompt(input_title, input_party, duration, colour)
     --[[Writes to memory the message to be displayed in a Level Up prompt.]]
     if colour == nil then
         colour = 0
@@ -503,7 +512,7 @@ function show_prompt(input_title, input_party, duration, colour)
     end
 end
 
-function GetKHSCII(INPUT)
+local function GetKHSCII(INPUT)
     local _charTable = {
         [' '] =  0x01,
         ['\n'] =  0x02,
@@ -604,7 +613,7 @@ function GetKHSCII(INPUT)
     return _returnArray
 end
 
-function is_pressed(button_array, only)
+local function is_pressed(button_array, only)
     --[[Returns true if the buttons passed in button_array
     are pressed.  If only is true, then returns true if 
     only those are pressed]]
@@ -614,7 +623,7 @@ function is_pressed(button_array, only)
               "L2", "R2", "L1", "R1", "Triangle", "Circle", "X", "Square",
               "Unused 1", "Unused 2", "Unused 3", "Unused 4", "Right Analog Stick U", "Right Analog Stick R", "Right Analog Stick D", "Right Analog Stick L",
               "Unused 5", "Unused 6", "Unused 7", "Unused 8", "Left Analog Stick U", "Left Analog Stick R", "Left Analog Stick D", "Left Analog Stick L"}
-    expected_bitmap = {}
+    local expected_bitmap = {}
     for k,v in pairs(bitmap) do
         if contains(button_array, v) then
             expected_bitmap[k] = 1
@@ -641,5 +650,78 @@ function is_pressed(button_array, only)
     end
 end
 
+local function is_in_gummi_garage()
+    return ReadInt(inGummi) > 0
+end
 
+local function grant_shared_ability(shared_ability_value)
+    local current_shared_abilities_qty = #get_shared_abilities()
+    if current_shared_abilities_qty < 8 then
+        WriteByte(shared_abilities_address + current_shared_abilities_qty, shared_ability_value + 128)
+    end
+end
 
+local function grant_sora_ability(ability_value)
+    local current_sora_abilities_qty = #get_sora_abilities()
+    if current_sora_abilities_qty < 48 then
+        WriteByte(soraCurAbilities + current_sora_abilities_qty, ability_value + 128)
+    end
+end
+
+return {
+    byte_to_bits = byte_to_bits,
+    bits_to_byte = bits_to_byte,
+    ReadBits = ReadBits,
+    ReadBit = ReadBit,
+    WriteBit = WriteBit,
+    contains = contains,
+    get_index = get_index,
+    merge_tables = merge_tables,
+    get_world = get_world,
+    get_room = get_room,
+    get_animation_speed = get_animation_speed,
+    get_current_animation = get_current_animation,
+    get_ground_combo_length_limit = get_ground_combo_length_limit,
+    get_air_combo_length_limit = get_air_combo_length_limit,
+    get_animation_time = get_animation_time,
+    get_stock = get_stock,
+    get_stock_at_index = get_stock_at_index,
+    get_sora_abilities = get_sora_abilities,
+    get_shared_abilities = get_shared_abilities,
+    get_equipped_sora_abilities = get_equipped_sora_abilities,
+    get_equipped_shared_abilities = get_equipped_shared_abilities,
+    get_soras_accessory_slots = get_soras_accessory_slots,
+    get_soras_equipped_accessories = get_soras_equipped_accessories,
+    get_inputs = get_inputs,
+    get_spell_effectiveness = get_spell_effectiveness,
+    get_current_hits = get_current_hits,
+    get_sora_pos = get_sora_pos,
+    get_gummi_qty_at_index = get_gummi_qty_at_index,
+    set_animation_speed = set_animation_speed,
+    set_ground_combo_length_limit = set_ground_combo_length_limit,
+    set_air_combo_length_limit = set_air_combo_length_limit,
+    set_stock_at_index = set_stock_at_index,
+    set_sora_walk_speed = set_sora_walk_speed,
+    set_sora_run_speed = set_sora_run_speed,
+    set_spell_effectiveness = set_spell_effectiveness,
+    set_spell_cost = set_spell_cost,
+    set_attack_animation_data = set_attack_animation_data,
+    set_command_data = set_command_data,
+    set_gummi_qty_at_index = set_gummi_qty_at_index,
+    make_sora_actionable = make_sora_actionable,
+    calculate_ground_combo_limit = calculate_ground_combo_limit,
+    calculate_air_combo_limit = calculate_air_combo_limit,
+    enable_ability = enable_ability,
+    force_scan = force_scan,
+    force_combo_master = force_combo_master,
+    allow_summon_anywhere = allow_summon_anywhere,
+    allow_midair_dodge_roll_guard = allow_midair_dodge_roll_guard,
+    allow_air_items = allow_air_items,
+    multiply_summon_time = multiply_summon_time,
+    show_prompt = show_prompt,
+    GetKHSCII = GetKHSCII,
+    is_pressed = is_pressed,
+    is_in_gummi_garage = is_in_gummi_garage,
+    give_shared_ability = grant_shared_ability,
+    give_sora_ability = grant_sora_ability
+}

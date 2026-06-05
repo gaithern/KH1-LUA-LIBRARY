@@ -281,6 +281,7 @@ chests_interaction = 0x2B5AA4
 examine_interaction = 0x294B89
 talk_interaction = 0x294BC9
 trinity_interaction = 0x1A4EFF
+syscall_battle_check = 0x1AD52E
 
 -- show prompt
 boxMemory = 0x283B390

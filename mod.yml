@@ -18,3 +18,7 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/VersionCheck.lua
+- name: scripts/io_packages/json.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/json.lua
