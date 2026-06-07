@@ -232,6 +232,34 @@ local function get_gummi_qty_at_index(index)
     return ReadByte(gummiInventory + index - 1)
 end
 
+local function get_absolute_item_descriptions_memory_address()
+    local offsets = {0x8, 0x689, 0x678, 0xE0, 0x0}
+    local absolute_item_description_memory_address = GetPointer(itemDescriptions)
+    for _, offset in pairs(offsets) do
+        absolute_item_description_memory_address = GetPointerA(absolute_item_description_memory_address, offset)
+    end
+    return absolute_item_description_memory_address
+end
+
+local function get_absolute_item_description_at_idx_memory_address(idx)
+    local absolute_item_description_memory_address = get_absolute_item_descriptions_memory_address()
+    local delimiter_cnt = 0
+    local i = 0
+    while delimiter_cnt < idx do
+        if ReadByte(absolute_item_description_memory_address + i, true) == 0xCD then return nil end
+        if ReadByte(absolute_item_description_memory_address + i, true) == 0x00 then delimiter_cnt = delimiter_cnt + 1 end
+        i = i + 1
+    end
+    local item_description_start_addr = absolute_item_description_memory_address + i
+    local y = 1
+    while ReadByte(item_description_start_addr + y, true) ~= 0x00 and ReadByte(item_description_start_addr + y, true) ~= 0xCD do
+        y = y + 1
+    end
+    local bytes = ReadArray(item_description_start_addr, y, true)
+    local description = GetTextFromKHSCII(bytes)
+    return {["start"] = item_description_start_addr, ["length"] = y, ["bytes"] = bytes, ["description"] = description}
+end
+
 -- ########### --
 -- # Setters # --
 -- ########### --
@@ -613,6 +641,96 @@ local function GetKHSCII(INPUT)
     return _returnArray
 end
 
+local function GetTextFromKHSCII(INPUT)
+    local _charTable = {
+        [0x01] =  ' ',
+        [0x02] =  '\n',
+        [0x6E] =  '-',
+        [0x5F] =  '!',
+        [0x60] =  '?',
+        [0x62] =  '%',
+        [0x66] =  '/',
+        [0x68] =  '.',
+        [0x69] =  ',',
+        [0x6C] =  ';',
+        [0x6B] =  ':',
+        [0x71] =  '\'',
+        [0x74] =  '(',
+        [0x75] =  ')',
+        [0x76] =  '[',
+        [0x77] =  ']',
+        [0xCA] =  '¡',
+        [0xCB] =  '¿',
+        [0xCC] =  'À',
+        [0xCD] =  'Á',
+        [0xCE] =  'Â',
+        [0xCF] =  'Ä',
+        [0xD0] =  'Ç',
+        [0xD1] =  'È',
+        [0xD2] =  'É',
+        [0xD3] =  'Ê',
+        [0xD4] =  'Ë',
+        [0xD5] =  'Ì',
+        [0xD6] =  'Í',
+        [0xD7] =  'Î',
+        [0xD8] =  'Ï',
+        [0xD9] =  'Ñ',
+        [0xDA] =  'Ò',
+        [0xDB] =  'Ó',
+        [0xDC] =  'Ô',
+        [0xDD] =  'Ö',
+        [0xDE] =  'Ù',
+        [0xDF] =  'Ú',
+        [0xE0] =  'Û',
+        [0xE1] =  'Ü',
+        [0xE2] =  'ß',
+        [0xE3] =  'à',
+        [0xE4] =  'á',
+        [0xE5] =  'â',
+        [0xE6] =  'ä',
+        [0xE7] =  'ç',
+        [0xE8] =  'è',
+        [0xE9] =  'é',
+        [0xEA] =  'ê',
+        [0xEB] =  'ë',
+        [0xEC] =  'ì',
+        [0xED] =  'í',
+        [0xEE] =  'î',
+        [0xEF] =  'ï',
+        [0xF0] =  'ñ',
+        [0xF1] =  'ò',
+        [0xF2] =  'ó',
+        [0xF3] =  'ô',
+        [0xF4] =  'ö',
+        [0xF5] =  'ù',
+        [0xF6] =  'ú',
+        [0xF7] =  'û',
+        [0xF8] =  'ü'
+    }
+
+    local _returnString = ''
+
+    for i = 1, #INPUT do
+        local _code = INPUT[i]
+
+        if _code == 0x00 then
+            break
+        elseif _code >= 0x45 and _code <= 0x5E then
+            _returnString = _returnString .. string.char(_code + 0x1C)
+        elseif _code >= 0x2B and _code <= 0x44 then
+            _returnString = _returnString .. string.char(_code + 0x16)
+        elseif _code >= 0x21 and _code <= 0x2A then
+            _returnString = _returnString .. string.char(_code + 0x0F)
+        elseif _charTable[_code] ~= nil then
+            _returnString = _returnString .. _charTable[_code]
+        else
+            _returnString = _returnString .. ' '
+        end
+    end
+
+    return _returnString
+end
+
 local function is_pressed(button_array, only)
     --[[Returns true if the buttons passed in button_array
     are pressed.  If only is true, then returns true if 
@@ -697,6 +815,7 @@ return {
     get_current_hits = get_current_hits,
     get_sora_pos = get_sora_pos,
     get_gummi_qty_at_index = get_gummi_qty_at_index,
+    get_absolute_item_description_at_idx_memory_address = get_absolute_item_description_at_idx_memory_address,
     set_animation_speed = set_animation_speed,
     set_ground_combo_length_limit = set_ground_combo_length_limit,
     set_air_combo_length_limit = set_air_combo_length_limit,
@@ -720,6 +839,7 @@ return {
     multiply_summon_time = multiply_summon_time,
     show_prompt = show_prompt,
     GetKHSCII = GetKHSCII,
+    GetTextFromKHSCII = GetTextFromKHSCII,
     is_pressed = is_pressed,
     is_in_gummi_garage = is_in_gummi_garage,
     give_shared_ability = grant_shared_ability,

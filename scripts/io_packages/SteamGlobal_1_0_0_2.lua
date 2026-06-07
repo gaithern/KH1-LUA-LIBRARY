@@ -288,3 +288,6 @@ boxMemory = 0x283B390
 textMemory = 0x2DC2668
 colorBox = 0x527A10
 colorText = 0x527A50
+
+-- item descriptions
+itemDescriptions = 0x21AB020
