@@ -246,7 +246,7 @@ local function get_absolute_item_description_at_idx_memory_address(idx)
     local delimiter_cnt = 0
     local i = 0
     while delimiter_cnt < idx do
-        if ReadByte(absolute_item_description_memory_address + i, true) == 0xCD then return nil end
+        if ReadByte(absolute_item_description_memory_address + i, true) == 0xCD then return end
         if ReadByte(absolute_item_description_memory_address + i, true) == 0x00 then delimiter_cnt = delimiter_cnt + 1 end
         i = i + 1
     end
@@ -356,6 +356,14 @@ end
 
 local function set_gummi_qty_at_index(index, qty)
     WriteByte(gummiInventory + index - 1, math.min(qty, 99))
+end
+
+local function set_absolute_item_description_at_idx_memory_address(idx, overwrite_str)
+    local tgt_string = get_absolute_item_description_at_idx_memory_address(idx)
+    if tgt_string == nil then return end
+    local overwrite_bytes = GetKHSCII(overwrite_str)
+    if overwrite_bytes > tgt_string["length"] then return end
+    WriteArray(tgt_string["start"], overwrite_bytes, true)
 end
 
 -- ############ --
@@ -827,6 +835,7 @@ return {
     set_attack_animation_data = set_attack_animation_data,
     set_command_data = set_command_data,
     set_gummi_qty_at_index = set_gummi_qty_at_index,
+    set_absolute_item_description_at_idx_memory_address = set_absolute_item_description_at_idx_memory_address,
     make_sora_actionable = make_sora_actionable,
     calculate_ground_combo_limit = calculate_ground_combo_limit,
     calculate_air_combo_limit = calculate_air_combo_limit,
