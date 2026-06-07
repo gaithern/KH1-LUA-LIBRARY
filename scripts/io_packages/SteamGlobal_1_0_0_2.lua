@@ -290,4 +290,4 @@ colorBox = 0x527A10
 colorText = 0x527A50
 
 -- item descriptions
-itemDescriptions = 0x21AB020
+itemDescriptions = 0x2F11898

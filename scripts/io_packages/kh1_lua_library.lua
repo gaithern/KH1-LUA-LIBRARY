@@ -18,6 +18,198 @@
 -- ########### --
 -- # Helpers # --
 -- ########### --
+
+local function GetKHSCII(INPUT)
+    local _charTable = {
+        [' '] =  0x01,
+        ['\n'] =  0x02,
+        ['-'] =  0x6E,
+        ['!'] =  0x5F,
+        ['?'] =  0x60,
+        ['%'] =  0x62,
+        ['/'] =  0x66,
+        ['.'] =  0x68,
+        [','] =  0x69,
+        [';'] =  0x6C,
+        [':'] =  0x6B,
+        ['\''] =  0x71,
+        ['('] =  0x74,
+        [')'] =  0x75,
+        ['['] =  0x76,
+        [']'] =  0x77,
+        ['¡'] =  0xCA,
+        ['¿'] =  0xCB,
+        ['À'] =  0xCC,
+        ['Á'] =  0xCD,
+        ['Â'] =  0xCE,
+        ['Ä'] =  0xCF,
+        ['Ç'] =  0xD0,
+        ['È'] =  0xD1,
+        ['É'] =  0xD2,
+        ['Ê'] =  0xD3,
+        ['Ë'] =  0xD4,
+        ['Ì'] =  0xD5,
+        ['Í'] =  0xD6,
+        ['Î'] =  0xD7,
+        ['Ï'] =  0xD8,
+        ['Ñ'] =  0xD9,
+        ['Ò'] =  0xDA,
+        ['Ó'] =  0xDB,
+        ['Ô'] =  0xDC,
+        ['Ö'] =  0xDD,
+        ['Ù'] =  0xDE,
+        ['Ú'] =  0xDF,
+        ['Û'] =  0xE0,
+        ['Ü'] =  0xE1,
+        ['ß'] =  0xE2,
+        ['à'] =  0xE3,
+        ['á'] =  0xE4,
+        ['â'] =  0xE5,
+        ['ä'] =  0xE6,
+        ['ç'] =  0xE7,
+        ['è'] =  0xE8,
+        ['é'] =  0xE9,
+        ['ê'] =  0xEA,
+        ['ë'] =  0xEB,
+        ['ì'] =  0xEC,
+        ['í'] =  0xED,
+        ['î'] =  0xEE,
+        ['ï'] =  0xEF,
+        ['ñ'] =  0xF0,
+        ['ò'] =  0xF1,
+        ['ó'] =  0xF2,
+        ['ô'] =  0xF3,
+        ['ö'] =  0xF4,
+        ['ù'] =  0xF5,
+        ['ú'] =  0xF6,
+        ['û'] =  0xF7,
+        ['ü'] =  0xF8
+    }
+
+    local _returnArray = {}
+
+    local i = 1
+    local z = 1
+
+    while z <= #INPUT do
+        local _char = INPUT:sub(z, z)
+
+        if _char >= 'a' and _char <= 'z' then
+            _returnArray[i] = string.byte(_char) - 0x1C
+            z = z + 1
+        elseif _char >= 'A' and _char <= 'Z' then
+            _returnArray[i] = string.byte(_char) - 0x16
+            z = z + 1
+        elseif _char >= '0' and _char <= '9' then
+            _returnArray[i] = string.byte(_char) - 0x0F
+            z = z + 1
+        else
+            if _charTable[_char] ~= nil then
+                _returnArray[i] = _charTable[_char]
+                z = z + 1
+            else
+                _returnArray[i] = 0x01
+                z = z + 1
+            end
+        end
+
+        i = i + 1
+    end
+
+    table.insert(_returnArray, 0x00)
+    return _returnArray
+end
+
+local function GetTextFromKHSCII(INPUT)
+    local _charTable = {
+        [0x01] =  ' ',
+        [0x02] =  '\n',
+        [0x6E] =  '-',
+        [0x5F] =  '!',
+        [0x60] =  '?',
+        [0x62] =  '%',
+        [0x66] =  '/',
+        [0x68] =  '.',
+        [0x69] =  ',',
+        [0x6C] =  ';',
+        [0x6B] =  ':',
+        [0x71] =  '\'',
+        [0x74] =  '(',
+        [0x75] =  ')',
+        [0x76] =  '[',
+        [0x77] =  ']',
+        [0xCA] =  '¡',
+        [0xCB] =  '¿',
+        [0xCC] =  'À',
+        [0xCD] =  'Á',
+        [0xCE] =  'Â',
+        [0xCF] =  'Ä',
+        [0xD0] =  'Ç',
+        [0xD1] =  'È',
+        [0xD2] =  'É',
+        [0xD3] =  'Ê',
+        [0xD4] =  'Ë',
+        [0xD5] =  'Ì',
+        [0xD6] =  'Í',
+        [0xD7] =  'Î',
+        [0xD8] =  'Ï',
+        [0xD9] =  'Ñ',
+        [0xDA] =  'Ò',
+        [0xDB] =  'Ó',
+        [0xDC] =  'Ô',
+        [0xDD] =  'Ö',
+        [0xDE] =  'Ù',
+        [0xDF] =  'Ú',
+        [0xE0] =  'Û',
+        [0xE1] =  'Ü',
+        [0xE2] =  'ß',
+        [0xE3] =  'à',
+        [0xE4] =  'á',
+        [0xE5] =  'â',
+        [0xE6] =  'ä',
+        [0xE7] =  'ç',
+        [0xE8] =  'è',
+        [0xE9] =  'é',
+        [0xEA] =  'ê',
+        [0xEB] =  'ë',
+        [0xEC] =  'ì',
+        [0xED] =  'í',
+        [0xEE] =  'î',
+        [0xEF] =  'ï',
+        [0xF0] =  'ñ',
+        [0xF1] =  'ò',
+        [0xF2] =  'ó',
+        [0xF3] =  'ô',
+        [0xF4] =  'ö',
+        [0xF5] =  'ù',
+        [0xF6] =  'ú',
+        [0xF7] =  'û',
+        [0xF8] =  'ü'
+    }
+
+    local _returnString = ''
+
+    for i = 1, #INPUT do
+        local _code = INPUT[i]
+
+        if _code == 0x00 then
+            break
+        elseif _code >= 0x45 and _code <= 0x5E then
+            _returnString = _returnString .. string.char(_code + 0x1C)
+        elseif _code >= 0x2B and _code <= 0x44 then
+            _returnString = _returnString .. string.char(_code + 0x16)
+        elseif _code >= 0x21 and _code <= 0x2A then
+            _returnString = _returnString .. string.char(_code + 0x0F)
+        elseif _charTable[_code] ~= nil then
+            _returnString = _returnString .. _charTable[_code]
+        else
+            _returnString = _returnString .. ' '
+        end
+    end
+
+    return _returnString
+end
+
 local function byte_to_bits(byte)
     local bits = {}
     for i = 0, 7 do
@@ -233,10 +425,12 @@ local function get_gummi_qty_at_index(index)
 end
 
 local function get_absolute_item_descriptions_memory_address()
-    local offsets = {0x8, 0x689, 0x678, 0xE0, 0x0}
+    local offsets = {0x0, 0xD8, 0x8, 0x60}
     local absolute_item_description_memory_address = GetPointer(itemDescriptions)
+    ConsolePrint(absolute_item_description_memory_address)
     for _, offset in pairs(offsets) do
-        absolute_item_description_memory_address = GetPointerA(absolute_item_description_memory_address, offset)
+        absolute_item_description_memory_address = GetPointerA(absolute_item_description_memory_address + offset)
+        ConsolePrint(absolute_item_description_memory_address)
     end
     return absolute_item_description_memory_address
 end
@@ -360,9 +554,14 @@ end
 
 local function set_absolute_item_description_at_idx_memory_address(idx, overwrite_str)
     local tgt_string = get_absolute_item_description_at_idx_memory_address(idx)
-    if tgt_string == nil then return end
+    ConsolePrint("Start: " .. tostring(tgt_string["start"]))
+    ConsolePrint("Length: " .. tostring(tgt_string["length"]))
+    ConsolePrint("Description: " .. tostring(tgt_string["description"]))
+    if tgt_string == nil then ConsolePrint("Nothing found for that idx " .. tostring(idx) .. ".") return end
     local overwrite_bytes = GetKHSCII(overwrite_str)
-    if overwrite_bytes > tgt_string["length"] then return end
+    table.remove(overwrite_bytes)
+    if #overwrite_bytes > tgt_string["length"] then ConsolePrint("Input string " .. overwrite_str .. " too long!") return end
+    while #overwrite_bytes < tgt_string["length"] do table.insert(overwrite_bytes, 0x01) end
     WriteArray(tgt_string["start"], overwrite_bytes, true)
 end
 
@@ -546,197 +745,6 @@ local function show_prompt(input_title, input_party, duration, colour)
             WriteInt(_boxAddress, 0x01)
         end
     end
-end
-
-local function GetKHSCII(INPUT)
-    local _charTable = {
-        [' '] =  0x01,
-        ['\n'] =  0x02,
-        ['-'] =  0x6E,
-        ['!'] =  0x5F,
-        ['?'] =  0x60,
-        ['%'] =  0x62,
-        ['/'] =  0x66,
-        ['.'] =  0x68,
-        [','] =  0x69,
-        [';'] =  0x6C,
-        [':'] =  0x6B,
-        ['\''] =  0x71,
-        ['('] =  0x74,
-        [')'] =  0x75,
-        ['['] =  0x76,
-        [']'] =  0x77,
-        ['¡'] =  0xCA,
-        ['¿'] =  0xCB,
-        ['À'] =  0xCC,
-        ['Á'] =  0xCD,
-        ['Â'] =  0xCE,
-        ['Ä'] =  0xCF,
-        ['Ç'] =  0xD0,
-        ['È'] =  0xD1,
-        ['É'] =  0xD2,
-        ['Ê'] =  0xD3,
-        ['Ë'] =  0xD4,
-        ['Ì'] =  0xD5,
-        ['Í'] =  0xD6,
-        ['Î'] =  0xD7,
-        ['Ï'] =  0xD8,
-        ['Ñ'] =  0xD9,
-        ['Ò'] =  0xDA,
-        ['Ó'] =  0xDB,
-        ['Ô'] =  0xDC,
-        ['Ö'] =  0xDD,
-        ['Ù'] =  0xDE,
-        ['Ú'] =  0xDF,
-        ['Û'] =  0xE0,
-        ['Ü'] =  0xE1,
-        ['ß'] =  0xE2,
-        ['à'] =  0xE3,
-        ['á'] =  0xE4,
-        ['â'] =  0xE5,
-        ['ä'] =  0xE6,
-        ['ç'] =  0xE7,
-        ['è'] =  0xE8,
-        ['é'] =  0xE9,
-        ['ê'] =  0xEA,
-        ['ë'] =  0xEB,
-        ['ì'] =  0xEC,
-        ['í'] =  0xED,
-        ['î'] =  0xEE,
-        ['ï'] =  0xEF,
-        ['ñ'] =  0xF0,
-        ['ò'] =  0xF1,
-        ['ó'] =  0xF2,
-        ['ô'] =  0xF3,
-        ['ö'] =  0xF4,
-        ['ù'] =  0xF5,
-        ['ú'] =  0xF6,
-        ['û'] =  0xF7,
-        ['ü'] =  0xF8
-    }
-
-    local _returnArray = {}
-
-    local i = 1
-    local z = 1
-
-    while z <= #INPUT do
-        local _char = INPUT:sub(z, z)
-
-        if _char >= 'a' and _char <= 'z' then
-            _returnArray[i] = string.byte(_char) - 0x1C
-            z = z + 1
-        elseif _char >= 'A' and _char <= 'Z' then
-            _returnArray[i] = string.byte(_char) - 0x16
-            z = z + 1
-        elseif _char >= '0' and _char <= '9' then
-            _returnArray[i] = string.byte(_char) - 0x0F
-            z = z + 1
-        else
-            if _charTable[_char] ~= nil then
-                _returnArray[i] = _charTable[_char]
-                z = z + 1
-            else
-                _returnArray[i] = 0x01
-                z = z + 1
-            end
-        end
-
-        i = i + 1
-    end
-
-    table.insert(_returnArray, 0x00)
-    return _returnArray
-end
-
-local function GetTextFromKHSCII(INPUT)
-    local _charTable = {
-        [0x01] =  ' ',
-        [0x02] =  '\n',
-        [0x6E] =  '-',
-        [0x5F] =  '!',
-        [0x60] =  '?',
-        [0x62] =  '%',
-        [0x66] =  '/',
-        [0x68] =  '.',
-        [0x69] =  ',',
-        [0x6C] =  ';',
-        [0x6B] =  ':',
-        [0x71] =  '\'',
-        [0x74] =  '(',
-        [0x75] =  ')',
-        [0x76] =  '[',
-        [0x77] =  ']',
-        [0xCA] =  '¡',
-        [0xCB] =  '¿',
-        [0xCC] =  'À',
-        [0xCD] =  'Á',
-        [0xCE] =  'Â',
-        [0xCF] =  'Ä',
-        [0xD0] =  'Ç',
-        [0xD1] =  'È',
-        [0xD2] =  'É',
-        [0xD3] =  'Ê',
-        [0xD4] =  'Ë',
-        [0xD5] =  'Ì',
-        [0xD6] =  'Í',
-        [0xD7] =  'Î',
-        [0xD8] =  'Ï',
-        [0xD9] =  'Ñ',
-        [0xDA] =  'Ò',
-        [0xDB] =  'Ó',
-        [0xDC] =  'Ô',
-        [0xDD] =  'Ö',
-        [0xDE] =  'Ù',
-        [0xDF] =  'Ú',
-        [0xE0] =  'Û',
-        [0xE1] =  'Ü',
-        [0xE2] =  'ß',
-        [0xE3] =  'à',
-        [0xE4] =  'á',
-        [0xE5] =  'â',
-        [0xE6] =  'ä',
-        [0xE7] =  'ç',
-        [0xE8] =  'è',
-        [0xE9] =  'é',
-        [0xEA] =  'ê',
-        [0xEB] =  'ë',
-        [0xEC] =  'ì',
-        [0xED] =  'í',
-        [0xEE] =  'î',
-        [0xEF] =  'ï',
-        [0xF0] =  'ñ',
-        [0xF1] =  'ò',
-        [0xF2] =  'ó',
-        [0xF3] =  'ô',
-        [0xF4] =  'ö',
-        [0xF5] =  'ù',
-        [0xF6] =  'ú',
-        [0xF7] =  'û',
-        [0xF8] =  'ü'
-    }
-
-    local _returnString = ''
-
-    for i = 1, #INPUT do
-        local _code = INPUT[i]
-
-        if _code == 0x00 then
-            break
-        elseif _code >= 0x45 and _code <= 0x5E then
-            _returnString = _returnString .. string.char(_code + 0x1C)
-        elseif _code >= 0x2B and _code <= 0x44 then
-            _returnString = _returnString .. string.char(_code + 0x16)
-        elseif _code >= 0x21 and _code <= 0x2A then
-            _returnString = _returnString .. string.char(_code + 0x0F)
-        elseif _charTable[_code] ~= nil then
-            _returnString = _returnString .. _charTable[_code]
-        else
-            _returnString = _returnString .. ' '
-        end
-    end
-
-    return _returnString
 end
 
 local function is_pressed(button_array, only)
