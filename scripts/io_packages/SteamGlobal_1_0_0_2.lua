@@ -288,3 +288,6 @@ boxMemory = 0x283B390
 textMemory = 0x2DC2668
 colorBox = 0x527A10
 colorText = 0x527A50
+
+-- giftTableScale fix
+giftTableScale = 0x1B7E5C 
