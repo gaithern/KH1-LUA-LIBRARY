@@ -658,7 +658,7 @@ end
 local function grant_shared_ability(shared_ability_value)
     local current_shared_abilities_qty = #get_shared_abilities()
     if current_shared_abilities_qty < 8 then
-        WriteByte(shared_abilities_address + current_shared_abilities_qty, shared_ability_value + 128)
+        WriteByte(sharedAbilities + current_shared_abilities_qty, shared_ability_value + 128)
     end
 end
 
