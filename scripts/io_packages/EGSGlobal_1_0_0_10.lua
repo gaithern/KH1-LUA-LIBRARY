@@ -290,3 +290,6 @@ colorText = 0x528750
 
 -- giftTableScale fix
 giftTableScale = 0x1B5D0C
+
+-- battleModeCheck
+battleModeCheck = 0x1AB266
