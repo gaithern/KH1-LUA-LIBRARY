@@ -92,6 +92,15 @@ local function GetKHSCII(INPUT)
     local z = 1
 
     while z <= #INPUT do
+        local _literalHex = INPUT:match('^{0x(%x%x?)}', z)
+
+        if _literalHex then
+            _returnArray[i] = tonumber(_literalHex, 16)
+            z = z + 4 + #_literalHex
+            i = i + 1
+            goto continue
+        end
+
         local _char = INPUT:sub(z, z)
 
         if _char >= 'a' and _char <= 'z' then
@@ -114,6 +123,8 @@ local function GetKHSCII(INPUT)
         end
 
         i = i + 1
+
+        ::continue::
     end
 
     table.insert(_returnArray, 0x00)
