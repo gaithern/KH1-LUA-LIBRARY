@@ -201,6 +201,10 @@ local function get_room()
     return ReadByte(room)
 end
 
+local function get_gummi_select()
+    return ReadByte(gummiSelect)
+end
+
 local function get_animation_speed()
     return ReadFloat(GetPointer(soraHUD - 0xA94) + 0x284, true)
 end
@@ -691,6 +695,7 @@ return {
     merge_tables = merge_tables,
     get_world = get_world,
     get_room = get_room,
+    get_gummi_select = get_gummi_select,
     get_animation_speed = get_animation_speed,
     get_current_animation = get_current_animation,
     get_ground_combo_length_limit = get_ground_combo_length_limit,
