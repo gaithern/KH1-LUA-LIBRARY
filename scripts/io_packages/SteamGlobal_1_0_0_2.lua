@@ -294,3 +294,6 @@ giftTableScale = 0x1B7E5C
 
 -- battleModeCheck
 battleModeCheck = 0x1AD526
+
+-- synthesisItemNames
+UK_Word = 0x2E1AC60
