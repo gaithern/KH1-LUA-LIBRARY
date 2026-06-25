@@ -426,7 +426,7 @@ local function set_spell_cost(spell, value)
         elseif spell == "Aerora"   then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x13 * 0x70)
         elseif spell == "Aeroga"   then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x14 * 0x70) end
         if memory_location then
-            WriteByte(memory_location, possible_magic_costs[value])
+            WriteShort(memory_location, possible_magic_costs[value])
         end
     end
 end    
