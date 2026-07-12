@@ -698,11 +698,18 @@ local function spawn_prize(item_id)
     fnc_spawn_prize/fnc_update_widget_queue (see SteamGlobal_1_0_0_2.lua /
     EGSGlobal_1_0_0_10.lua) and kh1_native.dll to be present.
 
+    fnc_spawn_prize's second argument is a pointer to a packed {x,y,z} world
+    position float vector (confirmed from the real EVDL caller,
+    fnc_22A_scatter_map_gimmick_prizes, which builds one on its own stack) --
+    NOT an entity/parent pointer. kh1_native.write_floats builds that vector
+    on the fly since Lua can't take the address of a local value itself.
+
     Returns true if the spawn call completed without crashing; the physical
     pickup and its notification icon may still fail to appear for reasons
     unrelated to the call itself (e.g. no valid spawn point nearby).]]
-    local sora_ptr = ReadLong(soraPointer)
-    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, sora_ptr, 0)
+    local pos = get_sora_pos()
+    local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
+    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
     kh1_native.call_function(fnc_update_widget_queue, 1, item_id) -- claim
     kh1_native.call_function(fnc_update_widget_queue, 0, item_id) -- display
     return spawned

@@ -26,6 +26,7 @@ static void LogDebug(const char* msg) {
 // than shared because this module is intentionally independent of it.
 typedef int          (__cdecl* t_lua_gettop)(void* L);
 typedef long long    (__cdecl* t_lua_tointegerx)(void* L, int idx, int* isnum);
+typedef double       (__cdecl* t_lua_tonumberx)(void* L, int idx, int* isnum);
 typedef void         (__cdecl* t_lua_pushinteger)(void* L, long long n);
 typedef void         (__cdecl* t_lua_pushboolean)(void* L, int b);
 typedef const char*  (__cdecl* t_lua_pushstring)(void* L, const char* s);
@@ -34,6 +35,7 @@ typedef void         (__cdecl* t_lua_createtable)(void* L, int narr, int nrec);
 
 static t_lua_gettop       p_lua_gettop       = nullptr;
 static t_lua_tointegerx   p_lua_tointegerx   = nullptr;
+static t_lua_tonumberx    p_lua_tonumberx    = nullptr;
 static t_lua_pushinteger  p_lua_pushinteger  = nullptr;
 static t_lua_pushboolean  p_lua_pushboolean  = nullptr;
 static t_lua_pushstring   p_lua_pushstring   = nullptr;
@@ -149,9 +151,34 @@ extern "C" int l_get_module_base(void* L) {
     return 1;
 }
 
+// write_floats(f1, f2, ...) -> address
+//
+// Lua has no way to take the address of a local value, but some game
+// functions expect a pointer to a small packed struct/vector (e.g. an {x,y,z}
+// position) rather than a plain integer/pointer argument. This writes up to
+// 16 Lua numbers as packed 32-bit floats into a static scratch buffer and
+// returns its address, for use as an argument to call_function.
+//
+// The buffer is a single static instance, overwritten by every call and only
+// valid until the next write_floats call -- pass the returned address into
+// call_function immediately, don't hold onto it.
+static const int MAX_SCRATCH_FLOATS = 16;
+static float g_scratchFloats[MAX_SCRATCH_FLOATS];
+
+extern "C" int l_write_floats(void* L) {
+    int nargs = p_lua_gettop(L);
+    if (nargs > MAX_SCRATCH_FLOATS) nargs = MAX_SCRATCH_FLOATS;
+    for (int i = 0; i < nargs; ++i) {
+        g_scratchFloats[i] = (float)p_lua_tonumberx(L, i + 1, nullptr);
+    }
+    p_lua_pushinteger(L, (long long)(unsigned long long)(void*)g_scratchFloats);
+    return 1;
+}
+
 static const luaL_Reg kh1_native_lib[] = {
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
+    {"write_floats", reinterpret_cast<void*>(l_write_floats)},
     {nullptr, nullptr}
 };
 
@@ -188,6 +215,7 @@ extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     if (hLua && !p_lua_gettop) {
         p_lua_gettop      = (t_lua_gettop)      GetProcAddress(hLua, "lua_gettop");
         p_lua_tointegerx  = (t_lua_tointegerx)  GetProcAddress(hLua, "lua_tointegerx");
+        p_lua_tonumberx   = (t_lua_tonumberx)   GetProcAddress(hLua, "lua_tonumberx");
         p_lua_pushinteger = (t_lua_pushinteger) GetProcAddress(hLua, "lua_pushinteger");
         p_lua_pushboolean = (t_lua_pushboolean) GetProcAddress(hLua, "lua_pushboolean");
         p_lua_pushstring  = (t_lua_pushstring)  GetProcAddress(hLua, "lua_pushstring");
@@ -195,7 +223,7 @@ extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
         p_lua_createtable = (t_lua_createtable) GetProcAddress(hLua, "lua_createtable");
     }
 
-    if (!p_lua_gettop || !p_lua_tointegerx || !p_lua_pushinteger || !p_lua_pushboolean ||
+    if (!p_lua_gettop || !p_lua_tointegerx || !p_lua_tonumberx || !p_lua_pushinteger || !p_lua_pushboolean ||
         !p_lua_pushstring || !p_luaL_setfuncs || !p_lua_createtable) {
         // Couldn't find a loaded module exporting the Lua C API -- bail out
         // without touching any of them. Returning 0 (no pushed values) makes
