@@ -297,3 +297,7 @@ battleModeCheck = 0x1AD526
 
 -- synthesisItemNames
 UK_Word = 0x2E1AC60
+
+-- spawn_prize (kh1_native.call_function targets, Steam-verified only)
+fnc_spawn_prize = 0x2BFF00
+fnc_update_widget_queue = 0x2AB8E0
