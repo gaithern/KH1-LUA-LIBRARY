@@ -695,8 +695,8 @@ local function spawn_prize(item_id)
     claim/display sequence the game's own EVDL "scatter prize" opcode (0x22A)
     uses, via kh1_native.call_function. Unlike the rest of this library this
     calls real game code rather than just reading/writing memory, so it needs
-    fnc_spawn_prize/fnc_update_widget_queue (Steam-verified only, see
-    SteamGlobal_1_0_0_2.lua) and kh1_native.dll to be present.
+    fnc_spawn_prize/fnc_update_widget_queue (see SteamGlobal_1_0_0_2.lua /
+    EGSGlobal_1_0_0_10.lua) and kh1_native.dll to be present.
 
     Returns true if the spawn call completed without crashing; the physical
     pickup and its notification icon may still fail to appear for reasons
