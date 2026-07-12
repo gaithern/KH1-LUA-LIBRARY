@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global
 LUAGUI_NAME = "kh1_native_test"
 LUAGUI_AUTH = "test"
 LUAGUI_DESC = "Manual test trigger for kh1_native.dll / spawn_prize -- hold L1+R1+R2 to spawn a Potion"
