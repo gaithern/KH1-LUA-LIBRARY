@@ -691,12 +691,11 @@ local function grant_sora_ability(ability_value)
 end
 
 local function spawn_prize(item_id)
-    --[[Spawns a physical item pickup near Sora and runs it through the same
-    claim/display sequence the game's own EVDL "scatter prize" opcode (0x22A)
-    uses, via kh1_native.call_function. Unlike the rest of this library this
-    calls real game code rather than just reading/writing memory, so it needs
-    fnc_spawn_prize/fnc_update_widget_queue (see SteamGlobal_1_0_0_2.lua /
-    EGSGlobal_1_0_0_10.lua) and kh1_native.dll to be present.
+    --[[Spawns a physical item pickup near Sora via kh1_native.call_function.
+    Unlike the rest of this library this calls real game code rather than
+    just reading/writing memory, so it needs fnc_spawn_prize (see
+    SteamGlobal_1_0_0_2.lua / EGSGlobal_1_0_0_10.lua) and kh1_native.dll to be
+    present.
 
     fnc_spawn_prize's second argument is a pointer to a packed {x,y,z} world
     position float vector (confirmed from the real EVDL caller,
@@ -704,15 +703,21 @@ local function spawn_prize(item_id)
     NOT an entity/parent pointer. kh1_native.write_floats builds that vector
     on the fly since Lua can't take the address of a local value itself.
 
+    Deliberately does NOT run the claim/display sequence (fnc_update_widget_queue,
+    EVDL opcodes 0x170/0x16F) real prize-scatter events chain after this: that
+    pair's "value" argument is actually the pop-in animation's total duration
+    (matched against a countdown elsewhere), not an item id, so feeding it
+    item_id there corrupts the icon's scale animation -- confirmed live: the
+    spawned icon visibly grows without bound, faster for lower item ids. The
+    physical pickup from fnc_spawn_prize alone is real and collectible without
+    it; only the (broken) HUD notification icon is skipped.
+
     Returns true if the spawn call completed without crashing; the physical
-    pickup and its notification icon may still fail to appear for reasons
-    unrelated to the call itself (e.g. no valid spawn point nearby).]]
+    pickup may still fail to appear for reasons unrelated to the call itself
+    (e.g. no valid spawn point nearby).]]
     local pos = get_sora_pos()
     local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
-    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
-    kh1_native.call_function(fnc_update_widget_queue, 1, item_id) -- claim
-    kh1_native.call_function(fnc_update_widget_queue, 0, item_id) -- display
-    return spawned
+    return kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
 end
 
 return {
