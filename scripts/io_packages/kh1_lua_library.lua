@@ -717,7 +717,8 @@ local function spawn_prize(item_id)
     (e.g. no valid spawn point nearby).]]
     local pos = get_sora_pos()
     local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
-    return kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
+    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
+    return spawned
 end
 
 return {
