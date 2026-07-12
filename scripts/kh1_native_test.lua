@@ -1,28 +1,36 @@
 ---@diagnostic disable: undefined-global
 LUAGUI_NAME = "kh1_native_test"
 LUAGUI_AUTH = "test"
-LUAGUI_DESC = "Manual test trigger for kh1_native.dll / spawn_prize -- hold L1+R1+R2 to spawn a Potion"
+LUAGUI_DESC = "Debug overlay driver for kh1_native.dll -- press F6 in-game to toggle the window"
 
 local kh1_lib = nil
-local wasPressed = false
+local kh1_native = nil
 
 function _OnInit()
 	if GAME_ID == 0xAF71841E and ENGINE_TYPE == "BACKEND" then
 		require("VersionCheck")
 		kh1_lib = require("kh1_lua_library")
-		ConsolePrint("kh1_native_test loaded - hold L1+R1+R2 to spawn_prize(1)")
+		kh1_native = require("kh1_native")
+		ConsolePrint("kh1_native debug overlay loaded - press F6 to toggle")
 	else
 		ConsolePrint("KH1 not detected, not running script")
 	end
 end
 
+-- The overlay window runs on its own thread and can't safely call game
+-- functions itself (see kh1_native's dllmain.cpp) -- it only queues a named
+-- request, which we dispatch here through the real Lua functions every frame,
+-- since this runs on the same thread the rest of this library's calls do.
 function _OnFrame()
-	if kh1_lib == nil then return end
+	if kh1_native == nil then return end
 
-	local pressed = kh1_lib.is_pressed({"L1", "R1", "R2"}, true)
-	if pressed and not wasPressed then
-		local ok = kh1_lib.spawn_prize(1)
-		ConsolePrint("spawn_prize(1) returned: " .. tostring(ok))
+	-- Also drives the F6 show/hide toggle -- must be polled every frame
+	-- regardless of whether an action is pending.
+	local action = kh1_native.poll_debug_action()
+	if action == nil then return end
+
+	if action.action == "spawn_prize" then
+		local ok = kh1_lib.spawn_prize(action.param1)
+		kh1_native.set_debug_result("spawn_prize(" .. action.param1 .. ") = " .. tostring(ok))
 	end
-	wasPressed = pressed
 end
