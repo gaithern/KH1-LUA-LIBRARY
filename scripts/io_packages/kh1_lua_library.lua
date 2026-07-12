@@ -10,10 +10,16 @@
 
 --[[
     This is a package that provides helpful functions for working in KH1 memory.
-    Tries to use io_packages from 
-    https://github.com/Denhonator/KHPCSpeedrunTools/tree/main/1FMMods/scripts/io_packages as much as 
+    Tries to use io_packages from
+    https://github.com/Denhonator/KHPCSpeedrunTools/tree/main/1FMMods/scripts/io_packages as much as
     possible, but some additional memory addresses may need to added.
 --]]
+
+-- kh1_native.dll (see native/KH1Native in this repo) is a native Lua module
+-- that bridges into raw game function calls -- something the OpenKH Lua host
+-- itself has no primitive for. Functions in the Advanced section that need to
+-- call into game code (rather than just read/write memory) go through it.
+local kh1_native = require("kh1_native")
 
 -- ########### --
 -- # Helpers # --
@@ -684,6 +690,24 @@ local function grant_sora_ability(ability_value)
     end
 end
 
+local function spawn_prize(item_id)
+    --[[Spawns a physical item pickup near Sora and runs it through the same
+    claim/display sequence the game's own EVDL "scatter prize" opcode (0x22A)
+    uses, via kh1_native.call_function. Unlike the rest of this library this
+    calls real game code rather than just reading/writing memory, so it needs
+    fnc_spawn_prize/fnc_update_widget_queue (Steam-verified only, see
+    SteamGlobal_1_0_0_2.lua) and kh1_native.dll to be present.
+
+    Returns true if the spawn call completed without crashing; the physical
+    pickup and its notification icon may still fail to appear for reasons
+    unrelated to the call itself (e.g. no valid spawn point nearby).]]
+    local sora_ptr = ReadLong(soraPointer)
+    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, sora_ptr, 0)
+    kh1_native.call_function(fnc_update_widget_queue, 1, item_id) -- claim
+    kh1_native.call_function(fnc_update_widget_queue, 0, item_id) -- display
+    return spawned
+end
+
 return {
     byte_to_bits = byte_to_bits,
     bits_to_byte = bits_to_byte,
@@ -740,5 +764,6 @@ return {
     is_pressed = is_pressed,
     is_in_gummi_garage = is_in_gummi_garage,
     give_shared_ability = grant_shared_ability,
-    give_sora_ability = grant_sora_ability
+    give_sora_ability = grant_sora_ability,
+    spawn_prize = spawn_prize
 }
