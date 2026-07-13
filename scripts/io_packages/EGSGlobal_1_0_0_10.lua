@@ -316,3 +316,11 @@ fnc_show_item_message = 0x2712A0
 fnc_item_popup_text_hook = 0x27141C
 fnc_item_popup_text_resume = 0x271424
 fnc_item_popup_text_call_target = 0x27C2C0
+
+-- popup completion hook (kh1_native.install_popup_completion_hook targets --
+-- see SteamGlobal_1_0_0_2.lua's fnc_item_popup_tick for the full writeup).
+-- EGS twin matched via find_similar_functions_fuzzy (score 1.0), same
+-- 6-byte "sub rsp,0x28; xor edx,edx" entry prologue.
+fnc_item_popup_tick = 0x271860
+fnc_item_popup_tick_resume = 0x271866
+g_item_popup_state = 0x84E340

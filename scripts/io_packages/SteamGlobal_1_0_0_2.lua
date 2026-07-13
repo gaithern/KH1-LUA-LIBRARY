@@ -318,3 +318,16 @@ fnc_show_item_message = 0x273410
 fnc_item_popup_text_hook = 0x27358C
 fnc_item_popup_text_resume = 0x273594
 fnc_item_popup_text_call_target = 0x27E430
+
+-- popup completion hook (kh1_native.install_popup_completion_hook targets --
+-- detects when the item popup has actually finished displaying, so custom
+-- text can be cleared at the right moment instead of on the first draw
+-- frame). fnc_item_popup_tick is the always-ticking per-frame consumer;
+-- hook/resume RVAs are the exact 6-byte "sub rsp,0x28; xor edx,edx" entry
+-- prologue window. state is g_item_popup_state, a lifecycle dword
+-- (0=idle, 1=just-dequeued, 2=holding, 3=start-fade, 4=fading-out,
+-- 5=force-cancel) that transitions back to 0 exactly once, right after the
+-- last visible frame. Verified live via Cheat Engine / Ghidra decompile.
+fnc_item_popup_tick = 0x2739D0
+fnc_item_popup_tick_resume = 0x2739D6
+g_item_popup_state = 0x84D940
