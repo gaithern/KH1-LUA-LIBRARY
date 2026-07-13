@@ -298,6 +298,23 @@ battleModeCheck = 0x1AD526
 -- synthesisItemNames
 UK_Word = 0x2E1AC60
 
--- spawn_prize (kh1_native.call_function targets, Steam-verified only)
+-- spawn_prize (kh1_native.call_function targets)
 fnc_spawn_prize = 0x2BFF00
 fnc_update_widget_queue = 0x2AB8E0
+
+-- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
+-- pickup popup directly, independent of any actual pickup)
+fnc_show_item_message = 0x273410
+
+-- custom popup text hook (kh1_native.install_popup_text_hook targets --
+-- see set_custom_item_popup_text). hook/resume RVAs are the exact 8-byte
+-- "mov rdi,rax; call FUN_14027e430" window inside fnc_draw_item_popup_entry
+-- where the resolved item-name pointer lands in RDI. call_target is
+-- FUN_14027e430 itself (NOT fnc_queue_item_popup_text, which is a
+-- different, later call in the same function -- RDI survives across
+-- FUN_14027e430 unclobbered per the x64 ABI's callee-saved guarantee, and
+-- is what fnc_queue_item_popup_text actually consumes further down).
+-- Verified live via Cheat Engine.
+fnc_item_popup_text_hook = 0x27358C
+fnc_item_popup_text_resume = 0x273594
+fnc_item_popup_text_call_target = 0x27E430
