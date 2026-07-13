@@ -26,7 +26,3 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/kh1_native.dll
-- name: scripts/kh1_native_test.lua
-  method: copy
-  source:
-  - name: scripts/kh1_native_test.lua
