@@ -354,6 +354,20 @@ fnc_002_close_window = 0x1B8100
 -- live via Cheat Engine breakpoint tracing, 2026-07-12.
 fnc_0B1_open_window_no_close = 0x1B9170
 
+-- Set_window_type (opcode 5) -- kh1_native.call_evdl_syscall target, see
+-- set_text_box_style. Writes a raw 2-byte style value directly into the
+-- box_id's template (no window needs to be open yet); real scripts observed
+-- pushing values 0-4. Exact visual meaning per value not yet mapped.
+fnc_005_set_window_type = 0x1B98F0
+
+-- Set_window_position/Set_window_size (opcodes 3/4) -- kh1_native.call_evdl_syscall
+-- targets, see set_text_box_position/set_text_box_size. Both write raw
+-- int-cast-to-float values directly into the box_id's template (no window
+-- needs to be open yet). Units are not screen pixels -- an internal layout
+-- unit not yet characterized live.
+fnc_003_set_window_position = 0x1B9770
+fnc_004_set_window_size = 0x1B97D0
+
 -- custom text box hook (kh1_native.install_textbox_hook targets -- see
 -- open_text_box). hook/resume RVAs are the exact 8-byte
 -- "mov rdx,[r11+r10*8+g_pEVStringDataPtr]" window inside fnc_001_display_message

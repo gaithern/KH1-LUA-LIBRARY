@@ -335,6 +335,14 @@ fnc_002_close_window = 0x1B5FB0
 -- Open_window_no_close (see SteamGlobal_1_0_0_2.lua for the full writeup).
 fnc_0B1_open_window_no_close = 0x1B7020
 
+-- Set_window_type (see SteamGlobal_1_0_0_2.lua for the full writeup).
+fnc_005_set_window_type = 0x1B77A0
+
+-- Set_window_position/Set_window_size (see SteamGlobal_1_0_0_2.lua for the
+-- full writeup).
+fnc_003_set_window_position = 0x1B7620
+fnc_004_set_window_size = 0x1B7680
+
 -- custom text box hook (see SteamGlobal_1_0_0_2.lua for the full writeup).
 -- Same 8-byte "mov rdx,[r11+r10*8+g_pEVStringDataPtr]" window, matched
 -- structurally from the Steam build's equivalent window.

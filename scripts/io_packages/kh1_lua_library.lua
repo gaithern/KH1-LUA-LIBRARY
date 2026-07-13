@@ -747,18 +747,95 @@ local function show_custom_item_popup(text)
     return kh1_native.call_function(fnc_show_item_message, 1, 1)
 end
 
-local function open_text_box(text, window_id)
+-- Keyed by window_id; each entry is {deadline=os.clock() value or nil,
+-- open_world=byte, open_room=byte}. Always populated on a successful open
+-- (regardless of duration_seconds) so update_text_boxes can auto-close on a
+-- room/world transition even for boxes with no timer.
+local open_text_boxes = {}
+
+local function set_text_box_style(window_id, style)
+    --[[Sets the visual style of a text box window's TEMPLATE (Set_window_type,
+    EVDL opcode 5) via kh1_native.call_evdl_syscall -- no window needs to be
+    open yet, this configures what a later open_text_box() call for the same
+    window_id will look like (matching how real scripts always call
+    Set_window_type/Set_window_size/etc. before Open_window). Normally called
+    for you by open_text_box's own style parameter -- call this directly only
+    if you want to configure a window_id's template without opening it yet.
+
+    style is a raw integer 0-8 (9 total; confirmed live in-game, 2026-07-12 --
+    values outside this range read past the end of the engine's own lookup
+    table and produce undefined/glitchy rendering, confirmed by testing
+    style 9). Visual catalogue, same test text at each:
+      0 - no box at all; plain white outlined text floating over the scene
+          (subtitle-style).
+      1 - black semi-transparent box, purple/pink border, boxy corners.
+      2 - the classic peach/orange rounded box (KH1's default look).
+      3 - peach/orange, same family as 2 but a different corner/side treatment.
+      4 - peach/orange, again a different corner/side treatment from 2 and 3.
+      5 - peach/orange with jagged/spiky "comic burst" corners.
+      6 - peach/orange with beveled (angle-cut) corners.
+      7 - visually identical to 6.
+      8 - visually identical to 6/7.
+    This deliberately doesn't expose named constants since 6/7/8 don't look
+    distinguishable despite being different values -- pass the raw integer.
+    window_id defaults to 1, matching open_text_box's default.
+
+    Returns true if the syscall completed without crashing.]]
+    window_id = window_id or 1
+    return kh1_native.call_evdl_syscall(fnc_005_set_window_type, {window_id, style})
+end
+
+local function set_text_box_position(window_id, x, y)
+    --[[Sets the position of a text box window's TEMPLATE (Set_window_position,
+    EVDL opcode 3) via kh1_native.call_evdl_syscall. Normally called for you
+    by open_text_box's own x/y parameters -- call this directly only if you
+    want to configure a window_id's template without opening it yet (this
+    does NOT move an already-open window).
+
+    x/y are raw integers cast to float by the engine (not a bit-reinterpret --
+    the EVDL stack only holds int32s). Not screen pixels -- an internal
+    layout unit not yet characterized live. window_id defaults to 1.
+
+    Returns true if the syscall completed without crashing.]]
+    window_id = window_id or 1
+    return kh1_native.call_evdl_syscall(fnc_003_set_window_position, {window_id, x, y})
+end
+
+local function set_text_box_size(window_id, width, height)
+    --[[Sets the size of a text box window's TEMPLATE (Set_window_size, EVDL
+    opcode 4) via kh1_native.call_evdl_syscall. Normally called for you by
+    open_text_box's own width/height parameters -- call this directly only
+    if you want to configure a window_id's template without opening it yet.
+
+    width/height are raw integers cast to float by the engine. Real scripts
+    were observed (grepped across the KH1-RANDOMIZER asm corpus) using small
+    values like width=10, height=2-3 -- an internal layout unit, not screen
+    pixels, not yet characterized live. window_id defaults to 1.
+
+    Returns true if the syscall completed without crashing.]]
+    window_id = window_id or 1
+    return kh1_native.call_evdl_syscall(fnc_004_set_window_size, {window_id, width, height})
+end
+
+local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
     --[[Opens a real EVDL dialogue/text window (the same kind used for NPC
     talk prompts and chest item-get messages) showing arbitrary Lua-supplied
     text, without needing an actual EVDL script to trigger it.
 
     window_id selects both which of the 4 concurrent window "slots" gets used
-    and which previously-configured template (position/size/type, normally
-    set by a script's own Set_window_position/Set_window_size/Set_window_type
-    calls before it opens a window) the box inherits -- this function doesn't
-    configure those itself, so the box's on-screen appearance follows
-    whatever the last real window using that window_id looked like. Defaults
-    to 1, which is the id most on-foot dialogue/prompt windows use.
+    and which previously-configured template (position/size/type) the box
+    inherits. Defaults to 1, which is the id most on-foot dialogue/prompt
+    windows use.
+
+    style/x/y/width/height are all optional and, if given, are applied to
+    window_id's template via set_text_box_style/set_text_box_position/
+    set_text_box_size BEFORE opening (matching how real EVDL scripts always
+    call Set_window_type/Set_window_position/Set_window_size before
+    Open_window). x and y must be given together (or not at all); same for
+    width and height -- each pair maps to a single underlying syscall that
+    can't set just one half. Omitting all of these leaves window_id's
+    template exactly as it was last configured (by a real script, or a
+    previous call here).
 
     Calls the real fnc_0B1_open_window_no_close and fnc_001_display_message
     EVDL syscall handlers via kh1_native.call_evdl_syscall, which builds a
@@ -789,13 +866,44 @@ local function open_text_box(text, window_id)
     does NOT call clear_textbox_text() itself. Message-count bookkeeping
     still happens for real inside fnc_001_display_message.
 
+    duration_seconds is optional. There's no native engine field for
+    "auto-close this window after N seconds" on this window system (unlike
+    e.g. show_prompt's Level-Up-style boxes, which do have a real duration
+    field written straight into the box struct) -- fnc_0B1_open_window_no_close
+    leaves the box open indefinitely once shown, full stop. If given, this is
+    purely a Lua-side timer (os.clock()-based, the same pattern used
+    elsewhere in this ecosystem for connect timeouts). Regardless of
+    duration_seconds, the box also auto-closes the moment get_world()/
+    get_room() changes from what they were at open time (a room/world
+    transition almost certainly means whatever this box was about no longer
+    applies, and a stale window left open across a map load looks broken).
+    update_text_boxes() must be called every frame from your own script's
+    _OnFrame to actually drive either of these -- kh1_lua_library has no
+    persistent per-frame hook of its own. Omit duration_seconds (or pass
+    nil/0) to only auto-close on room/world transition, not on a timer.
+
     Returns true if both syscalls completed without crashing.]]
     window_id = window_id or 1
+    if style ~= nil then
+        set_text_box_style(window_id, style)
+    end
+    if x ~= nil and y ~= nil then
+        set_text_box_position(window_id, x, y)
+    end
+    if width ~= nil and height ~= nil then
+        set_text_box_size(window_id, width, height)
+    end
     kh1_native.install_textbox_hook(fnc_display_message_text_hook, fnc_display_message_text_resume)
     kh1_native.install_textbox_anim_hook(fnc_display_message_anim_hook, fnc_display_message_anim_resume, fnc_display_message_anim_call_target)
     kh1_native.set_textbox_text(GetKHSCII(text))
     local opened = kh1_native.call_evdl_syscall(fnc_0B1_open_window_no_close, {window_id})
     local displayed = kh1_native.call_evdl_syscall(fnc_001_display_message, {window_id, 0})
+    kh1_native.set_pending_text_box(window_id, fnc_002_close_window)
+    open_text_boxes[window_id] = {
+        deadline = (duration_seconds and duration_seconds > 0) and (os.clock() + duration_seconds) or nil,
+        open_world = get_world(),
+        open_room = get_room(),
+    }
     return opened and displayed
 end
 
@@ -806,9 +914,50 @@ local function close_text_box(window_id)
     comment for how that works. Not required if the player is expected to
     dismiss the box themselves; provided for programmatic control.
 
+    Cancels any pending duration_seconds/room-transition tracking for this
+    window_id, so update_text_boxes() won't also try to close it again later.
+
     Returns true if the syscall completed without crashing.]]
     window_id = window_id or 1
+    open_text_boxes[window_id] = nil
+    kh1_native.clear_pending_text_box()
     return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
+end
+
+-- Runs once, every time this module is loaded/required -- including after
+-- an F1 script reload, which tears down and re-requires every Lua module
+-- (losing any Lua-side state like pending_text_box_closes above) without
+-- ever giving a text box opened before the reload a chance to close itself.
+-- kh1_native.dll's own pending-window-id/close-RVA tracking survives the
+-- reload (see its "PENDING TEXT BOX TRACKING" comment -- the DLL pins
+-- itself in memory across reloads), so this recovers and closes whatever
+-- open_text_box last opened instead of leaving it stranded on screen
+-- forever. Deliberately calls kh1_native.close_pending_text_box() directly
+-- (not close_text_box(), which needs fnc_002_close_window) -- on a fast F1
+-- reload this module-load code can run before the consuming script's
+-- require("VersionCheck") has re-populated that global this cycle,
+-- confirmed live by an earlier version of this crashing the syscall with
+-- rva=0x0; the native side already has its own copy of that RVA from when
+-- the box was opened.
+kh1_native.close_pending_text_box()
+
+local function update_text_boxes()
+    --[[Closes any text boxes opened via open_text_box() once their
+    duration_seconds timer elapses (if one was given) or the player has
+    changed world/room since it was opened (always checked, regardless of
+    duration_seconds). Call this every frame from your own script's
+    _OnFrame (harmless/no-op if no text boxes are currently tracked) -- see
+    open_text_box's comment for why this can't happen automatically.]]
+    local now = os.clock()
+    local current_world = get_world()
+    local current_room = get_room()
+    for window_id, box in pairs(open_text_boxes) do
+        local timed_out = box.deadline and now >= box.deadline
+        local transitioned = current_world ~= box.open_world or current_room ~= box.open_room
+        if timed_out or transitioned then
+            close_text_box(window_id)
+        end
+    end
 end
 
 return {
@@ -871,5 +1020,9 @@ return {
     spawn_prize = spawn_prize,
     show_custom_item_popup = show_custom_item_popup,
     open_text_box = open_text_box,
-    close_text_box = close_text_box
+    close_text_box = close_text_box,
+    update_text_boxes = update_text_boxes,
+    set_text_box_style = set_text_box_style,
+    set_text_box_position = set_text_box_position,
+    set_text_box_size = set_text_box_size
 }
