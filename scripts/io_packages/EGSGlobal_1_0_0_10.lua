@@ -355,5 +355,10 @@ g_pEVStringDataPtr = 0x23927C0
 -- matched structurally from the Steam build's equivalent window, inside
 -- fnc_display_message_on_window_opened_no_close.
 fnc_display_message_anim_hook = 0x1B6FE3
+
+-- play_se2 (see SteamGlobal_1_0_0_2.lua for the full writeup). EGS twin
+-- matched via Ghidra cross-binary fuzzy match (score 0.5714), verified by
+-- structural decompile comparison.
+fnc_play_se2 = 0x1766F0
 fnc_display_message_anim_resume = 0x1B6FEC
 fnc_display_message_anim_call_target = 0x174400
