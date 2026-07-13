@@ -302,3 +302,17 @@ UK_Word = 0x2E1B660
 -- verified by decompile comparison -- see native/KH1Native)
 fnc_spawn_prize = 0x2BDD50
 fnc_update_widget_queue = 0x2A9750
+
+-- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
+-- pickup popup directly, independent of any actual pickup; matched from Steam
+-- via Ghidra cross-binary fuzzy match, score 1.0, verified by decompile comparison)
+fnc_show_item_message = 0x2712A0
+
+-- custom popup text hook (kh1_native.install_popup_text_hook targets --
+-- see set_custom_item_popup_text). hook/resume RVAs are the exact 8-byte
+-- "mov rdi,rax; call FUN_14027c2c0" window inside fnc_draw_item_popup_entry
+-- where the resolved item-name pointer lands in RDI; matched structurally
+-- from the Steam build's equivalent window, verified live via Cheat Engine.
+fnc_item_popup_text_hook = 0x27141C
+fnc_item_popup_text_resume = 0x271424
+fnc_item_popup_text_call_target = 0x27C2C0

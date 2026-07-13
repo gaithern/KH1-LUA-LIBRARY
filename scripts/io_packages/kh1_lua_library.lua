@@ -721,6 +721,40 @@ local function spawn_prize(item_id)
     return spawned
 end
 
+local function show_item_popup(item_id)
+    --[[Directly triggers the map-prize pickup popup (the small text window
+    that names the item you got) for item_id, independent of any actual
+    pickup -- no spawn_prize call needed. Calls fnc_show_item_message(1,
+    item_id), the same enqueue call the real pickup-detection code
+    (FUN_1402c08d0) makes on a successful grab.
+
+    Returns true if the call completed without crashing. The popup itself is
+    a single-slot FIFO queue driven by an always-running per-frame consumer
+    (FUN_1402739d0), so repeated calls while one is still showing simply queue
+    up rather than overwriting each other.]]
+    return kh1_native.call_function(fnc_show_item_message, 1, item_id)
+end
+
+local function set_custom_item_popup_text(text)
+    --[[Makes the map-prize pickup popup (see show_item_popup) show arbitrary
+    custom text instead of a real item's name, by patching
+    fnc_draw_item_popup_entry in-process (kh1_native.dll) to redirect the
+    resolved item-name pointer to a caller-supplied KHSCII buffer. Installs
+    the hook on first use (idempotent, safe to call every time).
+
+    Call show_item_popup(item_id) afterward (item_id just needs to be any
+    valid id -- it still picks the icon/graphic shown, only the text is
+    overridden) or let a real pickup trigger it. Call
+    clear_custom_item_popup_text() to go back to showing real item names.]]
+    kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
+    kh1_native.set_custom_popup_text(GetKHSCII(text))
+end
+
+local function clear_custom_item_popup_text()
+    --[[Reverts show_item_popup to showing each item's real name again.]]
+    kh1_native.clear_custom_popup_text()
+end
+
 return {
     byte_to_bits = byte_to_bits,
     bits_to_byte = bits_to_byte,
@@ -778,5 +812,8 @@ return {
     is_in_gummi_garage = is_in_gummi_garage,
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
-    spawn_prize = spawn_prize
+    spawn_prize = spawn_prize,
+    show_item_popup = show_item_popup,
+    set_custom_item_popup_text = set_custom_item_popup_text,
+    clear_custom_item_popup_text = clear_custom_item_popup_text
 }

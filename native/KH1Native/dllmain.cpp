@@ -2,6 +2,8 @@
 #include <tlhelp32.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <vector>
 #include <d3d11.h>
 
 #include "imgui/imgui.h"
@@ -41,6 +43,9 @@ typedef void         (__cdecl* t_luaL_setfuncs)(void* L, const void* l, int nup)
 typedef void         (__cdecl* t_lua_createtable)(void* L, int narr, int nrec);
 typedef void         (__cdecl* t_lua_setfield)(void* L, int idx, const char* k);
 typedef const char*  (__cdecl* t_lua_tolstring)(void* L, int idx, size_t* len);
+typedef unsigned long long (__cdecl* t_lua_rawlen)(void* L, int idx);
+typedef int          (__cdecl* t_lua_rawgeti)(void* L, int idx, long long n);
+typedef void         (__cdecl* t_lua_settop)(void* L, int idx);
 
 static t_lua_gettop       p_lua_gettop       = nullptr;
 static t_lua_tointegerx   p_lua_tointegerx   = nullptr;
@@ -52,6 +57,9 @@ static t_luaL_setfuncs    p_luaL_setfuncs    = nullptr;
 static t_lua_createtable  p_lua_createtable  = nullptr;
 static t_lua_setfield     p_lua_setfield     = nullptr;
 static t_lua_tolstring    p_lua_tolstring    = nullptr;
+static t_lua_rawlen       p_lua_rawlen       = nullptr;
+static t_lua_rawgeti      p_lua_rawgeti      = nullptr;
+static t_lua_settop       p_lua_settop       = nullptr;
 
 struct luaL_Reg { const char* name; void* func; };
 
@@ -111,6 +119,7 @@ static SRWLOCK g_lock = SRWLOCK_INIT;
 static bool g_debugActionPending = false;
 static char g_debugAction[32] = "";
 static long long g_debugParam1 = 0;
+static char g_debugParamText[256] = "";
 
 static char g_debugResult[256] = "";
 
@@ -177,6 +186,35 @@ static void DrawForm() {
         AcquireSRWLockExclusive(&g_lock);
         strncpy_s(g_debugAction, "spawn_prize", _TRUNCATE);
         g_debugParam1 = itemId;
+        g_debugActionPending = true;
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Show Popup", ImVec2(160, 0))) {
+        AcquireSRWLockExclusive(&g_lock);
+        strncpy_s(g_debugAction, "show_item_popup", _TRUNCATE);
+        g_debugParam1 = itemId;
+        g_debugActionPending = true;
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+
+    ImGui::Separator();
+    static char customText[128] = "TEST";
+    ImGui::InputText("Custom Popup Text", customText, sizeof(customText));
+
+    if (ImGui::Button("Set Custom Text", ImVec2(160, 0))) {
+        AcquireSRWLockExclusive(&g_lock);
+        strncpy_s(g_debugAction, "set_custom_popup_text", _TRUNCATE);
+        strncpy_s(g_debugParamText, customText, _TRUNCATE);
+        g_debugActionPending = true;
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Custom Text", ImVec2(160, 0))) {
+        AcquireSRWLockExclusive(&g_lock);
+        strncpy_s(g_debugAction, "clear_custom_popup_text", _TRUNCATE);
         g_debugActionPending = true;
         ReleaseSRWLockExclusive(&g_lock);
     }
@@ -395,6 +433,240 @@ extern "C" int l_write_floats(void* L) {
     return 1;
 }
 
+// --- POPUP TEXT HOOK ---
+// Persistent, in-process equivalent of the Cheat Engine prototype that
+// proved this works (see kh1-widget-prize-system-findings memory / project
+// history): patches fnc_draw_item_popup_entry right after it resolves the
+// real item name into RDI, redirecting RDI to g_customTextBuffer instead
+// whenever g_customTextActive is set. No Cheat Engine involved -- this DLL
+// does its own nearby-memory allocation and (unlike CE's external
+// pause_process) suspends every other thread in this process itself while
+// patching the live instruction stream, then resumes them.
+static unsigned char g_customTextBuffer[512] = {};
+static volatile unsigned char g_customTextActive = 0;
+static bool g_popupHookInstalled = false;
+
+// Windows only relocates a VirtualAlloc'd region to the exact address you
+// ask for (or fails) -- it never silently moves it elsewhere -- so probing
+// outward from the target in fixed steps is a standard, reliable way to land
+// a code cave within jmp/call rel32 range (matches the technique CE's own
+// "preferred address" allocation uses under the hood).
+static void* AllocateNear(void* target, size_t size) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uintptr_t granularity = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+    uintptr_t targetAddr = (uintptr_t)target;
+    const uintptr_t maxRange = 0x70000000; // stay well inside +/-2GB for rel32 safety margin
+
+    for (uintptr_t offset = 0; offset < maxRange; offset += granularity) {
+        uintptr_t candidates[2] = { targetAddr + offset, (targetAddr > offset) ? (targetAddr - offset) : 0 };
+        for (int i = 0; i < 2; ++i) {
+            uintptr_t addr = candidates[i];
+            if (addr == 0) continue;
+            addr -= addr % granularity;
+            void* p = VirtualAlloc((void*)addr, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            if (p) return p;
+        }
+    }
+    return nullptr;
+}
+
+// Suspends every thread in this process except the caller, so patching a
+// live instruction stream can't race a torn fetch on another thread -- the
+// same principle as always pause_process()-ing before a Cheat Engine patch,
+// just done from inside the process instead of from an external debugger.
+static std::vector<HANDLE> SuspendOtherThreads() {
+    std::vector<HANDLE> handles;
+    DWORD selfTid = GetCurrentThreadId();
+    DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return handles;
+
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.dwSize >= (FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(te.th32OwnerProcessID))) {
+                if (te.th32OwnerProcessID == pid && te.th32ThreadID != selfTid) {
+                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                    if (h) {
+                        SuspendThread(h);
+                        handles.push_back(h);
+                    }
+                }
+            }
+            te.dwSize = sizeof(te);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return handles;
+}
+
+static void ResumeThreads(std::vector<HANDLE>& handles) {
+    for (HANDLE h : handles) {
+        ResumeThread(h);
+        CloseHandle(h);
+    }
+    handles.clear();
+}
+
+// Builds and installs the hook stub. hookAddr/resumeAddr/callTargetAddr are
+// absolute addresses (base + RVA), resolved by the caller from the
+// version-correct SteamGlobal/EGSGlobal address tables -- this function
+// itself has no version-specific knowledge at all.
+//
+// Original bytes at hookAddr are expected to be exactly:
+//   mov rdi,rax   (3 bytes: 48 8B F8 or 48 89 C7)
+//   call rel32    (5 bytes: E8 xx xx xx xx)
+// i.e. fnc_draw_item_popup_entry stashing the resolved item-name pointer
+// into RDI right before calling fnc_queue_item_popup_text. Verified via
+// live Cheat Engine testing on both Steam and EGS builds before this was
+// written -- see native/KH1Native and the project memory for the writeup.
+//
+// Stub layout (all in the allocated cave):
+//   push rax
+//   mov rax, &g_customTextActive
+//   cmp byte ptr [rax],1
+//   jne useOriginal
+//   mov rdi, &g_customTextBuffer
+//   pop rax
+//   jmp continueCall
+//   useOriginal:
+//   pop rax
+//   mov rdi,rax
+//   continueCall:
+//   call callTargetAddr
+//   jmp resumeAddr
+static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
+    if (g_popupHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    bool movRdiRax = (hookPtr[0] == 0x48) &&
+        ((hookPtr[1] == 0x8B && hookPtr[2] == 0xF8) || (hookPtr[1] == 0x89 && hookPtr[2] == 0xC7));
+    bool callRel32 = (hookPtr[3] == 0xE8);
+    if (!movRdiRax || !callRel32) {
+        LogDebug("InstallPopupTextHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallPopupTextHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[64] = {};
+    size_t off = 0;
+    uint64_t flagAddr = (uint64_t)(uintptr_t)&g_customTextActive;
+    uint64_t bufAddr = (uint64_t)(uintptr_t)&g_customTextBuffer;
+
+    stub[off++] = 0x50; // push rax
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, flagAddr
+    memcpy(stub + off, &flagAddr, 8); off += 8;
+
+    stub[off++] = 0x80; stub[off++] = 0x38; stub[off++] = 0x01; // cmp byte ptr [rax],1
+
+    stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
+    size_t jneOperand = off; off += 4;
+
+    stub[off++] = 0x48; stub[off++] = 0xBF; // mov rdi, bufAddr
+    memcpy(stub + off, &bufAddr, 8); off += 8;
+
+    stub[off++] = 0x58; // pop rax
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> continueCall
+    size_t jmpOperand = off; off += 4;
+
+    size_t useOriginalPos = off;
+    stub[off++] = 0x58; // pop rax
+    stub[off++] = 0x48; stub[off++] = 0x8B; stub[off++] = 0xF8; // mov rdi,rax
+
+    size_t continueCallPos = off;
+    stub[off++] = 0xE8; // call rel32 (patched below)
+    size_t callOperand = off; off += 4;
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpBackOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jneRel = (int32_t)((int64_t)useOriginalPos - (int64_t)(jneOperand + 4));
+    memcpy(stub + jneOperand, &jneRel, 4);
+
+    int32_t jmpRel = (int32_t)((int64_t)continueCallPos - (int64_t)(jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    int32_t callRel = (int32_t)((int64_t)callTargetAddr - (int64_t)(caveBase + callOperand + 4));
+    memcpy(stub + callOperand, &callRel, 4);
+
+    int32_t jmpBackRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBackOperand + 4));
+    memcpy(stub + jmpBackOperand, &jmpBackRel, 4);
+
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90; // NOP-pad the leftover 3 bytes of the 8-byte window
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 8);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 8, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 8);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_popupHookInstalled = true;
+    LogDebug("InstallPopupTextHook: installed successfully");
+    return true;
+}
+
+// install_popup_text_hook(hookRva, resumeRva, callTargetRva) -> ok(boolean)
+// Idempotent -- safe to call every time before using set_custom_popup_text.
+extern "C" int l_install_popup_text_hook(void* L) {
+    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    unsigned long long callTargetRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    bool ok = InstallPopupTextHook(base + hookRva, base + resumeRva, base + callTargetRva);
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+// set_custom_popup_text(byteTable) -> (none)
+// byteTable is a Lua array of KHSCII byte values (e.g. from GetKHSCII()).
+// Takes effect on the next fnc_enqueue_item_popup-driven popup, real or
+// triggered via show_item_popup -- until clear_custom_popup_text() is
+// called. Has no effect unless install_popup_text_hook() already succeeded.
+extern "C" int l_set_custom_popup_text(void* L) {
+    unsigned long long len = p_lua_rawlen(L, 1);
+    const unsigned long long maxLen = sizeof(g_customTextBuffer) - 1;
+    if (len > maxLen) len = maxLen;
+    for (unsigned long long i = 0; i < len; ++i) {
+        p_lua_rawgeti(L, 1, (long long)(i + 1));
+        g_customTextBuffer[i] = (unsigned char)p_lua_tointegerx(L, -1, nullptr);
+        p_lua_settop(L, -2);
+    }
+    g_customTextBuffer[len] = 0;
+    g_customTextActive = 1;
+    return 0;
+}
+
+// clear_custom_popup_text() -> (none)
+// Reverts fnc_draw_item_popup_entry to showing real item names again.
+extern "C" int l_clear_custom_popup_text(void* L) {
+    g_customTextActive = 0;
+    return 0;
+}
+
 // poll_debug_action() -> nil | {action=, param1=}
 //
 // Called every Lua frame by the debug companion script. Also polls F6 to
@@ -411,20 +683,23 @@ extern "C" int l_poll_debug_action(void* L) {
     bool has;
     char action[32];
     long long param1;
+    char paramText[256];
     AcquireSRWLockExclusive(&g_lock);
     has = g_debugActionPending;
     if (has) {
         strncpy_s(action, g_debugAction, _TRUNCATE);
         param1 = g_debugParam1;
+        strncpy_s(paramText, g_debugParamText, _TRUNCATE);
         g_debugActionPending = false;
     }
     ReleaseSRWLockExclusive(&g_lock);
 
     if (!has) return 0;
 
-    p_lua_createtable(L, 0, 2);
+    p_lua_createtable(L, 0, 3);
     p_lua_pushstring(L, action); p_lua_setfield(L, -2, "action");
     p_lua_pushinteger(L, param1); p_lua_setfield(L, -2, "param1");
+    p_lua_pushstring(L, paramText); p_lua_setfield(L, -2, "param_text");
     return 1;
 }
 
@@ -443,6 +718,9 @@ static const luaL_Reg kh1_native_lib[] = {
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
+    {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
+    {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},
+    {"clear_custom_popup_text", reinterpret_cast<void*>(l_clear_custom_popup_text)},
     {"poll_debug_action", reinterpret_cast<void*>(l_poll_debug_action)},
     {"set_debug_result", reinterpret_cast<void*>(l_set_debug_result)},
     {nullptr, nullptr}
@@ -489,10 +767,14 @@ extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
         p_lua_createtable = (t_lua_createtable) GetProcAddress(hLua, "lua_createtable");
         p_lua_setfield    = (t_lua_setfield)    GetProcAddress(hLua, "lua_setfield");
         p_lua_tolstring   = (t_lua_tolstring)   GetProcAddress(hLua, "lua_tolstring");
+        p_lua_rawlen      = (t_lua_rawlen)      GetProcAddress(hLua, "lua_rawlen");
+        p_lua_rawgeti     = (t_lua_rawgeti)     GetProcAddress(hLua, "lua_rawgeti");
+        p_lua_settop      = (t_lua_settop)      GetProcAddress(hLua, "lua_settop");
     }
 
     if (!p_lua_gettop || !p_lua_tointegerx || !p_lua_tonumberx || !p_lua_pushinteger || !p_lua_pushboolean ||
-        !p_lua_pushstring || !p_luaL_setfuncs || !p_lua_createtable || !p_lua_setfield || !p_lua_tolstring) {
+        !p_lua_pushstring || !p_luaL_setfuncs || !p_lua_createtable || !p_lua_setfield || !p_lua_tolstring ||
+        !p_lua_rawlen || !p_lua_rawgeti || !p_lua_settop) {
         // Couldn't find a loaded module exporting the Lua C API -- bail out
         // without touching any of them. Returning 0 (no pushed values) makes
         // require() hand back `true` rather than crashing on a null function

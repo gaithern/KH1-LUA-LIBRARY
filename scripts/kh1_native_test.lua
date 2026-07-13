@@ -32,5 +32,14 @@ function _OnFrame()
 	if action.action == "spawn_prize" then
 		local ok = kh1_lib.spawn_prize(action.param1)
 		kh1_native.set_debug_result("spawn_prize(" .. action.param1 .. ") = " .. tostring(ok))
+	elseif action.action == "show_item_popup" then
+		local ok = kh1_lib.show_item_popup(action.param1)
+		kh1_native.set_debug_result("show_item_popup(" .. action.param1 .. ") = " .. tostring(ok))
+	elseif action.action == "set_custom_popup_text" then
+		kh1_lib.set_custom_item_popup_text(action.param_text)
+		kh1_native.set_debug_result("custom popup text set to \"" .. action.param_text .. "\"")
+	elseif action.action == "clear_custom_popup_text" then
+		kh1_lib.clear_custom_item_popup_text()
+		kh1_native.set_debug_result("custom popup text cleared")
 	end
 end
