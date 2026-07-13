@@ -48,11 +48,6 @@ for _, version_name in ipairs(versions) do
 	end
 end
 
-if canExecute and ReadByte(language) ~= 56 then
-	canExecute = false
-	ConsolePrint("\n\n!!!!!!!! LANGUAGE ERROR !!!!!!!!\n\nUnsupported language detected, this randomizer only supports English")
-end
-
 if not canExecute then
 	ConsolePrint("\n\n!!!!!!!! VERSION ERROR !!!!!!!!\n\nVersion check failed, check variable file version numbers against game version")
 end
