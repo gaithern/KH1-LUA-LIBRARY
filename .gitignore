@@ -1,0 +1,15 @@
+# Visual Studio / MSBuild intermediates for native/KH1Native.
+# The actual build output (scripts/io_packages/kh1_native.dll) is committed --
+# only the throwaway intermediate build tree is ignored here.
+native/**/x64/
+native/**/.vs/
+native/**/*.obj
+native/**/*.pdb
+native/**/*.ilk
+native/**/*.iobj
+native/**/*.ipdb
+native/**/*.lib
+native/**/*.exp
+native/**/*.tlog
+native/**/*.recipe
+native/**/*.pch
