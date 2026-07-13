@@ -330,4 +330,4 @@ fnc_item_popup_text_call_target = 0x27E430
 -- last visible frame. Verified live via Cheat Engine / Ghidra decompile.
 fnc_item_popup_tick = 0x2739D0
 fnc_item_popup_tick_resume = 0x2739D6
-g_item_popup_state = 0x84D940
+g_item_popup_state = 0x284D940
