@@ -614,6 +614,80 @@ extern "C" int l_clear_textbox_text(void* L) {
     return 0;
 }
 
+// --- PENDING TEXT BOX TRACKING ---
+// A script reload (F1 in the OpenKH Lua host) tears down and re-requires
+// every Lua module -- including kh1_lua_library -- but this DLL pins itself
+// in memory across that (see DllMain's LoadLibraryA self-reference below),
+// so a plain static survives the reload even though any Lua-side state
+// (e.g. a module-local table) does not. open_text_box records the window_id
+// AND the fnc_002_close_window RVA it used here; kh1_lua_library calls
+// close_pending_text_box() at module-load time (so it runs on every
+// require, including post-reload) to close it if still set.
+//
+// The close RVA is stored (not just the window_id) specifically so this
+// doesn't depend on any Lua global like fnc_002_close_window already being
+// populated -- confirmed live that it isn't: on a fast F1 reload,
+// kh1_lua_library's module-load code can run before the consuming script's
+// require("VersionCheck") has re-populated that global this cycle, and an
+// earlier version of this that looked fnc_002_close_window up fresh at
+// cleanup time crashed the syscall with rva=0x0. Storing the already-known
+// RVA from when the box was opened sidesteps that ordering entirely.
+// -1 means "none pending".
+static volatile long g_pendingTextBoxWindowId = -1;
+static volatile unsigned long long g_pendingTextBoxCloseRva = 0;
+
+// set_pending_text_box(windowId, closeRva) -> (none)
+extern "C" int l_set_pending_text_box(void* L) {
+    g_pendingTextBoxWindowId = (long)p_lua_tointegerx(L, 1, nullptr);
+    g_pendingTextBoxCloseRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    return 0;
+}
+
+// clear_pending_text_box() -> (none)
+extern "C" int l_clear_pending_text_box(void* L) {
+    g_pendingTextBoxWindowId = -1;
+    g_pendingTextBoxCloseRva = 0;
+    return 0;
+}
+
+// close_pending_text_box() -> ok(boolean)
+// Closes whatever text box open_text_box last opened (if any), using the
+// window_id and close-syscall RVA stored at open time -- see the comment
+// above for why it doesn't just look fnc_002_close_window up fresh. Builds
+// its own throwaway scriptCtx the same way call_evdl_syscall does (a single
+// stack arg: window_id). Returns false (no-op) if nothing is pending.
+extern "C" int l_close_pending_text_box(void* L) {
+    if (g_pendingTextBoxWindowId < 0 || g_pendingTextBoxCloseRva == 0) {
+        p_lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    memset(g_scratchScriptCtx, 0, sizeof(g_scratchScriptCtx));
+    int32_t windowId = (int32_t)g_pendingTextBoxWindowId;
+    memcpy(g_scratchScriptCtx + 408, &windowId, 4);
+    int32_t stackIdx = 0;
+    memcpy(g_scratchScriptCtx + 404, &stackIdx, 4);
+
+    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+    unsigned long long address = base + g_pendingTextBoxCloseRva;
+    unsigned long long args[1] = { (unsigned long long)(uintptr_t)g_scratchScriptCtx };
+    unsigned long long result = 0;
+    bool ok = SafeCall(address, args, 1, result);
+
+    if (!ok) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "close_pending_text_box crashed: windowId=%ld rva=0x%llx",
+            g_pendingTextBoxWindowId, g_pendingTextBoxCloseRva);
+        LogDebug(msg);
+    }
+
+    g_pendingTextBoxWindowId = -1;
+    g_pendingTextBoxCloseRva = 0;
+
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
 // Builds and installs the hook stub. hookAddr/resumeAddr/callTargetAddr are
 // absolute addresses (base + RVA), resolved by the caller from the
 // version-correct SteamGlobal/EGSGlobal address tables -- this function
@@ -939,6 +1013,9 @@ static const luaL_Reg kh1_native_lib[] = {
     {"install_textbox_anim_hook", reinterpret_cast<void*>(l_install_textbox_anim_hook)},
     {"set_textbox_text", reinterpret_cast<void*>(l_set_textbox_text)},
     {"clear_textbox_text", reinterpret_cast<void*>(l_clear_textbox_text)},
+    {"set_pending_text_box", reinterpret_cast<void*>(l_set_pending_text_box)},
+    {"clear_pending_text_box", reinterpret_cast<void*>(l_clear_pending_text_box)},
+    {"close_pending_text_box", reinterpret_cast<void*>(l_close_pending_text_box)},
     {nullptr, nullptr}
 };
 
