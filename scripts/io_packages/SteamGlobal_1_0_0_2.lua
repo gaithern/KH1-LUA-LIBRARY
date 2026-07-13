@@ -404,3 +404,12 @@ g_pEVStringDataPtr = 0x237C4E0
 fnc_display_message_anim_hook = 0x1B9133
 fnc_display_message_anim_resume = 0x1B913C
 fnc_display_message_anim_call_target = 0x1764E0
+
+-- play_se2 (kh1_native.call_function target -- plays a sound effect by id).
+-- Called from EVDL opcode 0x161 (play_se2), the cutscene-skip-prompt chime,
+-- and a hardcoded {0x3eb0,5} call site. Live-verified 2026-07-12: the call
+-- chain executes without error, but CAUTION -- an arbitrary/unregistered
+-- se_id (tested se_id=1) crashed the game outright. Only pass se_id values
+-- known to be valid, real KH1 SE ids. See fnc_play_se2's Ghidra plate
+-- comment for the full call chain and live-verification notes.
+fnc_play_se2 = 0x1787D0

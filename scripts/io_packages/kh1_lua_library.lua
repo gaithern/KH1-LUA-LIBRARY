@@ -747,6 +747,34 @@ local function show_custom_item_popup(text)
     return kh1_native.call_function(fnc_show_item_message, 1, 1)
 end
 
+local function play_se2(se_id, param_2)
+    --[[Plays a sound effect via kh1_native.call_function on fnc_play_se2 (see
+    SteamGlobal_1_0_0_2.lua / EGSGlobal_1_0_0_10.lua). Wraps the same native
+    call the game itself uses for EVDL opcode 0x161 (play_se2), the
+    cutscene-skip-prompt chime, and one other hardcoded call site -- all
+    confirmed live call sites pass a real SE id plus a second integer whose
+    exact meaning (priority/channel?) isn't fully understood; real call sites
+    observed use param_2=5, but param_2=0 is also confirmed fine (see below).
+
+    CAUTION: se_id is NOT a free-form integer. Live-tested 2026-07-12 --
+    calling with an arbitrary/unregistered se_id (1) crashed the game
+    outright (likely a null/garbage sound-bank lookup downstream). Known-good
+    pairs confirmed live and audible in the field: (31, 0) -- carried over
+    from an older code-cave-injection implementation in the sibling
+    KH1-LUA-LIBRARY-DEV repo (scripts/1fmASMDriver.lua +
+    play_sound_effect/assemblyPlaySE2), reproduced here through this
+    function's kh1_native.call_function path. Per that same prior work, the
+    valid se_id range for this bank is roughly decimal 1-76 with param_2=0.
+    (0x3eb0, 5) also ran the full call chain without error/crash but
+    produced no audible sound in the field -- that id is the
+    cutscene-skip-prompt chime and is likely only resident during that
+    specific context. Only pass se_id values already known to be valid,
+    real KH1 SE ids.
+
+    Returns true if the call completed without crashing.]]
+    return kh1_native.call_function(fnc_play_se2, se_id, param_2)
+end
+
 -- Keyed by window_id; each entry is {deadline=os.clock() value or nil,
 -- open_world=byte, open_room=byte}. Always populated on a successful open
 -- (regardless of duration_seconds) so update_text_boxes can auto-close on a
@@ -1019,6 +1047,7 @@ return {
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
     show_custom_item_popup = show_custom_item_popup,
+    play_se2 = play_se2,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,
