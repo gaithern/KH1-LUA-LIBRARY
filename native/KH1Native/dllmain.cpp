@@ -511,14 +511,6 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
 //   mov rax, &g_customTextActive
 //   cmp byte ptr [rax],1
 //   jne useOriginal
-//   mov byte ptr [rax],0    ; one-shot: consuming the custom text clears it
-//                           ; immediately, so it can never apply to a later,
-//                           ; unrelated popup (the rendering itself happens
-//                           ; on a later frame via the always-ticking queue
-//                           ; consumer, so clearing from Lua synchronously
-//                           ; right after triggering would clear it before
-//                           ; this hook ever runs -- this is the only point
-//                           ; that's actually safe to clear it).
 //   mov rdi, &g_customTextBuffer
 //   pop rax
 //   jmp continueCall
@@ -528,6 +520,13 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
 //   continueCall:
 //   call callTargetAddr
 //   jmp resumeAddr
+//
+// Note this hook fires every frame the popup box is drawn (many frames per
+// display, ~30-70 @60fps across its hold+fade cycle) -- it must NOT clear
+// g_customTextActive itself (an earlier version did, on first fire, which
+// made the custom text revert to the real item name after a single frame).
+// The flag is cleared by InstallPopupCompletionHook below instead, which
+// detects the popup's actual finish.
 static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
     if (g_popupHookInstalled) return true;
 
@@ -560,8 +559,6 @@ static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long
 
     stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
     size_t jneOperand = off; off += 4;
-
-    stub[off++] = 0xC6; stub[off++] = 0x00; stub[off++] = 0x00; // mov byte ptr [rax],0 (one-shot consume)
 
     stub[off++] = 0x48; stub[off++] = 0xBF; // mov rdi, bufAddr
     memcpy(stub + off, &bufAddr, 8); off += 8;
@@ -630,6 +627,154 @@ extern "C" int l_install_popup_text_hook(void* L) {
     unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
     unsigned long long callTargetRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
     bool ok = InstallPopupTextHook(base + hookRva, base + resumeRva, base + callTargetRva);
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+// --- POPUP COMPLETION HOOK ---
+// Detects when the item-popup box has actually finished displaying, so
+// g_customTextActive can be cleared at the right moment instead of guessing
+// a frame count or clearing too early. fnc_item_popup_tick is an
+// always-ticking per-frame consumer (runs every frame regardless of whether
+// a popup is visible) that drives a small lifecycle state machine at
+// g_item_popup_state: 0=idle, 1=just-dequeued, 2=holding, 3=start-fade,
+// 4=fading-out, 5=force-cancel. It transitions back to 0 exactly once, on
+// the frame right after the last visible frame -- fnc_draw_item_popup_entry
+// itself is not called at all once state hits 0, so this can't be detected
+// from inside that hook; it has to be sampled from somewhere that always
+// runs, which is why this is a second, independent, passive hook.
+static uint32_t g_prevPopupState = 0;
+static bool g_popupCompletionHookInstalled = false;
+
+// Original bytes at fnc_item_popup_tick's entry, identical on both builds:
+//   sub rsp,0x28   (48 83 EC 28)
+//   xor edx,edx    (33 D2)
+// verified via live read_memory on both Steam and EGS before this was
+// written -- see project memory / Ghidra plate comments on fnc_item_popup_tick.
+//
+// Stub layout (all in the allocated cave):
+//   push rax / push r10 / push r11
+//   mov r10, &g_item_popup_state ; mov eax, dword ptr [r10]   (current)
+//   mov r11, &g_prevPopupState   ; mov r10d, dword ptr [r11]  (previous)
+//   cmp r10d,0
+//   je skipClear                 ; previous already idle -> no transition
+//   cmp eax,0
+//   jne skipClear                ; not finished yet
+//   mov r10, &g_customTextActive
+//   mov byte ptr [r10],0         ; transition detected: clear one-shot flag
+//   skipClear:
+//   mov r10, &g_prevPopupState
+//   mov dword ptr [r10],eax
+//   pop r11 / pop r10 / pop rax
+//   sub rsp,0x28                 ; replay original bytes
+//   xor edx,edx
+//   jmp resumeAddr
+static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned long long resumeAddr, unsigned long long stateAddr) {
+    if (g_popupCompletionHookInstalled) return true;
+
+    unsigned char* tickPtr = (unsigned char*)(uintptr_t)tickAddr;
+    static const unsigned char expected[6] = { 0x48, 0x83, 0xEC, 0x28, 0x33, 0xD2 };
+    if (memcmp(tickPtr, expected, 6) != 0) {
+        LogDebug("InstallPopupCompletionHook: unexpected original bytes at tick address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)tickAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallPopupCompletionHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[96] = {};
+    size_t off = 0;
+    uint64_t stateAddrImm = stateAddr;
+    uint64_t prevAddrImm = (uint64_t)(uintptr_t)&g_prevPopupState;
+    uint64_t flagAddrImm = (uint64_t)(uintptr_t)&g_customTextActive;
+
+    stub[off++] = 0x50;             // push rax
+    stub[off++] = 0x41; stub[off++] = 0x52; // push r10
+    stub[off++] = 0x41; stub[off++] = 0x53; // push r11
+
+    stub[off++] = 0x49; stub[off++] = 0xBA; // mov r10, stateAddr
+    memcpy(stub + off, &stateAddrImm, 8); off += 8;
+    stub[off++] = 0x41; stub[off++] = 0x8B; stub[off++] = 0x02; // mov eax, dword ptr [r10]
+
+    stub[off++] = 0x49; stub[off++] = 0xBB; // mov r11, prevAddr
+    memcpy(stub + off, &prevAddrImm, 8); off += 8;
+    stub[off++] = 0x45; stub[off++] = 0x8B; stub[off++] = 0x13; // mov r10d, dword ptr [r11]
+
+    stub[off++] = 0x41; stub[off++] = 0x83; stub[off++] = 0xFA; stub[off++] = 0x00; // cmp r10d,0
+    stub[off++] = 0x0F; stub[off++] = 0x84; // je rel32 (patched below)
+    size_t jeOperand = off; off += 4;
+
+    stub[off++] = 0x83; stub[off++] = 0xF8; stub[off++] = 0x00; // cmp eax,0
+    stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
+    size_t jneOperand = off; off += 4;
+
+    stub[off++] = 0x49; stub[off++] = 0xBA; // mov r10, flagAddr
+    memcpy(stub + off, &flagAddrImm, 8); off += 8;
+    stub[off++] = 0x41; stub[off++] = 0xC6; stub[off++] = 0x02; stub[off++] = 0x00; // mov byte ptr [r10],0
+
+    size_t skipClearPos = off;
+    stub[off++] = 0x49; stub[off++] = 0xBA; // mov r10, prevAddr
+    memcpy(stub + off, &prevAddrImm, 8); off += 8;
+    stub[off++] = 0x41; stub[off++] = 0x89; stub[off++] = 0x02; // mov dword ptr [r10],eax
+
+    stub[off++] = 0x41; stub[off++] = 0x5B; // pop r11
+    stub[off++] = 0x41; stub[off++] = 0x5A; // pop r10
+    stub[off++] = 0x58;                     // pop rax
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x28; // sub rsp,0x28
+    stub[off++] = 0x33; stub[off++] = 0xD2; // xor edx,edx
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpBackOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jeRel = (int32_t)((int64_t)skipClearPos - (int64_t)(jeOperand + 4));
+    memcpy(stub + jeOperand, &jeRel, 4);
+
+    int32_t jneRel = (int32_t)((int64_t)skipClearPos - (int64_t)(jneOperand + 4));
+    memcpy(stub + jneOperand, &jneRel, 4);
+
+    int32_t jmpBackRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBackOperand + 4));
+    memcpy(stub + jmpBackOperand, &jmpBackRel, 4);
+
+    unsigned char patch[6];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(tickAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; // NOP-pad the 1 leftover byte of the 6-byte window
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)tickAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)tickAddr, patch, 6);
+    VirtualProtect((void*)(uintptr_t)tickAddr, 6, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)tickAddr, 6);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_popupCompletionHookInstalled = true;
+    LogDebug("InstallPopupCompletionHook: installed successfully");
+    return true;
+}
+
+// install_popup_completion_hook(tickRva, resumeRva, stateRva) -> ok(boolean)
+// Idempotent -- safe to call every time before using set_custom_popup_text.
+extern "C" int l_install_popup_completion_hook(void* L) {
+    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+    unsigned long long tickRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    unsigned long long stateRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    bool ok = InstallPopupCompletionHook(base + tickRva, base + resumeRva, base + stateRva);
     p_lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
@@ -712,6 +857,7 @@ static const luaL_Reg kh1_native_lib[] = {
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
     {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
+    {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
     {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},
     {"clear_custom_popup_text", reinterpret_cast<void*>(l_clear_custom_popup_text)},
     {"poll_debug_action", reinterpret_cast<void*>(l_poll_debug_action)},

@@ -726,20 +726,23 @@ local function show_custom_item_popup(text)
     normally names the item you got) with arbitrary custom text instead of
     a real item name -- no spawn_prize or actual pickup needed.
 
-    Installs kh1_native's in-process hook on fnc_draw_item_popup_entry on
-    first use (idempotent), writes `text` as the KHSCII buffer it should
-    show, then triggers the popup via fnc_show_item_message(1, 1) (item id
-    1 just picks which icon/graphic shows; the text is what's overridden).
+    Installs two kh1_native in-process hooks on first use (both idempotent):
+    one on fnc_draw_item_popup_entry that redirects the displayed text to a
+    custom buffer while a flag is set, and one on fnc_item_popup_tick (the
+    always-ticking queue consumer) that watches the popup's lifecycle state
+    and clears that flag the moment the popup actually finishes displaying
+    (not on the first frame -- the box renders across many frames, so
+    clearing any earlier would revert to the real item name mid-display).
+    Then writes `text` as the KHSCII buffer and triggers the popup via
+    fnc_show_item_message(1, 1) (item id 1 just picks which icon/graphic
+    shows; the text is what's overridden).
 
-    The hook consumes and clears the custom text itself, the instant it
-    actually renders (which happens on a later frame, via the always-
-    running queue consumer fnc_item_popup_tick -- clearing it synchronously
-    here instead would clear it before the hook ever saw it). This is
-    one-shot: nothing is left "stuck" for a later, unrelated real popup to
-    pick up by accident.
+    Self-cleaning: nothing is left "stuck" for a later, unrelated real
+    popup to pick up by accident, and no separate clear call is needed.
 
     Returns true if the enqueue call completed without crashing.]]
     kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
+    kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
     kh1_native.set_custom_popup_text(GetKHSCII(text))
     return kh1_native.call_function(fnc_show_item_message, 1, 1)
 end
