@@ -190,31 +190,14 @@ static void DrawForm() {
         ReleaseSRWLockExclusive(&g_lock);
     }
 
-    ImGui::SameLine();
-    if (ImGui::Button("Show Popup", ImVec2(160, 0))) {
-        AcquireSRWLockExclusive(&g_lock);
-        strncpy_s(g_debugAction, "show_item_popup", _TRUNCATE);
-        g_debugParam1 = itemId;
-        g_debugActionPending = true;
-        ReleaseSRWLockExclusive(&g_lock);
-    }
-
     ImGui::Separator();
     static char customText[128] = "TEST";
-    ImGui::InputText("Custom Popup Text", customText, sizeof(customText));
+    ImGui::InputText("Popup Text", customText, sizeof(customText));
 
-    if (ImGui::Button("Set Custom Text", ImVec2(160, 0))) {
+    if (ImGui::Button("Show Popup", ImVec2(160, 0))) {
         AcquireSRWLockExclusive(&g_lock);
-        strncpy_s(g_debugAction, "set_custom_popup_text", _TRUNCATE);
+        strncpy_s(g_debugAction, "show_custom_popup", _TRUNCATE);
         strncpy_s(g_debugParamText, customText, _TRUNCATE);
-        g_debugActionPending = true;
-        ReleaseSRWLockExclusive(&g_lock);
-    }
-
-    ImGui::SameLine();
-    if (ImGui::Button("Clear Custom Text", ImVec2(160, 0))) {
-        AcquireSRWLockExclusive(&g_lock);
-        strncpy_s(g_debugAction, "clear_custom_popup_text", _TRUNCATE);
         g_debugActionPending = true;
         ReleaseSRWLockExclusive(&g_lock);
     }
@@ -528,6 +511,14 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
 //   mov rax, &g_customTextActive
 //   cmp byte ptr [rax],1
 //   jne useOriginal
+//   mov byte ptr [rax],0    ; one-shot: consuming the custom text clears it
+//                           ; immediately, so it can never apply to a later,
+//                           ; unrelated popup (the rendering itself happens
+//                           ; on a later frame via the always-ticking queue
+//                           ; consumer, so clearing from Lua synchronously
+//                           ; right after triggering would clear it before
+//                           ; this hook ever runs -- this is the only point
+//                           ; that's actually safe to clear it).
 //   mov rdi, &g_customTextBuffer
 //   pop rax
 //   jmp continueCall
@@ -569,6 +560,8 @@ static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long
 
     stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
     size_t jneOperand = off; off += 4;
+
+    stub[off++] = 0xC6; stub[off++] = 0x00; stub[off++] = 0x00; // mov byte ptr [rax],0 (one-shot consume)
 
     stub[off++] = 0x48; stub[off++] = 0xBF; // mov rdi, bufAddr
     memcpy(stub + off, &bufAddr, 8); off += 8;
