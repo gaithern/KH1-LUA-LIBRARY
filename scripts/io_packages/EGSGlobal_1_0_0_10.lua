@@ -323,4 +323,4 @@ fnc_item_popup_text_call_target = 0x27C2C0
 -- 6-byte "sub rsp,0x28; xor edx,edx" entry prologue.
 fnc_item_popup_tick = 0x271860
 fnc_item_popup_tick_resume = 0x271866
-g_item_popup_state = 0x84E340
+g_item_popup_state = 0x284E340
