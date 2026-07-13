@@ -331,3 +331,62 @@ fnc_item_popup_text_call_target = 0x27E430
 fnc_item_popup_tick = 0x2739D0
 fnc_item_popup_tick_resume = 0x2739D6
 g_item_popup_state = 0x284D940
+
+-- text box (EVDL Open_window/Display_message/Close_window syscall handlers --
+-- kh1_native.call_evdl_syscall targets, see open_text_box/close_text_box).
+-- These are the real EVDL VM opcode handlers (0, 1, 2); calling them requires
+-- a synthetic scriptCtx (see kh1_native.dll's call_evdl_syscall) rather than
+-- plain call_function, since they read their arguments off the script VM's
+-- stack instead of normal registers. Verified live via Cheat Engine
+-- (chest-open text prompt) + static disassembly, 2026-07-12.
+fnc_000_open_window = 0x1B93F0
+fnc_001_display_message = 0x1B8DD0
+fnc_002_close_window = 0x1B8100
+
+-- Open_window_no_close (opcode 0xB1) -- open_text_box uses this instead of
+-- fnc_000_open_window (opcode 0) because fnc_000's own close-when-queue-empty
+-- callback chain auto-closes the window the instant its one queued message
+-- finishes displaying, with no wait for a real player confirm press (fine
+-- for real EVDL scripts, which pace themselves across multiple yielded
+-- frames -- wrong for a single fire-and-forget Lua call). This opcode's
+-- callback chain instead leaves the window open (idle, state=4) once its
+-- queue empties, until fnc_002_close_window is called explicitly. Verified
+-- live via Cheat Engine breakpoint tracing, 2026-07-12.
+fnc_0B1_open_window_no_close = 0x1B9170
+
+-- custom text box hook (kh1_native.install_textbox_hook targets -- see
+-- open_text_box). hook/resume RVAs are the exact 8-byte
+-- "mov rdx,[r11+r10*8+g_pEVStringDataPtr]" window inside fnc_001_display_message
+-- where the resolved per-script message-string pointer lands in RDX right
+-- before being handed to the low-level "set window message" call. Redirecting
+-- RDX here (instead of touching g_pEVStringDataPtr itself, which is a small
+-- table scoped to whichever script is currently loaded) lets arbitrary Lua
+-- text be shown while message-count bookkeeping still happens for real via
+-- the real fnc_001_display_message call, so the window closes/advances
+-- correctly on player input. Verified live via Cheat Engine + static
+-- disassembly, 2026-07-12.
+fnc_display_message_text_hook = 0x1B8E6C
+fnc_display_message_text_resume = 0x1B8E74
+g_pEVStringDataPtr = 0x237C4E0
+
+-- second text box hook: a freshly-opened window is never state==4 ("idle,
+-- ready") in the same frame as fnc_0B1_open_window_no_close, so
+-- fnc_001_display_message doesn't itself display anything -- it just queues
+-- the message and returns early (see its comment). The actual display
+-- happens later, on whatever frame the window's open animation completes,
+-- via fnc_display_message_on_window_opened_no_close's OWN independent
+-- g_pEVStringDataPtr resolution. Hooking only the first site left real text
+-- showing every time (confirmed live via Cheat Engine breakpoint tracing --
+-- fnc_001_display_message was taking its early-return path on every call).
+-- Shares g_textBoxActive/g_textBoxBuffer with the first hook; whichever site
+-- actually fires consumes and self-clears the flag. hook/resume/call_target
+-- RVAs are the exact 9-byte "mov rdx,[r12+rdx*8]; call
+-- fnc_leaf_display_message" window inside
+-- fnc_display_message_on_window_opened_no_close (NOT the plain
+-- fnc_display_message_on_window_opened registered by fnc_000_open_window --
+-- open_text_box uses the _no_close open opcode so the window doesn't
+-- auto-close the instant its message finishes displaying; see
+-- fnc_0B1_open_window_no_close's comment).
+fnc_display_message_anim_hook = 0x1B9133
+fnc_display_message_anim_resume = 0x1B913C
+fnc_display_message_anim_call_target = 0x1764E0

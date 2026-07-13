@@ -324,3 +324,28 @@ fnc_item_popup_text_call_target = 0x27C2C0
 fnc_item_popup_tick = 0x271860
 fnc_item_popup_tick_resume = 0x271866
 g_item_popup_state = 0x284E340
+
+-- text box (EVDL Open_window/Display_message/Close_window syscall handlers --
+-- see SteamGlobal_1_0_0_2.lua for the full writeup). Matched from Steam via
+-- Ghidra cross-binary fuzzy match, verified by structural decompile comparison.
+fnc_000_open_window = 0x1B72A0
+fnc_001_display_message = 0x1B6C80
+fnc_002_close_window = 0x1B5FB0
+
+-- Open_window_no_close (see SteamGlobal_1_0_0_2.lua for the full writeup).
+fnc_0B1_open_window_no_close = 0x1B7020
+
+-- custom text box hook (see SteamGlobal_1_0_0_2.lua for the full writeup).
+-- Same 8-byte "mov rdx,[r11+r10*8+g_pEVStringDataPtr]" window, matched
+-- structurally from the Steam build's equivalent window.
+fnc_display_message_text_hook = 0x1B6D1C
+fnc_display_message_text_resume = 0x1B6D24
+g_pEVStringDataPtr = 0x23927C0
+
+-- second text box hook (see SteamGlobal_1_0_0_2.lua for the full writeup).
+-- Same 9-byte "mov rdx,[r12+rdx*8]; call fnc_leaf_display_message" window,
+-- matched structurally from the Steam build's equivalent window, inside
+-- fnc_display_message_on_window_opened_no_close.
+fnc_display_message_anim_hook = 0x1B6FE3
+fnc_display_message_anim_resume = 0x1B6FEC
+fnc_display_message_anim_call_target = 0x174400

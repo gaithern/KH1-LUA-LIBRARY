@@ -747,6 +747,70 @@ local function show_custom_item_popup(text)
     return kh1_native.call_function(fnc_show_item_message, 1, 1)
 end
 
+local function open_text_box(text, window_id)
+    --[[Opens a real EVDL dialogue/text window (the same kind used for NPC
+    talk prompts and chest item-get messages) showing arbitrary Lua-supplied
+    text, without needing an actual EVDL script to trigger it.
+
+    window_id selects both which of the 4 concurrent window "slots" gets used
+    and which previously-configured template (position/size/type, normally
+    set by a script's own Set_window_position/Set_window_size/Set_window_type
+    calls before it opens a window) the box inherits -- this function doesn't
+    configure those itself, so the box's on-screen appearance follows
+    whatever the last real window using that window_id looked like. Defaults
+    to 1, which is the id most on-foot dialogue/prompt windows use.
+
+    Calls the real fnc_0B1_open_window_no_close and fnc_001_display_message
+    EVDL syscall handlers via kh1_native.call_evdl_syscall, which builds a
+    throwaway scriptCtx and feeds them arguments the same way the real EVDL
+    interpreter would (these handlers read off a script-VM stack, not
+    registers -- see SteamGlobal_1_0_0_2.lua's fnc_0B1/001/002 comments).
+    Open_window_no_close (opcode 0xB1) is used instead of the plain
+    Open_window (opcode 0): fnc_000_open_window's own close-when-queue-empty
+    callback chain auto-closes the window the instant its one queued message
+    finishes displaying, with no wait for a real player confirm press --
+    confirmed live via Cheat Engine breakpoint tracing, the window was
+    closing within the same frame it finished typing out, regardless of
+    input. fnc_0B1_open_window_no_close's callback chain instead leaves the
+    window open (idle, ready) once its queue empties, so it stays up
+    indefinitely until close_text_box() is called.
+
+    Message id 0 is always pushed for Display_message; the real per-script
+    string table lookup that id would normally trigger is discarded because
+    two hooks (install_textbox_hook + install_textbox_anim_hook) redirect the
+    resolved text pointer to a custom KHSCII buffer instead. Two hooks are
+    needed because a freshly-opened window is never immediately "idle/ready"
+    in the same frame as fnc_0B1_open_window_no_close -- fnc_001_display_message
+    just queues the message and returns early, and the actual display happens
+    a few frames later via fnc_display_message_on_window_opened_no_close's own
+    independent lookup (confirmed live: hooking only the first site left the
+    window showing its real, unrelated leftover text every time). Both hooks
+    self-clear the moment either one actually fires, so this deliberately
+    does NOT call clear_textbox_text() itself. Message-count bookkeeping
+    still happens for real inside fnc_001_display_message.
+
+    Returns true if both syscalls completed without crashing.]]
+    window_id = window_id or 1
+    kh1_native.install_textbox_hook(fnc_display_message_text_hook, fnc_display_message_text_resume)
+    kh1_native.install_textbox_anim_hook(fnc_display_message_anim_hook, fnc_display_message_anim_resume, fnc_display_message_anim_call_target)
+    kh1_native.set_textbox_text(GetKHSCII(text))
+    local opened = kh1_native.call_evdl_syscall(fnc_0B1_open_window_no_close, {window_id})
+    local displayed = kh1_native.call_evdl_syscall(fnc_001_display_message, {window_id, 0})
+    return opened and displayed
+end
+
+local function close_text_box(window_id)
+    --[[Closes a text box opened via open_text_box (or a real in-game one)
+    using the same window_id. Calls the real fnc_002_close_window EVDL
+    syscall handler via kh1_native.call_evdl_syscall -- see open_text_box's
+    comment for how that works. Not required if the player is expected to
+    dismiss the box themselves; provided for programmatic control.
+
+    Returns true if the syscall completed without crashing.]]
+    window_id = window_id or 1
+    return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
+end
+
 return {
     byte_to_bits = byte_to_bits,
     bits_to_byte = bits_to_byte,
@@ -805,5 +869,7 @@ return {
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
-    show_custom_item_popup = show_custom_item_popup
+    show_custom_item_popup = show_custom_item_popup,
+    open_text_box = open_text_box,
+    close_text_box = close_text_box
 }
