@@ -22,7 +22,3 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/json.lua
-- name: scripts/io_packages/kh1_native.dll
-  method: copy
-  source:
-  - name: scripts/io_packages/kh1_native.dll
