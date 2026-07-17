@@ -1019,11 +1019,29 @@ static const luaL_Reg kh1_native_lib[] = {
     {nullptr, nullptr}
 };
 
-// LuaBackend (the OpenKH Lua host) embeds the Lua 5.4 runtime in its own DLL
-// rather than loading a separate "lua54.dll", and that host DLL's name varies
-// by build/game. So instead of guessing a filename, walk every module loaded
-// in this process and use whichever one actually exports the Lua C API.
-static HMODULE FindLuaModule() {
+// Every Lua C API export this module needs to bridge into the host's Lua
+// state. A candidate module only counts if ALL of these resolve from it --
+// see ModuleExportsAllRequired().
+static const char* const kRequiredLuaExports[] = {
+    "lua_gettop", "lua_tointegerx", "lua_tonumberx", "lua_pushinteger",
+    "lua_pushboolean", "lua_pushstring", "luaL_setfuncs", "lua_createtable",
+    "lua_rawlen", "lua_rawgeti", "lua_settop",
+};
+
+static bool ModuleExportsAllRequired(HMODULE mod) {
+    if (!mod) return false;
+    for (const char* name : kRequiredLuaExports) {
+        if (!GetProcAddress(mod, name)) return false;
+    }
+    return true;
+}
+
+// Last-resort fallback for a LuaBackend build FindLuaModule() doesn't
+// recognize: scan every module loaded in the process. Requires ALL required
+// symbols to resolve from the SAME module before accepting it (unlike the
+// single-symbol check this replaced), so a module that only partially
+// matches can't win just by enumerating first.
+static HMODULE FindLuaModuleByProcessScan() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return nullptr;
 
@@ -1032,10 +1050,10 @@ static HMODULE FindLuaModule() {
     me.dwSize = sizeof(me);
     if (Module32FirstW(snap, &me)) {
         do {
-            if (GetProcAddress(me.hModule, "lua_gettop")) {
+            if (ModuleExportsAllRequired(me.hModule)) {
                 found = me.hModule;
                 char msg[MAX_PATH + 32];
-                snprintf(msg, sizeof(msg), "Found Lua API in module: %ls", me.szModule);
+                snprintf(msg, sizeof(msg), "FindLuaModuleByProcessScan: found Lua API in module: %ls", me.szModule);
                 LogDebug(msg);
                 break;
             }
@@ -1043,6 +1061,61 @@ static HMODULE FindLuaModule() {
     }
     CloseHandle(snap);
     return found;
+}
+
+// LuaBackend (the OpenKH Lua host) gets its Lua 5.4 implementation from some
+// module -- either embedded directly in LuaBackend.dll, or a separate DLL it
+// imports (e.g. "lua54.dll" on the current Steam build) -- and which one
+// varies by build/game. This used to walk every loaded module in the process
+// and grab the first one exporting "lua_gettop", but that's a landmine:
+// lua-apclientpp.dll (the Archipelago Lua binding, shipped alongside this in
+// scripts/io_packages) statically embeds its own separate copy of Lua 5.4 and
+// exports the exact same symbol names, under a completely unrelated
+// lua_State. If it happens to enumerate before the real module, the bridge
+// silently binds to the wrong interpreter instance instead of failing
+// loudly. Anchoring to LuaBackend.dll's own dependency graph instead of a
+// process-wide name search makes that collision structurally impossible --
+// lua-apclientpp.dll is never something LuaBackend.dll itself imports.
+static HMODULE FindLuaModule() {
+    HMODULE luaBackend = GetModuleHandleA("LuaBackend.dll");
+    if (!luaBackend) {
+        LogDebug("FindLuaModule: LuaBackend.dll not found in process, falling back to process scan");
+        return FindLuaModuleByProcessScan();
+    }
+
+    // Tier 1: LuaBackend.dll embeds Lua directly and exports it itself.
+    if (ModuleExportsAllRequired(luaBackend)) {
+        LogDebug("FindLuaModule: Lua API resolved directly from LuaBackend.dll");
+        return luaBackend;
+    }
+
+    // Tier 2: walk LuaBackend.dll's own import table (already mapped, so
+    // this is just in-memory PE parsing off its own HMODULE base) and test
+    // each DLL it actually imports -- a short, fixed list that a same-process
+    // module like lua-apclientpp.dll can never appear in, regardless of load
+    // order.
+    BYTE* base = reinterpret_cast<BYTE*>(luaBackend);
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDir.VirtualAddress != 0) {
+        IMAGE_IMPORT_DESCRIPTOR* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + importDir.VirtualAddress);
+        for (; imp->Name != 0; imp++) {
+            const char* dllName = reinterpret_cast<const char*>(base + imp->Name);
+            HMODULE candidate = GetModuleHandleA(dllName);
+            if (ModuleExportsAllRequired(candidate)) {
+                char msg[MAX_PATH + 64];
+                snprintf(msg, sizeof(msg), "FindLuaModule: resolved via LuaBackend.dll import: %s", dllName);
+                LogDebug(msg);
+                return candidate;
+            }
+        }
+    }
+
+    // Tier 3: give up on LuaBackend.dll's own dependencies and fall back to
+    // the (now collision-hardened) process-wide scan.
+    LogDebug("FindLuaModule: no LuaBackend.dll dependency exports the Lua API, falling back to process scan");
+    return FindLuaModuleByProcessScan();
 }
 
 extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
