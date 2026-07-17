@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <vector>
 
+extern "C" {
+#include "lua54/lua.h"
+#include "lua54/lauxlib.h"
+}
+
 // --- DEBUG LOGGING ---
 static char g_dllDir[MAX_PATH] = "";
 
@@ -20,37 +25,6 @@ static void LogDebug(const char* msg) {
         fclose(f);
     }
 }
-
-// --- LUA FUNCTION POINTERS ---
-// Resolved against whichever already-loaded module in the host process exports
-// the Lua C API (no Lua headers needed) -- see FindLuaModule(). Same technique
-// as KH1Overlay's dllmain.cpp in the randomizer repo; duplicated here rather
-// than shared because this module is intentionally independent of it.
-typedef int          (__cdecl* t_lua_gettop)(void* L);
-typedef long long    (__cdecl* t_lua_tointegerx)(void* L, int idx, int* isnum);
-typedef double       (__cdecl* t_lua_tonumberx)(void* L, int idx, int* isnum);
-typedef void         (__cdecl* t_lua_pushinteger)(void* L, long long n);
-typedef void         (__cdecl* t_lua_pushboolean)(void* L, int b);
-typedef const char*  (__cdecl* t_lua_pushstring)(void* L, const char* s);
-typedef void         (__cdecl* t_luaL_setfuncs)(void* L, const void* l, int nup);
-typedef void         (__cdecl* t_lua_createtable)(void* L, int narr, int nrec);
-typedef unsigned long long (__cdecl* t_lua_rawlen)(void* L, int idx);
-typedef int          (__cdecl* t_lua_rawgeti)(void* L, int idx, long long n);
-typedef void         (__cdecl* t_lua_settop)(void* L, int idx);
-
-static t_lua_gettop       p_lua_gettop       = nullptr;
-static t_lua_tointegerx   p_lua_tointegerx   = nullptr;
-static t_lua_tonumberx    p_lua_tonumberx    = nullptr;
-static t_lua_pushinteger  p_lua_pushinteger  = nullptr;
-static t_lua_pushboolean  p_lua_pushboolean  = nullptr;
-static t_lua_pushstring   p_lua_pushstring   = nullptr;
-static t_luaL_setfuncs    p_luaL_setfuncs    = nullptr;
-static t_lua_createtable  p_lua_createtable  = nullptr;
-static t_lua_rawlen       p_lua_rawlen       = nullptr;
-static t_lua_rawgeti      p_lua_rawgeti      = nullptr;
-static t_lua_settop       p_lua_settop       = nullptr;
-
-struct luaL_Reg { const char* name; void* func; };
 
 // --- CALL BRIDGE ---
 // Windows x64 has a single calling convention (first four integer/pointer args
@@ -113,21 +87,21 @@ static bool SafeCall(unsigned long long address, const unsigned long long* args,
 // when the call itself doesn't fault. Prefer wrapping a specific, tested call
 // sequence in a named Lua function (see kh1_lua_library.lua) rather than
 // calling this directly from gameplay-facing code.
-extern "C" int l_call_function(void* L) {
-    int nargs = p_lua_gettop(L);
+extern "C" int l_call_function(lua_State* L) {
+    int nargs = lua_gettop(L);
     if (nargs < 1) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "call_function requires at least an address");
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "call_function requires at least an address");
         return 2;
     }
 
-    unsigned long long rva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long rva = (unsigned long long)lua_tointegerx(L, 1, nullptr);
     int argCount = nargs - 1;
     if (argCount > MAX_CALL_ARGS) argCount = MAX_CALL_ARGS;
 
     unsigned long long args[MAX_CALL_ARGS] = {};
     for (int i = 0; i < argCount; ++i) {
-        args[i] = (unsigned long long)p_lua_tointegerx(L, i + 2, nullptr);
+        args[i] = (unsigned long long)lua_tointegerx(L, i + 2, nullptr);
     }
 
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
@@ -140,13 +114,13 @@ extern "C" int l_call_function(void* L) {
         char msg[128];
         snprintf(msg, sizeof(msg), "call_function crashed: rva=0x%llx argCount=%d", rva, argCount);
         LogDebug(msg);
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "call_function: exception during call (bad address or arguments)");
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "call_function: exception during call (bad address or arguments)");
         return 2;
     }
 
-    p_lua_pushboolean(L, 1);
-    p_lua_pushinteger(L, (long long)result);
+    lua_pushboolean(L, 1);
+    lua_pushinteger(L, (long long)result);
     return 2;
 }
 
@@ -154,8 +128,8 @@ extern "C" int l_call_function(void* L) {
 // The main module's current runtime base address, for scripts that need to
 // reason about/log absolute addresses rather than just supplying an RVA to
 // call_function.
-extern "C" int l_get_module_base(void* L) {
-    p_lua_pushinteger(L, (long long)(unsigned long long)GetModuleHandleA(nullptr));
+extern "C" int l_get_module_base(lua_State* L) {
+    lua_pushinteger(L, (long long)(unsigned long long)GetModuleHandleA(nullptr));
     return 1;
 }
 
@@ -173,13 +147,13 @@ extern "C" int l_get_module_base(void* L) {
 static const int MAX_SCRATCH_FLOATS = 16;
 static float g_scratchFloats[MAX_SCRATCH_FLOATS];
 
-extern "C" int l_write_floats(void* L) {
-    int nargs = p_lua_gettop(L);
+extern "C" int l_write_floats(lua_State* L) {
+    int nargs = lua_gettop(L);
     if (nargs > MAX_SCRATCH_FLOATS) nargs = MAX_SCRATCH_FLOATS;
     for (int i = 0; i < nargs; ++i) {
-        g_scratchFloats[i] = (float)p_lua_tonumberx(L, i + 1, nullptr);
+        g_scratchFloats[i] = (float)lua_tonumberx(L, i + 1, nullptr);
     }
-    p_lua_pushinteger(L, (long long)(unsigned long long)(void*)g_scratchFloats);
+    lua_pushinteger(L, (long long)(unsigned long long)(void*)g_scratchFloats);
     return 1;
 }
 
@@ -206,16 +180,16 @@ extern "C" int l_write_floats(void* L) {
 static const unsigned long long MAX_SYSCALL_STACK = 32;
 static unsigned char g_scratchScriptCtx[4512] = {};
 
-extern "C" int l_call_evdl_syscall(void* L) {
-    unsigned long long rva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long len = p_lua_rawlen(L, 2);
+extern "C" int l_call_evdl_syscall(lua_State* L) {
+    unsigned long long rva = (unsigned long long)lua_tointegerx(L, 1, nullptr);
+    unsigned long long len = lua_rawlen(L, 2);
     if (len > MAX_SYSCALL_STACK) len = MAX_SYSCALL_STACK;
 
     memset(g_scratchScriptCtx, 0, sizeof(g_scratchScriptCtx));
     for (unsigned long long i = 0; i < len; ++i) {
-        p_lua_rawgeti(L, 2, (long long)(i + 1));
-        int32_t v = (int32_t)p_lua_tointegerx(L, -1, nullptr);
-        p_lua_settop(L, -2);
+        lua_rawgeti(L, 2, (long long)(i + 1));
+        int32_t v = (int32_t)lua_tointegerx(L, -1, nullptr);
+        lua_settop(L, -2);
         memcpy(g_scratchScriptCtx + 408 + i * 4, &v, 4);
     }
     int32_t stackIdx = (int32_t)(len > 0 ? len - 1 : 0);
@@ -231,13 +205,13 @@ extern "C" int l_call_evdl_syscall(void* L) {
         char msg[128];
         snprintf(msg, sizeof(msg), "call_evdl_syscall crashed: rva=0x%llx stackLen=%llu", rva, len);
         LogDebug(msg);
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "call_evdl_syscall: exception during call (bad address or arguments)");
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "call_evdl_syscall: exception during call (bad address or arguments)");
         return 2;
     }
 
-    p_lua_pushboolean(L, 1);
-    p_lua_pushinteger(L, (long long)result);
+    lua_pushboolean(L, 1);
+    lua_pushinteger(L, (long long)result);
     return 2;
 }
 
@@ -446,12 +420,12 @@ static bool InstallTextBoxHook(unsigned long long hookAddr, unsigned long long r
 
 // install_textbox_hook(hookRva, resumeRva) -> ok(boolean)
 // Idempotent -- safe to call every time before using set_textbox_text.
-extern "C" int l_install_textbox_hook(void* L) {
+extern "C" int l_install_textbox_hook(lua_State* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    unsigned long long hookRva = (unsigned long long)lua_tointegerx(L, 1, nullptr);
+    unsigned long long resumeRva = (unsigned long long)lua_tointegerx(L, 2, nullptr);
     bool ok = InstallTextBoxHook(base + hookRva, base + resumeRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
@@ -574,13 +548,13 @@ static bool InstallTextBoxAnimHook(unsigned long long hookAddr, unsigned long lo
 
 // install_textbox_anim_hook(hookRva, resumeRva, callTargetRva) -> ok(boolean)
 // Idempotent -- safe to call every time before using set_textbox_text.
-extern "C" int l_install_textbox_anim_hook(void* L) {
+extern "C" int l_install_textbox_anim_hook(lua_State* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    unsigned long long callTargetRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    unsigned long long hookRva = (unsigned long long)lua_tointegerx(L, 1, nullptr);
+    unsigned long long resumeRva = (unsigned long long)lua_tointegerx(L, 2, nullptr);
+    unsigned long long callTargetRva = (unsigned long long)lua_tointegerx(L, 3, nullptr);
     bool ok = InstallTextBoxAnimHook(base + hookRva, base + resumeRva, base + callTargetRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
@@ -592,14 +566,14 @@ extern "C" int l_install_textbox_anim_hook(void* L) {
 // display is usually deferred to a later frame (see the comment above
 // InstallTextBoxHook). Has no effect unless both install_textbox_hook() and
 // install_textbox_anim_hook() already succeeded.
-extern "C" int l_set_textbox_text(void* L) {
-    unsigned long long len = p_lua_rawlen(L, 1);
+extern "C" int l_set_textbox_text(lua_State* L) {
+    unsigned long long len = lua_rawlen(L, 1);
     const unsigned long long maxLen = sizeof(g_textBoxBuffer) - 1;
     if (len > maxLen) len = maxLen;
     for (unsigned long long i = 0; i < len; ++i) {
-        p_lua_rawgeti(L, 1, (long long)(i + 1));
-        g_textBoxBuffer[i] = (unsigned char)p_lua_tointegerx(L, -1, nullptr);
-        p_lua_settop(L, -2);
+        lua_rawgeti(L, 1, (long long)(i + 1));
+        g_textBoxBuffer[i] = (unsigned char)lua_tointegerx(L, -1, nullptr);
+        lua_settop(L, -2);
     }
     g_textBoxBuffer[len] = 0;
     g_textBoxActive = 1;
@@ -609,7 +583,7 @@ extern "C" int l_set_textbox_text(void* L) {
 // clear_textbox_text() -> (none)
 // Fallback/safety-net only (e.g. if the window never actually opened) --
 // normal use relies on the hooks' own self-clearing.
-extern "C" int l_clear_textbox_text(void* L) {
+extern "C" int l_clear_textbox_text(lua_State* L) {
     g_textBoxActive = 0;
     return 0;
 }
@@ -637,14 +611,14 @@ static volatile long g_pendingTextBoxWindowId = -1;
 static volatile unsigned long long g_pendingTextBoxCloseRva = 0;
 
 // set_pending_text_box(windowId, closeRva) -> (none)
-extern "C" int l_set_pending_text_box(void* L) {
-    g_pendingTextBoxWindowId = (long)p_lua_tointegerx(L, 1, nullptr);
-    g_pendingTextBoxCloseRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+extern "C" int l_set_pending_text_box(lua_State* L) {
+    g_pendingTextBoxWindowId = (long)lua_tointegerx(L, 1, nullptr);
+    g_pendingTextBoxCloseRva = (unsigned long long)lua_tointegerx(L, 2, nullptr);
     return 0;
 }
 
 // clear_pending_text_box() -> (none)
-extern "C" int l_clear_pending_text_box(void* L) {
+extern "C" int l_clear_pending_text_box(lua_State* L) {
     g_pendingTextBoxWindowId = -1;
     g_pendingTextBoxCloseRva = 0;
     return 0;
@@ -656,9 +630,9 @@ extern "C" int l_clear_pending_text_box(void* L) {
 // above for why it doesn't just look fnc_002_close_window up fresh. Builds
 // its own throwaway scriptCtx the same way call_evdl_syscall does (a single
 // stack arg: window_id). Returns false (no-op) if nothing is pending.
-extern "C" int l_close_pending_text_box(void* L) {
+extern "C" int l_close_pending_text_box(lua_State* L) {
     if (g_pendingTextBoxWindowId < 0 || g_pendingTextBoxCloseRva == 0) {
-        p_lua_pushboolean(L, 0);
+        lua_pushboolean(L, 0);
         return 1;
     }
 
@@ -684,7 +658,7 @@ extern "C" int l_close_pending_text_box(void* L) {
     g_pendingTextBoxWindowId = -1;
     g_pendingTextBoxCloseRva = 0;
 
-    p_lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
@@ -816,13 +790,13 @@ static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long
 
 // install_popup_text_hook(hookRva, resumeRva, callTargetRva) -> ok(boolean)
 // Idempotent -- safe to call every time before using set_custom_popup_text.
-extern "C" int l_install_popup_text_hook(void* L) {
+extern "C" int l_install_popup_text_hook(lua_State* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    unsigned long long callTargetRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    unsigned long long hookRva = (unsigned long long)lua_tointegerx(L, 1, nullptr);
+    unsigned long long resumeRva = (unsigned long long)lua_tointegerx(L, 2, nullptr);
+    unsigned long long callTargetRva = (unsigned long long)lua_tointegerx(L, 3, nullptr);
     bool ok = InstallPopupTextHook(base + hookRva, base + resumeRva, base + callTargetRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
@@ -964,13 +938,13 @@ static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned lon
 
 // install_popup_completion_hook(tickRva, resumeRva, stateRva) -> ok(boolean)
 // Idempotent -- safe to call every time before using set_custom_popup_text.
-extern "C" int l_install_popup_completion_hook(void* L) {
+extern "C" int l_install_popup_completion_hook(lua_State* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long tickRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    unsigned long long stateRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    unsigned long long tickRva = (unsigned long long)lua_tointegerx(L, 1, nullptr);
+    unsigned long long resumeRva = (unsigned long long)lua_tointegerx(L, 2, nullptr);
+    unsigned long long stateRva = (unsigned long long)lua_tointegerx(L, 3, nullptr);
     bool ok = InstallPopupCompletionHook(base + tickRva, base + resumeRva, base + stateRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
@@ -979,14 +953,14 @@ extern "C" int l_install_popup_completion_hook(void* L) {
 // Takes effect on the next fnc_enqueue_item_popup-driven popup, real or
 // triggered via show_item_popup -- until clear_custom_popup_text() is
 // called. Has no effect unless install_popup_text_hook() already succeeded.
-extern "C" int l_set_custom_popup_text(void* L) {
-    unsigned long long len = p_lua_rawlen(L, 1);
+extern "C" int l_set_custom_popup_text(lua_State* L) {
+    unsigned long long len = lua_rawlen(L, 1);
     const unsigned long long maxLen = sizeof(g_customTextBuffer) - 1;
     if (len > maxLen) len = maxLen;
     for (unsigned long long i = 0; i < len; ++i) {
-        p_lua_rawgeti(L, 1, (long long)(i + 1));
-        g_customTextBuffer[i] = (unsigned char)p_lua_tointegerx(L, -1, nullptr);
-        p_lua_settop(L, -2);
+        lua_rawgeti(L, 1, (long long)(i + 1));
+        g_customTextBuffer[i] = (unsigned char)lua_tointegerx(L, -1, nullptr);
+        lua_settop(L, -2);
     }
     g_customTextBuffer[len] = 0;
     g_customTextActive = 1;
@@ -995,181 +969,52 @@ extern "C" int l_set_custom_popup_text(void* L) {
 
 // clear_custom_popup_text() -> (none)
 // Reverts fnc_draw_item_popup_entry to showing real item names again.
-extern "C" int l_clear_custom_popup_text(void* L) {
+extern "C" int l_clear_custom_popup_text(lua_State* L) {
     g_customTextActive = 0;
     return 0;
 }
 
 static const luaL_Reg kh1_native_lib[] = {
-    {"call_function", reinterpret_cast<void*>(l_call_function)},
-    {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
-    {"write_floats", reinterpret_cast<void*>(l_write_floats)},
-    {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
-    {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
-    {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},
-    {"clear_custom_popup_text", reinterpret_cast<void*>(l_clear_custom_popup_text)},
-    {"call_evdl_syscall", reinterpret_cast<void*>(l_call_evdl_syscall)},
-    {"install_textbox_hook", reinterpret_cast<void*>(l_install_textbox_hook)},
-    {"install_textbox_anim_hook", reinterpret_cast<void*>(l_install_textbox_anim_hook)},
-    {"set_textbox_text", reinterpret_cast<void*>(l_set_textbox_text)},
-    {"clear_textbox_text", reinterpret_cast<void*>(l_clear_textbox_text)},
-    {"set_pending_text_box", reinterpret_cast<void*>(l_set_pending_text_box)},
-    {"clear_pending_text_box", reinterpret_cast<void*>(l_clear_pending_text_box)},
-    {"close_pending_text_box", reinterpret_cast<void*>(l_close_pending_text_box)},
+    {"call_function", l_call_function},
+    {"get_module_base", l_get_module_base},
+    {"write_floats", l_write_floats},
+    {"install_popup_text_hook", l_install_popup_text_hook},
+    {"install_popup_completion_hook", l_install_popup_completion_hook},
+    {"set_custom_popup_text", l_set_custom_popup_text},
+    {"clear_custom_popup_text", l_clear_custom_popup_text},
+    {"call_evdl_syscall", l_call_evdl_syscall},
+    {"install_textbox_hook", l_install_textbox_hook},
+    {"install_textbox_anim_hook", l_install_textbox_anim_hook},
+    {"set_textbox_text", l_set_textbox_text},
+    {"clear_textbox_text", l_clear_textbox_text},
+    {"set_pending_text_box", l_set_pending_text_box},
+    {"clear_pending_text_box", l_clear_pending_text_box},
+    {"close_pending_text_box", l_close_pending_text_box},
     {nullptr, nullptr}
 };
 
-// Every Lua C API export this module needs to bridge into the host's Lua
-// state. A candidate module only counts if ALL of these resolve from it --
-// see ModuleExportsAllRequired().
-static const char* const kRequiredLuaExports[] = {
-    "lua_gettop", "lua_tointegerx", "lua_tonumberx", "lua_pushinteger",
-    "lua_pushboolean", "lua_pushstring", "luaL_setfuncs", "lua_createtable",
-    "lua_rawlen", "lua_rawgeti", "lua_settop",
-};
-
-// If `label` is given and `mod` exports at least one required symbol but not
-// all of them, logs exactly which ones are missing. `label` is omitted for
-// the Tier 3 process-wide scan's usual candidates so the log isn't spammed
-// with a line for every unrelated system DLL that matches zero symbols.
-static bool ModuleExportsAllRequired(HMODULE mod, const char* label = nullptr) {
-    if (!mod) return false;
-    int foundCount = 0;
-    char missing[512] = "";
-    size_t missingLen = 0;
-    for (const char* name : kRequiredLuaExports) {
-        if (GetProcAddress(mod, name)) {
-            foundCount++;
-        } else if (label) {
-            int n = snprintf(missing + missingLen, sizeof(missing) - missingLen, " %s", name);
-            if (n > 0) missingLen += n;
-        }
-    }
-    constexpr int kRequiredCount = sizeof(kRequiredLuaExports) / sizeof(kRequiredLuaExports[0]);
-    bool allPresent = (foundCount == kRequiredCount);
-    if (label && foundCount > 0 && !allPresent) {
-        char msg[600];
-        snprintf(msg, sizeof(msg), "%s: partial match (%d/%d), missing:%s", label, foundCount, kRequiredCount, missing);
-        LogDebug(msg);
-    }
-    return allPresent;
-}
-
-// Last-resort fallback for a LuaBackend build FindLuaModule() doesn't
-// recognize: scan every module loaded in the process. Requires ALL required
-// symbols to resolve from the SAME module before accepting it (unlike the
-// single-symbol check this replaced), so a module that only partially
-// matches can't win just by enumerating first.
-static HMODULE FindLuaModuleByProcessScan() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-    if (snap == INVALID_HANDLE_VALUE) return nullptr;
-
-    HMODULE found = nullptr;
-    MODULEENTRY32W me = {};
-    me.dwSize = sizeof(me);
-    if (Module32FirstW(snap, &me)) {
-        do {
-            char narrowName[MAX_PATH];
-            WideCharToMultiByte(CP_ACP, 0, me.szModule, -1, narrowName, sizeof(narrowName), nullptr, nullptr);
-            if (ModuleExportsAllRequired(me.hModule, narrowName)) {
-                found = me.hModule;
-                char msg[MAX_PATH + 32];
-                snprintf(msg, sizeof(msg), "FindLuaModuleByProcessScan: found Lua API in module: %s", narrowName);
-                LogDebug(msg);
-                break;
-            }
-        } while (Module32NextW(snap, &me));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
-// LuaBackend (the OpenKH Lua host) gets its Lua 5.4 implementation from some
-// module -- either embedded directly in LuaBackend.dll, or a separate DLL it
-// imports (e.g. "lua54.dll" on the current Steam build) -- and which one
-// varies by build/game. This used to walk every loaded module in the process
-// and grab the first one exporting "lua_gettop", but that's a landmine:
-// lua-apclientpp.dll (the Archipelago Lua binding, shipped alongside this in
-// scripts/io_packages) statically embeds its own separate copy of Lua 5.4 and
-// exports the exact same symbol names, under a completely unrelated
-// lua_State. If it happens to enumerate before the real module, the bridge
-// silently binds to the wrong interpreter instance instead of failing
-// loudly. Anchoring to LuaBackend.dll's own dependency graph instead of a
-// process-wide name search makes that collision structurally impossible --
-// lua-apclientpp.dll is never something LuaBackend.dll itself imports.
-static HMODULE FindLuaModule() {
-    HMODULE luaBackend = GetModuleHandleA("LuaBackend.dll");
-    if (!luaBackend) {
-        LogDebug("FindLuaModule: LuaBackend.dll not found in process, falling back to process scan");
-        return FindLuaModuleByProcessScan();
-    }
-
-    // Tier 1: LuaBackend.dll embeds Lua directly and exports it itself.
-    if (ModuleExportsAllRequired(luaBackend, "LuaBackend.dll (self)")) {
-        LogDebug("FindLuaModule: Lua API resolved directly from LuaBackend.dll");
-        return luaBackend;
-    }
-
-    // Tier 2: walk LuaBackend.dll's own import table (already mapped, so
-    // this is just in-memory PE parsing off its own HMODULE base) and test
-    // each DLL it actually imports -- a short, fixed list that a same-process
-    // module like lua-apclientpp.dll can never appear in, regardless of load
-    // order.
-    BYTE* base = reinterpret_cast<BYTE*>(luaBackend);
-    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    IMAGE_DATA_DIRECTORY importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDir.VirtualAddress != 0) {
-        IMAGE_IMPORT_DESCRIPTOR* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + importDir.VirtualAddress);
-        for (; imp->Name != 0; imp++) {
-            const char* dllName = reinterpret_cast<const char*>(base + imp->Name);
-            HMODULE candidate = GetModuleHandleA(dllName);
-            if (ModuleExportsAllRequired(candidate, dllName)) {
-                char msg[MAX_PATH + 64];
-                snprintf(msg, sizeof(msg), "FindLuaModule: resolved via LuaBackend.dll import: %s", dllName);
-                LogDebug(msg);
-                return candidate;
-            }
-        }
-    }
-
-    // Tier 3: give up on LuaBackend.dll's own dependencies and fall back to
-    // the (now collision-hardened) process-wide scan.
-    LogDebug("FindLuaModule: no LuaBackend.dll dependency exports the Lua API, falling back to process scan");
-    return FindLuaModuleByProcessScan();
-}
-
-extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
+// Lua 5.4 is statically linked into this DLL (see lua54/, vendored from
+// lua.org) rather than resolved from whatever the host process happens to
+// have loaded. LuaBackend (the OpenKH Lua host) hands luaopen_kh1_native a
+// real lua_State* below, and these are just ordinary linked C functions
+// operating on that pointer -- there's no ABI reason they need to be the
+// SAME compiled copy of Lua that created the state, only the same Lua
+// version, which is guaranteed here since it's vendored and pinned (5.4.7).
+//
+// This replaces an earlier design that scanned the host process at runtime
+// for a module exporting the Lua C API by name (see git history). That
+// approach turned out to be fundamentally unreliable: some legitimate
+// LuaBackend builds statically embed Lua without exporting it anywhere any
+// module can see, so there was nothing for any scan -- however careful -- to
+// find. Confirmed live via Cheat Engine across multiple machines, 2026-07-17.
+//
+// LUA_BUILD_AS_DLL is deliberately left undefined (see the vcxproj comment
+// next to the lua54\*.c entries) so none of this is exported from
+// kh1_native.dll itself -- it stays private to this module.
+extern "C" __declspec(dllexport) int luaopen_kh1_native(lua_State* L) {
     LogDebug("luaopen_kh1_native called");
-
-    HMODULE hLua = FindLuaModule();
-    if (hLua && !p_lua_gettop) {
-        p_lua_gettop      = (t_lua_gettop)      GetProcAddress(hLua, "lua_gettop");
-        p_lua_tointegerx  = (t_lua_tointegerx)  GetProcAddress(hLua, "lua_tointegerx");
-        p_lua_tonumberx   = (t_lua_tonumberx)   GetProcAddress(hLua, "lua_tonumberx");
-        p_lua_pushinteger = (t_lua_pushinteger) GetProcAddress(hLua, "lua_pushinteger");
-        p_lua_pushboolean = (t_lua_pushboolean) GetProcAddress(hLua, "lua_pushboolean");
-        p_lua_pushstring  = (t_lua_pushstring)  GetProcAddress(hLua, "lua_pushstring");
-        p_luaL_setfuncs   = (t_luaL_setfuncs)   GetProcAddress(hLua, "luaL_setfuncs");
-        p_lua_createtable = (t_lua_createtable) GetProcAddress(hLua, "lua_createtable");
-        p_lua_rawlen      = (t_lua_rawlen)      GetProcAddress(hLua, "lua_rawlen");
-        p_lua_rawgeti     = (t_lua_rawgeti)     GetProcAddress(hLua, "lua_rawgeti");
-        p_lua_settop      = (t_lua_settop)      GetProcAddress(hLua, "lua_settop");
-    }
-
-    if (!p_lua_gettop || !p_lua_tointegerx || !p_lua_tonumberx || !p_lua_pushinteger || !p_lua_pushboolean ||
-        !p_lua_pushstring || !p_luaL_setfuncs || !p_lua_createtable ||
-        !p_lua_rawlen || !p_lua_rawgeti || !p_lua_settop) {
-        // Couldn't find a loaded module exporting the Lua C API -- bail out
-        // without touching any of them. Returning 0 (no pushed values) makes
-        // require() hand back `true` rather than crashing on a null function
-        // pointer call.
-        LogDebug("luaopen_kh1_native: failed to resolve Lua API exports, aborting safely");
-        return 0;
-    }
-
-    p_lua_createtable(L, 0, 2);
-    p_luaL_setfuncs(L, kh1_native_lib, 0);
+    lua_createtable(L, 0, 2);
+    luaL_setfuncs(L, kh1_native_lib, 0);
     return 1;
 }
 
