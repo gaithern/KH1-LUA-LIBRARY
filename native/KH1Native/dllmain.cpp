@@ -1028,12 +1028,31 @@ static const char* const kRequiredLuaExports[] = {
     "lua_rawlen", "lua_rawgeti", "lua_settop",
 };
 
-static bool ModuleExportsAllRequired(HMODULE mod) {
+// If `label` is given and `mod` exports at least one required symbol but not
+// all of them, logs exactly which ones are missing. `label` is omitted for
+// the Tier 3 process-wide scan's usual candidates so the log isn't spammed
+// with a line for every unrelated system DLL that matches zero symbols.
+static bool ModuleExportsAllRequired(HMODULE mod, const char* label = nullptr) {
     if (!mod) return false;
+    int foundCount = 0;
+    char missing[512] = "";
+    size_t missingLen = 0;
     for (const char* name : kRequiredLuaExports) {
-        if (!GetProcAddress(mod, name)) return false;
+        if (GetProcAddress(mod, name)) {
+            foundCount++;
+        } else if (label) {
+            int n = snprintf(missing + missingLen, sizeof(missing) - missingLen, " %s", name);
+            if (n > 0) missingLen += n;
+        }
     }
-    return true;
+    constexpr int kRequiredCount = sizeof(kRequiredLuaExports) / sizeof(kRequiredLuaExports[0]);
+    bool allPresent = (foundCount == kRequiredCount);
+    if (label && foundCount > 0 && !allPresent) {
+        char msg[600];
+        snprintf(msg, sizeof(msg), "%s: partial match (%d/%d), missing:%s", label, foundCount, kRequiredCount, missing);
+        LogDebug(msg);
+    }
+    return allPresent;
 }
 
 // Last-resort fallback for a LuaBackend build FindLuaModule() doesn't
@@ -1050,10 +1069,12 @@ static HMODULE FindLuaModuleByProcessScan() {
     me.dwSize = sizeof(me);
     if (Module32FirstW(snap, &me)) {
         do {
-            if (ModuleExportsAllRequired(me.hModule)) {
+            char narrowName[MAX_PATH];
+            WideCharToMultiByte(CP_ACP, 0, me.szModule, -1, narrowName, sizeof(narrowName), nullptr, nullptr);
+            if (ModuleExportsAllRequired(me.hModule, narrowName)) {
                 found = me.hModule;
                 char msg[MAX_PATH + 32];
-                snprintf(msg, sizeof(msg), "FindLuaModuleByProcessScan: found Lua API in module: %ls", me.szModule);
+                snprintf(msg, sizeof(msg), "FindLuaModuleByProcessScan: found Lua API in module: %s", narrowName);
                 LogDebug(msg);
                 break;
             }
@@ -1084,7 +1105,7 @@ static HMODULE FindLuaModule() {
     }
 
     // Tier 1: LuaBackend.dll embeds Lua directly and exports it itself.
-    if (ModuleExportsAllRequired(luaBackend)) {
+    if (ModuleExportsAllRequired(luaBackend, "LuaBackend.dll (self)")) {
         LogDebug("FindLuaModule: Lua API resolved directly from LuaBackend.dll");
         return luaBackend;
     }
@@ -1103,7 +1124,7 @@ static HMODULE FindLuaModule() {
         for (; imp->Name != 0; imp++) {
             const char* dllName = reinterpret_cast<const char*>(base + imp->Name);
             HMODULE candidate = GetModuleHandleA(dllName);
-            if (ModuleExportsAllRequired(candidate)) {
+            if (ModuleExportsAllRequired(candidate, dllName)) {
                 char msg[MAX_PATH + 64];
                 snprintf(msg, sizeof(msg), "FindLuaModule: resolved via LuaBackend.dll import: %s", dllName);
                 LogDebug(msg);
