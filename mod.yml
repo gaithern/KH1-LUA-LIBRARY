@@ -26,3 +26,7 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/kh1_native.dll
+- name: dll/lua54.dll
+  method: copy
+  source:
+  - name: dll/lua54.dll
