@@ -2,14 +2,14 @@ title: KH1 Lua Library
 originalAuthor: Gicu
 description: Library of Lua functions for use in rando and other mods
 assets:
+- name: dll/lua54.dll
+  method: copy
+  source:
+  - name: dll/lua54.dll
 - name: scripts/io_packages/EGSGlobal_1_0_0_10.lua
   method: copy
   source:
   - name: scripts/io_packages/EGSGlobal_1_0_0_10.lua
-- name: scripts/io_packages/kh1_lua_library.lua
-  method: copy
-  source:
-  - name: scripts/io_packages/kh1_lua_library.lua
 - name: scripts/io_packages/SteamGlobal_1_0_0_2.lua
   method: copy
   source:
@@ -22,11 +22,11 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/json.lua
+- name: scripts/io_packages/kh1_lua_library.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/kh1_lua_library.lua
 - name: scripts/io_packages/kh1_native.dll
   method: copy
   source:
   - name: scripts/io_packages/kh1_native.dll
-- name: dll/lua54.dll
-  method: copy
-  source:
-  - name: dll/lua54.dll
