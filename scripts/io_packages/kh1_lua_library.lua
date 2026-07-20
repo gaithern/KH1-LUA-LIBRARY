@@ -1029,17 +1029,27 @@ local function sora_koed()
 end
 
 local function ko_sora()
-    --[[Instantly triggers the real in-game Game Over sequence by calling
-    fnc_116_game_over (EVDL syscall opcode 0x116) via
-    kh1_native.call_evdl_syscall -- see SteamGlobal_1_0_0_2.lua for what the
-    native function itself does (game-over flag, subsystem shutdown, delayed
-    callback, screen transition). Takes no scriptCtx stack args. Replaces an
-    earlier version of this that manually zeroed Sora's HP, forced stateFlag,
-    and NOP'd the deathCheck function -- a memory hack that left a dangling,
-    never-consumed revertCode flag instead of letting the game handle its own
-    death sequence.]]
+    --[[Instantly triggers the real full in-game KO sequence (death
+    animation + input lock + Game Over menu) by calling
+    fnc_trigger_ko_event_script(0xC8) via kh1_native.call_function -- see
+    SteamGlobal_1_0_0_2.lua for the full writeup. This is a normal fastcall
+    function (one integer arg, no scriptCtx), NOT an EVDL syscall handler --
+    it cold-starts EVDL event script 0xC8 (Sora's real KO script) and enters
+    actual cutscene mode, which is what naturally locks player input and
+    plays the KO animation; the script itself eventually brings up the same
+    Game Over menu as fnc_116_game_over.
+
+    Live-verified via Cheat Engine on 2026-07-20 by breakpointing the real
+    death-processing code path during an actual in-game KO and reading the
+    exact function/argument the game itself calls.
+
+    Replaces two earlier, less complete versions of this: (1) a raw
+    fnc_116_game_over syscall call, which only opened the Game Over menu and
+    left Sora still actionable underneath it, and before that (2) a manual
+    HP-zero/stateFlag/deathCheck-NOP memory hack that left a dangling,
+    never-consumed revertCode flag.]]
     if not sora_koed() then
-        kh1_native.call_evdl_syscall(fnc_116_game_over, {})
+        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
     end
 end
 
