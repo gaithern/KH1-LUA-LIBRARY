@@ -30,6 +30,14 @@ saveOpenAddress = 0x232DFA4
 skippable = 0x2382594
 soraHP = 0x2D5CC4C
 soraHUD = 0x281249C
+-- fnc_apply_actor_status_effect(actor_ptr, type_flags): resolves actor_ptr+0x68's
+-- status-effect table and activates entry (type_flags & 0x7FF); bit 0x800 =
+-- persistent/infinite duration. Native engine call behind the .bd AI verb
+-- t0 0x4b (AttachStatusEffect?) - see KH1-EVDL-TOOLS docs/enemy_ai for how
+-- Sephiroth's Heartless Angel (ex_3000_02.bd) chains 11 of these (type index
+-- 34-44) onto its target. EGS RVA not yet resolved (fuzzy-match came back
+-- empty/unreliable for this short function on 2026-07-20) - Steam only so far.
+fnc_apply_actor_status_effect = 0x2AE160
 stateFlag = 0x2867364
 summoning = 0x2D60FAC
 textProg = 0x232DF74
