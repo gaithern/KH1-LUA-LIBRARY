@@ -1029,12 +1029,17 @@ local function sora_koed()
 end
 
 local function ko_sora()
+    --[[Instantly triggers the real in-game Game Over sequence by calling
+    fnc_116_game_over (EVDL syscall opcode 0x116) via
+    kh1_native.call_evdl_syscall -- see SteamGlobal_1_0_0_2.lua for what the
+    native function itself does (game-over flag, subsystem shutdown, delayed
+    callback, screen transition). Takes no scriptCtx stack args. Replaces an
+    earlier version of this that manually zeroed Sora's HP, forced stateFlag,
+    and NOP'd the deathCheck function -- a memory hack that left a dangling,
+    never-consumed revertCode flag instead of letting the game handle its own
+    death sequence.]]
     if not sora_koed() then
-        WriteByte(soraHP, 0)
-        WriteByte(maxHP - 0x1, 0)
-        WriteByte(stateFlag, 1)
-        WriteShort(deathCheck, 0x9090)
-        revertCode = true
+        kh1_native.call_evdl_syscall(fnc_116_game_over, {})
     end
 end
 

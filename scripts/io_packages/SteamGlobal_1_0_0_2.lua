@@ -376,6 +376,15 @@ fnc_005_set_window_type = 0x1B98F0
 fnc_003_set_window_position = 0x1B9770
 fnc_004_set_window_size = 0x1B97D0
 
+-- Game_over (opcode 0x116) -- kh1_native.call_evdl_syscall target, see
+-- ko_sora. Takes no scriptCtx stack args. Triggers the real in-game Game
+-- Over sequence: sets the game-over-active flag, runs input/camera/audio
+-- shutdown, schedules a delayed callback, then a screen-state transition --
+-- confirmed via Ghidra decompile (fnc_116_game_over calls a single helper
+-- doing all of the above; both renamed/commented in Ghidra 2026-07-20).
+-- Replaces the previous manual HP-zero/stateFlag/deathCheck-NOP memory hack.
+fnc_116_game_over = 0x1ACC00
+
 -- custom text box hook (kh1_native.install_textbox_hook targets -- see
 -- open_text_box). hook/resume RVAs are the exact 8-byte
 -- "mov rdx,[r11+r10*8+g_pEVStringDataPtr]" window inside fnc_001_display_message
