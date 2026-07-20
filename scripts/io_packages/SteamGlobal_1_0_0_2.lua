@@ -376,14 +376,33 @@ fnc_005_set_window_type = 0x1B98F0
 fnc_003_set_window_position = 0x1B9770
 fnc_004_set_window_size = 0x1B97D0
 
--- Game_over (opcode 0x116) -- kh1_native.call_evdl_syscall target, see
--- ko_sora. Takes no scriptCtx stack args. Triggers the real in-game Game
--- Over sequence: sets the game-over-active flag, runs input/camera/audio
--- shutdown, schedules a delayed callback, then a screen-state transition --
--- confirmed via Ghidra decompile (fnc_116_game_over calls a single helper
--- doing all of the above; both renamed/commented in Ghidra 2026-07-20).
--- Replaces the previous manual HP-zero/stateFlag/deathCheck-NOP memory hack.
+-- Game_over (opcode 0x116) -- kh1_native.call_evdl_syscall target. Takes no
+-- scriptCtx stack args. Only brings up the Game Over menu itself (game-over
+-- flag, input/camera/audio shutdown, a delayed callback, a screen-state
+-- transition) -- confirmed via Ghidra decompile, but confirmed live
+-- 2026-07-20 that calling this alone leaves the player still actionable
+-- underneath the menu. NOT currently used by ko_sora -- see
+-- fnc_trigger_ko_event_script below for the real full-KO trigger, which
+-- naturally leads into this same menu as part of its own event script.
 fnc_116_game_over = 0x1ACC00
+
+-- Trigger_ko_event_script -- kh1_native.call_function target, see ko_sora.
+-- NOT an EVDL syscall handler (normal fastcall convention, one integer arg
+-- in RCX, no scriptCtx). This is the real "party member KO'd" trigger: sets
+-- flags on the global Sora object, then cold-starts an EVDL event script by
+-- numeric id (the arg) via fnc_ev_script_cold_init, entering real cutscene
+-- mode (g_InCutscene) -- which is what actually locks player input, unlike
+-- fnc_116_game_over alone. That cutscene's own script plays the KO
+-- animation and eventually shows the Game Over menu itself. Live-verified
+-- 2026-07-20 via Cheat Engine: a hardware breakpoint on the CMP/JZ guard
+-- inside the shared per-party-member HP-processing function (this repo's
+-- deathCheck address, now understood to gate this exact call) fired exactly
+-- once during a real in-game death, with the dying character's resolved
+-- struct pointer in RDI and word ptr [RDI+0x17C] == 0xC8 (200) -- the
+-- script id for Sora's KO specifically, passed straight through as this
+-- function's only argument. Call as
+-- kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8).
+fnc_trigger_ko_event_script = 0x1C43D0
 
 -- custom text box hook (kh1_native.install_textbox_hook targets -- see
 -- open_text_box). hook/resume RVAs are the exact 8-byte
