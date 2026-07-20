@@ -775,6 +775,42 @@ local function play_se2(se_id, param_2)
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
 end
 
+local function apply_status_effect_to_sora(type_index, persistent)
+    --[[Investigative/debug tool, NOT confirmed safe for normal gameplay use.
+
+    Calls fnc_apply_actor_status_effect(sora_actor_ptr, type_flags) directly
+    against Sora's own actor (GetPointer(soraPointer)) via
+    kh1_native.call_function. This is the exact native call the .bd AI
+    scripting language's verb t0 0x4b (AttachStatusEffect?) goes through --
+    confirmed by decompiling the chain in Ghidra (fnc_bd_verb_attach_status_effect
+    @ 0x1402ba410 -> fnc_apply_actor_status_effect @ 0x1402ae160 ->
+    fnc_status_effect_activate_by_type @ 0x1401e0100). type_index is looked
+    up in the ACTOR's own status-effect table (actor_ptr+0x68) - it is NOT
+    confirmed to be a universal/game-wide id, so a given type_index may mean
+    something completely different (or nothing at all) depending on which
+    actor it's applied to.
+
+    Added 2026-07-20 while investigating Sephiroth's Heartless Angel attack:
+    his ex_3000_02.bd behavior block calls this chain 11 times in a row
+    against its target with type_index 34 through 44 (raw values 2082-2092,
+    all with the persistent bit set), immediately before a MakeAttack call.
+    This function exists to test type_index values 0-51ish live against
+    Sora and observe what actually happens (HP/MP/other) - see the debug
+    overlay's "Apply Status Effect (Sora)" action.
+
+    persistent (bool, default true) sets bit 0x800 (infinite duration),
+    matching every real .bd call site surveyed so far (all had it set).
+
+    Returns true if the call completed without crashing -- NOT a confirmation
+    that the effect index is meaningful or safe. Untested type indices could
+    plausibly corrupt actor state; this is diagnostic tooling, not a stable
+    API.]]
+    local flags = type_index & 0x7FF
+    if persistent == nil or persistent then flags = flags | 0x800 end
+    local sora_actor = GetPointer(soraPointer)
+    return kh1_native.call_function(fnc_apply_actor_status_effect, sora_actor, flags)
+end
+
 -- Keyed by window_id; each entry is {deadline=os.clock() value or nil,
 -- open_world=byte, open_room=byte}. Always populated on a successful open
 -- (regardless of duration_seconds) so update_text_boxes can auto-close on a
@@ -988,6 +1024,44 @@ local function update_text_boxes()
     end
 end
 
+local function sora_koed()
+    return ReadByte(maxHP - 0x1) == 0
+end
+
+local function ko_sora()
+    --[[Instantly triggers the real full in-game KO sequence (death
+    animation + input lock + Game Over menu) by calling
+    fnc_trigger_ko_event_script(0xC8) via kh1_native.call_function -- see
+    SteamGlobal_1_0_0_2.lua for the full writeup. This is a normal fastcall
+    function (one integer arg, no scriptCtx), NOT an EVDL syscall handler --
+    it cold-starts EVDL event script 0xC8 (Sora's real KO script) and enters
+    actual cutscene mode, which is what naturally locks player input and
+    plays the KO animation; the script itself eventually brings up the same
+    Game Over menu as fnc_116_game_over.
+
+    Live-verified via Cheat Engine on 2026-07-20 by breakpointing the real
+    death-processing code path during an actual in-game KO and reading the
+    exact function/argument the game itself calls.
+
+    Replaces two earlier, less complete versions of this: (1) a raw
+    fnc_116_game_over syscall call, which only opened the Game Over menu and
+    left Sora still actionable underneath it, and before that (2) a manual
+    HP-zero/stateFlag/deathCheck-NOP memory hack that left a dangling,
+    never-consumed revertCode flag.]]
+    if not sora_koed() then
+        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
+    end
+end
+
+local function heartless_angel_sora()
+    if not sora_koed() then
+        WriteByte(soraHP, 1)
+        WriteByte(maxHP - 0x1, 1)
+        WriteByte(soraHP + 0x8, 0)
+        WriteByte(maxHP - 0x1 + 2, 0)
+    end
+end
+
 return {
     byte_to_bits = byte_to_bits,
     bits_to_byte = bits_to_byte,
@@ -1048,10 +1122,14 @@ return {
     spawn_prize = spawn_prize,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
+    apply_status_effect_to_sora = apply_status_effect_to_sora,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,
     set_text_box_style = set_text_box_style,
     set_text_box_position = set_text_box_position,
-    set_text_box_size = set_text_box_size
+    set_text_box_size = set_text_box_size,
+    sora_koed = sora_koed,
+    ko_sora = ko_sora,
+    heartless_angel_sora = heartless_angel_sora
 }
