@@ -310,6 +310,16 @@ UK_Word = 0x2E1AC60
 fnc_spawn_prize = 0x2BFF00
 fnc_update_widget_queue = 0x2AB8E0
 
+-- spawn_enemy (kh1_native.spawn_enemy target -- low-level entity constructor,
+-- splices a synthetic record into the room's live placement table then calls
+-- this directly -- see
+-- KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md)
+fnc_spawn_world_gimmick_entity = 0x290D60
+-- current room's live placement-table pointer/count (DAT_14296b630/
+-- DAT_14296b628 in Ghidra)
+placementTablePtr = 0x296B630
+placementTableCount = 0x296B628
+
 -- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
 -- pickup popup directly, independent of any actual pickup)
 fnc_show_item_message = 0x273410

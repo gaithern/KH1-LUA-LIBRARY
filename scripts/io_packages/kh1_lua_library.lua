@@ -721,6 +721,47 @@ local function spawn_prize(item_id)
     return spawned
 end
 
+local function spawn_enemy(x, y, z, species)
+    --[[Spawns a Heartless (or other placement-table-driven entity) at an
+    arbitrary world position via kh1_native.spawn_enemy.
+
+    Unlike spawn_prize (which wraps a purpose-built fnc_spawn_prize taking an
+    explicit position pointer), Heartless have no such convenience wrapper --
+    this calls the lower-level fnc_spawn_world_gimmick_entity directly. That
+    function resolves its argument by exact-matching it against a record in
+    the current room's own live placement table, so this works by cloning an
+    EXISTING record of the requested species from that table, editing its id
+    and position, and appending it -- see native/KH1Native/dllmain.cpp's
+    l_spawn_enemy for the full mechanism and
+    KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md for
+    how the record format was reverse-engineered.
+
+    IMPORTANT LIMITATION: `species` must already have at least one native
+    placement record in the CURRENT room (e.g. species 30/Shadow works in
+    Traverse Town 2nd District, where Shadows are already part of the room's
+    own encounter data) -- this cannot yet spawn a species with zero
+    presence in the room's placement table, since most of a record's fields
+    aren't understood well enough to synthesize from scratch. `species`
+    defaults to 30 (Shadow) if omitted.
+
+    WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
+    record-splicing (allocate a new table, copy the old one in, clone/edit a
+    record, repoint two live globals) is fiddly byte-level work that's safer
+    done once in C++ than from Lua. See l_spawn_enemy's comment for why a
+    Cheat-Engine-injected call to this same target function reliably crashed
+    the game during development, and why an in-process native call (this
+    function) is the fix being tested.
+
+    Returns true + the new entity's pointer if the spawn call completed
+    without crashing, or false + an error message (e.g. "no existing record
+    of that species in this room to clone from") otherwise. A successful
+    call is not the same as a visually/functionally correct Heartless --
+    this is newly-added and not yet confirmed working end-to-end in a real
+    play session.]]
+    species = species or 30
+    return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount, x, y, z, species)
+end
+
 local function show_custom_item_popup(text)
     --[[Shows the map-prize pickup popup (the small text window that
     normally names the item you got) with arbitrary custom text instead of
@@ -1120,6 +1161,7 @@ return {
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
+    spawn_enemy = spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     apply_status_effect_to_sora = apply_status_effect_to_sora,

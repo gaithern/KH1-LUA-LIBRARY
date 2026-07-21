@@ -183,6 +183,145 @@ extern "C" int l_write_floats(void* L) {
     return 1;
 }
 
+// --- ENEMY SPAWN (PLACEMENT-TABLE SPLICE) ---
+// spawn_enemy(spawnFnRva, tablePtrRva, tableCountRva, x, y, z, species) ->
+//   ok(boolean), entityPtr(integer) | errorMessage(string)
+//
+// Constructs a Heartless (or any other placement-table-driven entity) at an
+// arbitrary world position by splicing a synthetic record into the current
+// room's live placement table, then calling fnc_spawn_world_gimmick_entity
+// (spawnFnRva) with that record's id -- the exact same low-level constructor
+// the room's own loader uses for doors/chests/party/Heartless. See
+// KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md for the
+// full record format and how this was reverse-engineered.
+//
+// WHY THIS HAS TO BE A NATIVE FUNCTION, NOT A CHEAT ENGINE SCRIPT: an entire
+// session was spent proving that calling fnc_spawn_world_gimmick_entity via
+// Cheat Engine's execute_code (which runs the call from a CE-injected
+// foreign thread) reliably freezes then crashes the game -- confirmed with
+// byte-exact real game data, ruling out bad data as the cause. Trivial and
+// medium-complexity calls via the same CE mechanism were stable; only this
+// function's full construction path, reached via a foreign thread, died.
+// SafeCall below runs the same call in-process, from whatever thread the
+// Lua script is already executing on (the game's own thread via LuaBackend),
+// which is the untested-but-well-evidenced fix for that failure mode.
+//
+// HOW IT WORKS:
+// 1. Reads the live placement-table pointer/count from tablePtrRva/
+//    tableCountRva (DAT_14296b630/DAT_14296b628 on Steam).
+// 2. Scans the CURRENT table for an existing record whose species byte
+//    (record+0x55) matches the requested `species` -- this becomes a
+//    template, since most of a placement record's ~30 fields (resolved
+//    resource handles, scale, def-kind, orientation-branch selector, etc.)
+//    aren't independently understood well enough to synthesize from
+//    scratch. IMPORTANT LIMITATION: this means spawn_enemy can only spawn a
+//    species that ALREADY has at least one native placement record in the
+//    current room (e.g. Shadows, species index 30, in Traverse Town 2nd
+//    District) -- it cannot yet conjure a species with zero presence in the
+//    room's own placement data. Making this fully general would need either
+//    a hand-built record for every species (a lot of unmapped fields per
+//    species) or captured template records shipped as static data.
+// 3. Allocates a fresh (count+1)-record buffer, copies the old table in,
+//    appends a clone of the template record with a new unique id (top byte
+//    forced to 0x99, outside the 1/7/8/0xC category values
+//    fnc_find_gimmick_type_def treats specially, so the default
+//    exact-id-match lookup path is always taken) and the requested x/y/z
+//    written into the position fields (record+0x1C/+0x20/+0x24 -- the
+//    RUNTIME record layout, which differs from the .ard FILE layout, see
+//    the doc).
+// 4. Repoints the two live globals at the new buffer/count and calls the
+//    constructor with the new record's id.
+//
+// KNOWN LIMITATION: the old and every intermediate table buffer are
+// intentionally leaked (not VirtualFree'd) -- the very first table belongs
+// to the game's own allocator, not ours, so freeing it would be unsafe, and
+// distinguishing "ours" from "the game's" reliably wasn't worth the
+// complexity for what's meant to be an occasional debug/testing tool, not a
+// hot-loop spawner. Each call leaks one VirtualAlloc allocation (minimum
+// 64KB granularity even though the actual table is much smaller).
+static const size_t PLACEMENT_RECORD_SIZE = 0x78;
+static const int PLACEMENT_SPECIES_OFFSET = 0x55;
+static const int PLACEMENT_POS_X_OFFSET = 0x1C;
+static const int PLACEMENT_POS_Y_OFFSET = 0x20;
+static const int PLACEMENT_POS_Z_OFFSET = 0x24;
+static uint32_t g_nextSpawnEnemyId = 0x00990001;
+
+extern "C" int l_spawn_enemy(void* L) {
+    unsigned long long spawnFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long tablePtrRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    unsigned long long tableCountRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    float x = (float)p_lua_tonumberx(L, 4, nullptr);
+    float y = (float)p_lua_tonumberx(L, 5, nullptr);
+    float z = (float)p_lua_tonumberx(L, 6, nullptr);
+    uint8_t species = (uint8_t)p_lua_tointegerx(L, 7, nullptr);
+
+    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+    uint8_t** tablePtrAddr = (uint8_t**)(uintptr_t)(base + tablePtrRva);
+    int32_t* tableCountAddr = (int32_t*)(uintptr_t)(base + tableCountRva);
+
+    uint8_t* oldTable = *tablePtrAddr;
+    int32_t oldCount = *tableCountAddr;
+    if (!oldTable || oldCount <= 0 || oldCount > 4096) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: placement table not valid right now (wrong room state?)");
+        return 2;
+    }
+
+    uint8_t* templateRec = nullptr;
+    for (int32_t i = 0; i < oldCount; ++i) {
+        uint8_t* rec = oldTable + (size_t)i * PLACEMENT_RECORD_SIZE;
+        if (rec[PLACEMENT_SPECIES_OFFSET] == species) {
+            templateRec = rec;
+            break;
+        }
+    }
+    if (!templateRec) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: no existing record of that species in this room to clone from");
+        return 2;
+    }
+
+    size_t newSize = (size_t)(oldCount + 1) * PLACEMENT_RECORD_SIZE;
+    uint8_t* newTable = (uint8_t*)VirtualAlloc(nullptr, newSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!newTable) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: VirtualAlloc failed");
+        return 2;
+    }
+
+    memcpy(newTable, oldTable, (size_t)oldCount * PLACEMENT_RECORD_SIZE);
+    uint8_t* newRec = newTable + (size_t)oldCount * PLACEMENT_RECORD_SIZE;
+    memcpy(newRec, templateRec, PLACEMENT_RECORD_SIZE);
+
+    uint32_t newId = g_nextSpawnEnemyId++;
+    newId = (newId & 0xFF00FFFFu) | 0x00990000u; // force category byte so the default lookup path is always taken
+    memcpy(newRec + 0, &newId, 4);
+    memcpy(newRec + PLACEMENT_POS_X_OFFSET, &x, 4);
+    memcpy(newRec + PLACEMENT_POS_Y_OFFSET, &y, 4);
+    memcpy(newRec + PLACEMENT_POS_Z_OFFSET, &z, 4);
+
+    *tablePtrAddr = newTable;
+    *tableCountAddr = oldCount + 1;
+
+    unsigned long long spawnFnAddr = base + spawnFnRva;
+    unsigned long long args[1] = { (unsigned long long)newId };
+    unsigned long long result = 0;
+    bool ok = SafeCall(spawnFnAddr, args, 1, result);
+
+    if (!ok) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "spawn_enemy crashed: spawnFnRva=0x%llx id=0x%x species=%d", spawnFnRva, newId, species);
+        LogDebug(msg);
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: exception during constructor call");
+        return 2;
+    }
+
+    p_lua_pushboolean(L, 1);
+    p_lua_pushinteger(L, (long long)result);
+    return 2;
+}
+
 // --- EVDL SYSCALL BRIDGE ---
 // call_evdl_syscall(rva, {arg1, arg2, ...}) -> ok(boolean), result(integer) | errorMessage(string)
 //
@@ -1004,6 +1143,7 @@ static const luaL_Reg kh1_native_lib[] = {
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
+    {"spawn_enemy", reinterpret_cast<void*>(l_spawn_enemy)},
     {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
     {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
     {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},
