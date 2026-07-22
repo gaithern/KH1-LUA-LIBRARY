@@ -314,10 +314,30 @@ fnc_spawn_world_gimmick_entity = 0x28EBD0
 -- read off fnc_find_gimmick_type_def's EGS twin at 0x1402859c0, score 1.0)
 placementTablePtr = 0x296C030
 placementTableCount = 0x296C028
+-- Resolves an encoded resource handle back to the real pointer/string it was
+-- minted from (see SteamGlobal_1_0_0_2.lua for the full writeup). Matched to
+-- Steam RVA 0x38ADC0 via call-graph correlation anchored on
+-- fnc_resource_handle_bucket_table_init (1.0 fuzzy score), then confirmed
+-- structurally identical via decompile -- this one is NOT yet live-verified
+-- on EGS (Steam's game session was the one running when this was found).
+-- With this alone, spawn_enemy's native-record-reuse path (a creature
+-- already present in the room) works on EGS; the fallback-template path
+-- (zero native presence) still refuses cleanly below.
+fnc_resolve_resource_handle = 0x38B0B0
+-- Per-species resource-blob table (DAT_140d2b880 in Ghidra -- EGS twin of
+-- Steam's DAT_140d2ada0, found 2026-07-22 via the EGS decompile of
+-- fnc_spawn_world_gimmick_entity's own twin at 0x28EBD0, same call site
+-- `&DAT_140d2b880 + (species << 0x12)`). See SteamGlobal_1_0_0_2.lua for the
+-- full writeup ("Session 9" of the investigation doc) -- l_spawn_enemy uses
+-- this to prime a freshly claimed slot before calling the constructor, for
+-- the fallback path. Not independently live-verified on EGS (found via
+-- Steam-side live debugging plus a static decompile match here).
+speciesResourceTable = 0xD2B880
 -- TODO (2026-07-21): EGS twins of fnc_load_gimmick_assets (Steam 0x285EE0),
--- loadedSpeciesPtrTable (Steam 0x2869E18), evSystemFlags (Steam 0x2382590),
--- and fnc_mint_resource_handle (Steam 0x38AD90) not yet located -- spawn_enemy
--- will error on EGS until these are added (Steam-only investigation so far).
+-- loadedSpeciesPtrTable (Steam 0x2869E18), and fnc_mint_resource_handle
+-- (Steam 0x38AD90) not yet located -- spawn_enemy's fallback-template path
+-- (a creature with zero native presence in the room) will cleanly refuse on
+-- EGS until these are added (Steam-only investigation so far).
 
 -- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
 -- pickup popup directly, independent of any actual pickup; matched from Steam

@@ -721,47 +721,67 @@ local function spawn_prize(item_id)
     return spawned
 end
 
-local function spawn_enemy(x, y, z, species)
+local function spawn_enemy(model_path, motion_path, x, y, z)
     --[[Spawns a Heartless (or other placement-table-driven entity) at an
     arbitrary world position via kh1_native.spawn_enemy. x/y/z all default to
     Sora's own live position (get_sora_pos()) when omitted -- pass explicit
     coordinates only if you want it somewhere other than on top of Sora.
+
+    `model_path`/`motion_path` identify the creature by its real, stable
+    filename pair (e.g. "xa_ex_2010.mdls"/"xa_ex_2010.mset" for Soldier) --
+    NOT by a species/slot number. That numeric species byte was proven this
+    investigation to be a per-room-LOCAL index with no fixed meaning across
+    rooms (the same number is a different creature in a different room, e.g.
+    species=30 is a Shadow in Traverse Town 2nd District but something else
+    entirely in Alleyway) -- see
+    KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md,
+    sessions 5-6, for the full history. l_spawn_enemy figures out which local
+    slot number (if any) already holds this creature, or claims a free one,
+    entirely on its own -- callers never see or choose a species number.
 
     Unlike spawn_prize (which wraps a purpose-built fnc_spawn_prize taking an
     explicit position pointer), Heartless have no such convenience wrapper --
     this calls the lower-level fnc_spawn_world_gimmick_entity directly. That
     function resolves its argument by exact-matching it against a record in
     the current room's own live placement table, so this works by cloning an
-    EXISTING record of the requested species from that table, editing its id
-    and position, and appending it -- see native/KH1Native/dllmain.cpp's
-    l_spawn_enemy for the full mechanism and
-    KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md for
-    how the record format was reverse-engineered.
+    existing (or captured fallback) record, editing its id, species/slot, and
+    position, and appending it -- see native/KH1Native/dllmain.cpp's
+    l_spawn_enemy for the full mechanism.
 
     CONFIRMED LIVE (2026-07-21): a spawned Shadow can be locked onto,
     damaged, defeated, and attacks Sora back -- fully functional, not just a
-    rendered prop, for a species already native to the room.
+    rendered prop, for a creature already native to the room.
 
-    `species` needs at least one native placement record somewhere the game
-    itself provides one -- either the CURRENT room (e.g. species 30/Shadow
-    in Traverse Town 2nd District), or a captured static fallback template
-    shipped in l_spawn_enemy (currently just species 34/Soldier).
+    For a creature with zero native presence in the room, l_spawn_enemy needs
+    a verified fallback-template entry (species byte, char-id, weight, and
+    these same model/motion filenames) -- either hardcoded in kKnownCreatures
+    (currently just Soldier, xa_ex_2010) or learned automatically. Every
+    successful call that finds this creature already native to a room
+    opportunistically captures its real char-id/weight/full record straight
+    from live memory (see LearnCreatureIfNew) -- no manual capture, no
+    transcription risk. Once learned, a creature is spawnable anywhere for
+    the rest of the game session, even in rooms with zero native presence of
+    it (lost on restart -- purely in-memory). Requesting a creature that's
+    neither native to the current room nor known/learned yet returns an
+    error rather than guessing; visit a room where it's native once first.
+    For a fallback spawn, it also triggers the same asset-load call real EVDL
+    room scripts use (fnc_load_gimmick_assets) and waits for it before
+    constructing, since the record's own self-heal only resolves handles
+    into already-loaded data -- it never triggers a load itself; see
+    l_spawn_enemy's comment for the full history of getting this right
+    without crashing.
 
-    For a species with zero native presence in the room, l_spawn_enemy also
-    triggers the same asset-load call real EVDL room scripts use
-    (fnc_load_gimmick_assets) and waits for it before constructing, since the
-    record's own self-heal only resolves handles into already-loaded data --
-    it never triggers a load. This crashed the whole game process twice
-    during development (see l_spawn_enemy's comment and session 5 of the
-    investigation doc) before the actual cause was found: two fields in a
-    captured template (the model/motion filename handles) encode a
-    session-relative bucket index that's presumptively invalid in a
-    different session. The fix mints fresh, this-session-valid handles for
-    known species' real filename strings instead of ever reusing a captured
-    number -- currently only species 34/Soldier has a verified entry; every
-    other species just skips the load trigger (old behavior: may render
-    invisible/inert, but no crash risk). `species` defaults to 30 (Shadow) if
-    omitted.
+    ALSO for a fallback spawn (a genuinely new species/slot claimed this
+    session): primes the per-species resource-blob table
+    (speciesResourceTable) from a captured copy of that creature's own
+    native entry before ever calling the constructor. Confirmed live
+    2026-07-22 that this table is NEVER populated by the asset-load
+    streaming path above, and the constructor's kind==3 setup blindly
+    parses whatever garbage happens to be there -- this crashed even
+    Soldier's own previously-considered-solid fallback path. See
+    CaptureResourceBlobIfNew in dllmain.cpp and
+    KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md,
+    "Session 9", for the full story.
 
     WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
     record-splicing (allocate a new table, copy the old one in, clone/edit a
@@ -769,13 +789,12 @@ local function spawn_enemy(x, y, z, species)
     done once in C++ than from Lua. See l_spawn_enemy's comment for why a
     Cheat-Engine-injected call to this same target function reliably crashed
     the game during development, and why an in-process native call (this
-    function) is the fix being tested.
+    function) is the fix.
 
     Returns true + the new entity's pointer if the spawn call completed
-    without crashing, or false + an error message (e.g. "no existing record
-    of that species in this room, and no captured fallback template for it")
+    without crashing, or false + an error message (e.g. "no native record of
+    this creature in the room, and no verified fallback data for it")
     otherwise.]]
-    species = species or 30
     if x == nil or y == nil or z == nil then
         local pos = get_sora_pos()
         x = x or pos["X"]
@@ -783,7 +802,8 @@ local function spawn_enemy(x, y, z, species)
         z = z or pos["Z"]
     end
     return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount,
-        fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, evSystemFlags, x, y, z, species)
+        fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, fnc_resolve_resource_handle,
+        speciesResourceTable, model_path, motion_path, x, y, z)
 end
 
 local function show_custom_item_popup(text)

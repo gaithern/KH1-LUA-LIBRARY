@@ -328,19 +328,33 @@ placementTableCount = 0x296B628
 fnc_load_gimmick_assets = 0x285EE0
 -- Per-species "loaded resource pointer" table (DAT_142869e18 in Ghidra),
 -- 0x50-byte stride per species index -- polled after fnc_load_gimmick_assets
--- to detect when the async load has actually finished. EGS twin not yet located.
+-- to detect when the async load has actually finished, and scanned by
+-- spawn_enemy to find an already-loaded or free local slot for a creature
+-- with zero native presence in the room. EGS twin not yet located.
 loadedSpeciesPtrTable = 0x2869E18
--- g_EVSystemFlags (DAT_142382590 in Ghidra) -- fnc_0B5_load_model sets bit
--- 0x2000 on this immediately before calling fnc_load_gimmick_assets;
--- spawn_enemy does NOT currently do the same (see l_spawn_enemy comment,
--- session 5 attempt 2) -- kept only as a spare parameter. EGS twin not yet
--- located.
-evSystemFlags = 0x2382590
 -- Mints a fresh, this-session-valid handle for an arbitrary pointer
 -- (FUN_14038ad90 in Ghidra) -- used to register spawn_enemy's own static
 -- model/motion filename strings instead of ever reusing a captured template's
 -- stale handle number for those fields. EGS twin not yet located.
 fnc_mint_resource_handle = 0x38AD90
+-- Resolves an encoded resource handle (as found in a placement record's
+-- model/motion filename fields) back to the real pointer/string it was
+-- minted from -- counterpart to fnc_mint_resource_handle. Lets spawn_enemy
+-- identify a creature already native to the room by its real filename
+-- instead of a guessed species number. Confirmed live 2026-07-22 via Cheat
+-- Engine against real Alleyway placement records.
+fnc_resolve_resource_handle = 0x38ADC0
+-- Per-species resource-blob table (DAT_140d2ada0 in Ghidra), 0x40000/256KB
+-- stride per species/slot index -- read by fnc_spawn_world_gimmick_entity's
+-- kind==3 setup path (FUN_140288460 -> FUN_140287e40) and parsed as a small
+-- section-offset table. Confirmed live 2026-07-22 that the fresh-load
+-- fallback path never populates this table for a genuinely new slot,
+-- crashing the constructor on the resulting garbage (even for Soldier,
+-- whose fallback path was otherwise considered solid since session 5) --
+-- see KH1-EVDL-TOOLS's investigation doc, "Session 9". l_spawn_enemy now
+-- primes a freshly claimed slot's entry here from a captured copy of that
+-- creature's own native entry before ever calling the constructor.
+speciesResourceTable = 0xD2ADA0
 
 -- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
 -- pickup popup directly, independent of any actual pickup)
