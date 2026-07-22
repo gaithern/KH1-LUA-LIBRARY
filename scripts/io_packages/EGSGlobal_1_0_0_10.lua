@@ -314,6 +314,10 @@ fnc_spawn_world_gimmick_entity = 0x28EBD0
 -- read off fnc_find_gimmick_type_def's EGS twin at 0x1402859c0, score 1.0)
 placementTablePtr = 0x296C030
 placementTableCount = 0x296C028
+-- TODO (2026-07-21): EGS twins of fnc_load_gimmick_assets (Steam 0x285EE0),
+-- loadedSpeciesPtrTable (Steam 0x2869E18), evSystemFlags (Steam 0x2382590),
+-- and fnc_mint_resource_handle (Steam 0x38AD90) not yet located -- spawn_enemy
+-- will error on EGS until these are added (Steam-only investigation so far).
 
 -- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
 -- pickup popup directly, independent of any actual pickup; matched from Steam

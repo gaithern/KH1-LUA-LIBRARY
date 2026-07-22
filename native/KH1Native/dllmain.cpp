@@ -222,13 +222,17 @@ extern "C" int l_write_floats(void* L) {
 //    a hand-built record for every species (a lot of unmapped fields per
 //    species) or captured template records shipped as static data.
 // 3. Allocates a fresh (count+1)-record buffer, copies the old table in,
-//    appends a clone of the template record with a new unique id (top byte
-//    forced to 0x99, outside the 1/7/8/0xC category values
-//    fnc_find_gimmick_type_def treats specially, so the default
-//    exact-id-match lookup path is always taken) and the requested x/y/z
-//    written into the position fields (record+0x1C/+0x20/+0x24 -- the
-//    RUNTIME record layout, which differs from the .ard FILE layout, see
-//    the doc).
+//    appends a clone of the template record with a new id built from a real
+//    category (3, character/actor) and this slot's own real index in the
+//    resized table -- not an out-of-band category, since the constructed
+//    entity's "kind" byte is derived directly from this same field, and
+//    every kind-specific setup branch in fnc_spawn_world_gimmick_entity
+//    (party-linkage for kind==3, the AI/motion-activation call for kind==2)
+//    is keyed off it. An out-of-band category matches none of those
+//    branches, so the entity renders but is completely non-interactable.
+//    The requested x/y/z is written into the position fields
+//    (record+0x1C/+0x20/+0x24 -- the RUNTIME record layout, which differs
+//    from the .ard FILE layout, see the doc).
 // 4. Repoints the two live globals at the new buffer/count and calls the
 //    constructor with the new record's id.
 //
@@ -244,16 +248,136 @@ static const int PLACEMENT_SPECIES_OFFSET = 0x55;
 static const int PLACEMENT_POS_X_OFFSET = 0x1C;
 static const int PLACEMENT_POS_Y_OFFSET = 0x20;
 static const int PLACEMENT_POS_Z_OFFSET = 0x24;
-static uint32_t g_nextSpawnEnemyId = 0x00990001;
+static const int PLACEMENT_MODEL_HANDLE_OFFSET = 0x60;
+static const int PLACEMENT_MOTION_HANDLE_OFFSET = 0x64;
+
+// The per-species asset-load state struct (DAT_142869dd0 in Ghidra, 0x50
+// bytes per species index) that loadedSpeciesPtrTable (passed in as
+// loadedPtrTableRva, pointing at this struct's +0x48 resolved-pointer field)
+// lives inside. Confirmed via decompiling FUN_140285ee0/FUN_140286420:
+//  - a state byte at +3 starts at 0 and is explicitly zeroed by
+//    fnc_load_gimmick_assets before it kicks off a fresh load for a slot,
+//    then climbs (1/2/4/6...) as the async load progresses -- so state != 0
+//    is a direct, general signal that "something has already touched this
+//    local species-slot number this session," independent of and more
+//    reliable than scanning the room's static placement records (a purely
+//    scripted/runtime spawn can claim a slot without ever appearing there).
+//  - a cached model-filename string at +4 (32 bytes) that FUN_140286420
+//    string-compares against each new load request for the same slot --
+//    matching means "reuse", mismatched means "evict and reload in place".
+// Together these let l_spawn_enemy's slot-collision guard (below, where the
+// load is actually triggered) tell "this slot already holds OUR species,
+// safe to reuse" apart from "this slot holds a DIFFERENT creature, refuse
+// rather than silently corrupt it".
+static const int LOADED_SPECIES_STRIDE = 0x50;
+static const int LOADED_SPECIES_STATE_OFFSET_FROM_PTR = -0x45;
+static const int LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR = -0x44;
+static const int LOADED_SPECIES_MODEL_NAME_SIZE = 0x20;
+
+// Fallback templates for species with zero placement record in the current room.
+// Captured live via Cheat Engine from a room where the species actually spawns
+// (see KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md,
+// session 5), rather than hand-built -- most of a record's ~30 fields still
+// aren't independently understood, so cloning a real one is the only reliable
+// source. id (+0x0), position (+0x1C/+0x20/+0x24), species (+0x55), char-id
+// (+0x4c), and weight (+0x59) all get overwritten/forced by l_spawn_enemy
+// regardless of what this template carries -- every field NOT in that list
+// is trusted as-is from the capture, so a still-unverified field could in
+// principle cause a similar problem to the ones already found and fixed
+// (record+8's stale resolved-handle crash, the species-byte transcription
+// bug, the record+0x4c g_SoraObjPtr-hijack bug -- see l_spawn_enemy and the
+// investigation doc, session 5, for all three).
+static const uint8_t kFallbackTemplate_Species34_Soldier[PLACEMENT_RECORD_SIZE] = {
+    0x03, 0x00, 0x03, 0x00, 0x22, 0x1C, 0x00, 0x00, 0xA0, 0xAD, 0x3F, 0x81, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x42, 0x00, 0x00,
+    0x3F, 0xC3, 0x00, 0x00, 0xC8, 0xC3, 0x00, 0x80, 0xB5, 0x43, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,
+    0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x05, 0x22, 0x05, 0x00, 0x06, 0x04, 0x01, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0xB0,
+    0x8E, 0x80, 0x20, 0xB0, 0x8E, 0x80, 0x4B, 0x41, 0x47, 0x45, 0x5F, 0x36, 0x5F, 0x31, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t* FindFallbackTemplate(uint8_t species) {
+    if (species == 34) return kFallbackTemplate_Species34_Soldier;
+    return nullptr;
+}
+
+// record+0x4c is a "character id" field fnc_spawn_world_gimmick_entity reads
+// for any kind==3 entity: if it resolves (via FUN_140285030) to < 3, the
+// entity is treated as an actual PARTY MEMBER and g_SoraObjPtr[that index]
+// gets overwritten with the new entity's pointer. kFallbackTemplate_Species34_Soldier
+// has 0 here -- confirmed live 2026-07-21 that this hijacked g_SoraObjPtr[0],
+// replacing the game's own reference to the real Sora with the spawned
+// Soldier (HUD face vanished, entity uninteractable, game crashed shortly
+// after). Confirmed live the same session that REAL, natively-placed
+// species-34 records read 0x12C (300) here instead, uniformly across every
+// record checked -- a fixed, species-constant value (like the model/motion
+// filename strings), not session-local data, so it's safe to force the same
+// way species/position are forced. Only applied when the fallback template
+// was used (usedFallback), never for an in-room clone, since a real record
+// already carries its own correct value and this table only has verified
+// data for species 34.
+struct SpeciesCharId {
+    uint8_t species;
+    uint16_t charId;
+    uint8_t weight; // record+0x59 -- also confirmed wrong in the template (39 vs real 4), not safety-critical but easy to fix alongside
+};
+static const SpeciesCharId kSpeciesCharId[] = {
+    { 34, 300, 4 }, // Soldier
+};
+static bool FindCharId(uint8_t species, uint16_t* outCharId, uint8_t* outWeight) {
+    for (const auto& entry : kSpeciesCharId) {
+        if (entry.species == species) {
+            *outCharId = entry.charId;
+            *outWeight = entry.weight;
+            return true;
+        }
+    }
+    return false;
+}
+
+// record+0x60/+0x64 hold handles (same bucket-table encoding as record+8, see
+// FUN_14038adc0) to the model/motion filename strings the async load callback
+// (FUN_140286420) dereferences. Confirmed live 2026-07-21 across all 13
+// Soldier records in a real room that these strings are genuinely
+// species-constant, not per-record -- but the raw handle NUMBERS are
+// session-relative (they encode an index into a table of 32MB-aligned heap
+// regions allocated fresh each session), which is why reusing a captured
+// template's raw handle crashed in a different session. Only species with a
+// verified entry here get the asset-load trigger attempted at all; see
+// l_spawn_enemy for the safe fallback when a species isn't listed.
+struct SpeciesResourceStrings {
+    uint8_t species;
+    const char* modelPath;
+    const char* motionPath;
+};
+static const SpeciesResourceStrings kSpeciesResourceStrings[] = {
+    { 34, "xa_ex_2010.mdls", "xa_ex_2010.mset" }, // Soldier
+};
+static bool FindResourceStrings(uint8_t species, const char** outModel, const char** outMotion) {
+    for (const auto& entry : kSpeciesResourceStrings) {
+        if (entry.species == species) {
+            *outModel = entry.modelPath;
+            *outMotion = entry.motionPath;
+            return true;
+        }
+    }
+    return false;
+}
 
 extern "C" int l_spawn_enemy(void* L) {
     unsigned long long spawnFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
     unsigned long long tablePtrRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
     unsigned long long tableCountRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
-    float x = (float)p_lua_tonumberx(L, 4, nullptr);
-    float y = (float)p_lua_tonumberx(L, 5, nullptr);
-    float z = (float)p_lua_tonumberx(L, 6, nullptr);
-    uint8_t species = (uint8_t)p_lua_tointegerx(L, 7, nullptr);
+    unsigned long long loadAssetsFnRva = (unsigned long long)p_lua_tointegerx(L, 4, nullptr);
+    unsigned long long loadedPtrTableRva = (unsigned long long)p_lua_tointegerx(L, 5, nullptr);
+    unsigned long long mintHandleFnRva = (unsigned long long)p_lua_tointegerx(L, 6, nullptr);
+    unsigned long long evSystemFlagsRva = (unsigned long long)p_lua_tointegerx(L, 7, nullptr);
+    float x = (float)p_lua_tonumberx(L, 8, nullptr);
+    float y = (float)p_lua_tonumberx(L, 9, nullptr);
+    float z = (float)p_lua_tonumberx(L, 10, nullptr);
+    uint8_t species = (uint8_t)p_lua_tointegerx(L, 11, nullptr);
 
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     uint8_t** tablePtrAddr = (uint8_t**)(uintptr_t)(base + tablePtrRva);
@@ -267,7 +391,7 @@ extern "C" int l_spawn_enemy(void* L) {
         return 2;
     }
 
-    uint8_t* templateRec = nullptr;
+    const uint8_t* templateRec = nullptr;
     for (int32_t i = 0; i < oldCount; ++i) {
         uint8_t* rec = oldTable + (size_t)i * PLACEMENT_RECORD_SIZE;
         if (rec[PLACEMENT_SPECIES_OFFSET] == species) {
@@ -275,10 +399,66 @@ extern "C" int l_spawn_enemy(void* L) {
             break;
         }
     }
+    bool usedFallback = false;
+    if (!templateRec) {
+        templateRec = FindFallbackTemplate(species);
+        usedFallback = (templateRec != nullptr);
+    }
     if (!templateRec) {
         p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: no existing record of that species in this room to clone from");
+        p_lua_pushstring(L, "spawn_enemy: no existing record of that species in this room, and no captured fallback template for it");
         return 2;
+    }
+    if (usedFallback) {
+        LogDebug("spawn_enemy: using captured fallback template (species not native to this room) -- known-crash fields (handle at +8, species, char-id, weight) are forced/fixed, but not every field in this template is independently verified yet");
+    }
+
+    // Resolved once, up front, rather than down where it's actually used (by
+    // the asset-load-trigger block below) -- the slot-collision guard right
+    // after this needs modelPath too, and it MUST run before the placement
+    // table is resized/swapped in below. (Confirmed live 2026-07-21: an
+    // earlier version of this guard ran too late, after *tablePtrAddr/
+    // *tableCountAddr were already updated -- a refused spawn still left a
+    // permanent half-built phantom record in the table, growing
+    // placementTableCount on every refusal even though no entity was ever
+    // constructed. Doing the check here, before any of that, means a refusal
+    // is a true no-op.)
+    const char* modelPath = nullptr;
+    const char* motionPath = nullptr;
+    bool haveResourceStrings = FindResourceStrings(species, &modelPath, &motionPath);
+
+    if (usedFallback && haveResourceStrings) {
+        // Slot-collision guard. If this species slot's state byte is already
+        // non-zero, something has loaded (or is loading) data into it this
+        // session -- check whether the cached model filename matches what
+        // we're about to request. A match means it's already US (or an
+        // identical prior fallback spawn of the same species) and reuse is
+        // exactly the intended, already-live-confirmed behavior (session 5:
+        // "second spawn attempt worked perfectly"). A mismatch means a
+        // DIFFERENT creature already owns this local slot number this
+        // session -- calling fnc_load_gimmick_assets would evict its cached
+        // data out from under it (confirmed via decompiling
+        // FUN_140286420: a cached-filename mismatch for an already-touched
+        // slot triggers an immediate in-place reload with the new request).
+        // Refuse rather than risk that. Closes the gap flagged at the end of
+        // session 5 -- the species=34 fallback previously only avoided this
+        // by room-by-room coincidence, with nothing actually checking for
+        // it. Live-confirmed 2026-07-21 (forged a fake different-species
+        // cached filename via KH1-LUA-LIBRARY-DEBUG's Forge Species Slot
+        // panel): refused cleanly, no crash. See
+        // KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md.
+        volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+        if (*stateAddr != 0) {
+            const char* cachedName = (const char*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+            if (strncmp(cachedName, modelPath, LOADED_SPECIES_MODEL_NAME_SIZE) != 0) {
+                char msg[192];
+                snprintf(msg, sizeof(msg), "spawn_enemy: species=%d slot already holds a different creature's data this session (cached model file doesn't match %s) -- refusing to avoid corrupting it", species, modelPath);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: fallback species slot collides with another creature already active in this room -- refusing");
+                return 2;
+            }
+        }
     }
 
     size_t newSize = (size_t)(oldCount + 1) * PLACEMENT_RECORD_SIZE;
@@ -293,15 +473,174 @@ extern "C" int l_spawn_enemy(void* L) {
     uint8_t* newRec = newTable + (size_t)oldCount * PLACEMENT_RECORD_SIZE;
     memcpy(newRec, templateRec, PLACEMENT_RECORD_SIZE);
 
-    uint32_t newId = g_nextSpawnEnemyId++;
-    newId = (newId & 0xFF00FFFFu) | 0x00990000u; // force category byte so the default lookup path is always taken
+    // record+0x08 is a cached resource-handle field. fnc_spawn_world_gimmick_entity
+    // already has a self-heal for it: it resolves this handle, and if that resolves
+    // to exactly 0 (unset), it re-resolves a fresh one from the global per-species
+    // resource table (keyed purely by the species byte at +0x55) and writes it back.
+    // A cloned template carries over whatever value was cached here in ITS room/
+    // session, though -- confirmed live 2026-07-21 that reusing a captured
+    // out-of-room template (Soldier, species 34) crashed the constructor
+    // ("exception during constructor call", caught safely by SafeCall). The stale
+    // handle most likely resolved to something non-zero-but-wrong in the new room
+    // rather than cleanly 0, so the self-heal never triggered. Zeroing it here
+    // forces the constructor's own existing fallback to always resolve it fresh
+    // for whatever room this actually runs in, whether templateRec came from the
+    // current room (harmless -- it'll just re-resolve the same thing) or a
+    // captured fallback template (the actual fix). Untested against other
+    // possibly-similar fields elsewhere in the record as of this change.
+    memset(newRec + 8, 0, 4);
+
+    // Category byte drives more than id lookup: fnc_spawn_world_gimmick_entity derives
+    // the constructed entity's "kind" byte directly from this same high byte, and every
+    // kind-specific setup branch in that constructor (party-linkage for kind==3, the
+    // FUN_1402a10b0 AI/motion-activation call for kind==2) is keyed off it. The previous
+    // out-of-band category 0x99 matched none of those branches, so a spawned entity
+    // rendered but skipped all per-kind registration -- confirmed live 2026-07-21: it was
+    // completely non-interactable (no lock-on, no hit detection) even while alive and
+    // long before any room-reload slot reuse. Use the real category (3, character/actor,
+    // matching the cloned template) with a real slot index (this record's own position
+    // in the resized table) so the entity gets the same kind byte a legitimately
+    // constructed record would.
+    uint32_t newId = ((uint32_t)3 << 16) | ((uint32_t)oldCount & 0xFFFFu);
     memcpy(newRec + 0, &newId, 4);
     memcpy(newRec + PLACEMENT_POS_X_OFFSET, &x, 4);
     memcpy(newRec + PLACEMENT_POS_Y_OFFSET, &y, 4);
     memcpy(newRec + PLACEMENT_POS_Z_OFFSET, &z, 4);
 
+    // Force the species byte to what was actually requested rather than trusting
+    // whatever's baked into templateRec at this offset. For an in-room clone this
+    // is a no-op (it's already equal, that's how templateRec was found). For a
+    // captured fallback template it's a real safety net: confirmed live 2026-07-21
+    // that a hand-transcribed static template (kFallbackTemplate_Species34_Soldier)
+    // had a transcription error that put the WRONG byte at this exact offset,
+    // spawning as species 0 (Sora) instead of 34 (Soldier) -- rendered as another
+    // Sora and fell endlessly, presumably because the neighboring char-id field
+    // this constructor checks (species_def+0x4c, see fnc_spawn_world_gimmick_entity)
+    // was corrupted the same way and got misread as a party-member slot. This line
+    // guarantees the species byte specifically is always correct regardless of
+    // template provenance; it does NOT fix other fields a mistranscribed template
+    // might still get wrong (that needs a clean re-capture, ideally generated
+    // mechanically rather than hand-typed, to avoid repeating this mistake).
+    newRec[PLACEMENT_SPECIES_OFFSET] = species;
+
+    // Only for a captured fallback template (never an in-room clone, which
+    // already carries a correct real value): force record+0x4c ("character
+    // id") and record+0x59 (weight) to live-verified, species-constant
+    // values instead of whatever the template happened to carry. This is
+    // the critical safety fix for the g_SoraObjPtr hijack documented above
+    // -- confirmed live 2026-07-21 that kFallbackTemplate_Species34_Soldier's
+    // own char-id (0) hijacked Sora's own party slot; real records read 300.
+    if (usedFallback) {
+        uint16_t charId = 0;
+        uint8_t weight = 0;
+        if (FindCharId(species, &charId, &weight)) {
+            memcpy(newRec + 0x4c, &charId, 2);
+            newRec[0x59] = weight;
+        } else {
+            // No verified char-id data for this species -- refuse rather than
+            // risk another silent g_SoraObjPtr hijack with an unknown value.
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: fallback template exists for this species but no verified char-id data -- refusing to risk a g_SoraObjPtr hijack");
+            return 2;
+        }
+    }
+
     *tablePtrAddr = newTable;
     *tableCountAddr = oldCount + 1;
+
+    // RE-ENABLED 2026-07-21 (third attempt), fundamentally different from the
+    // first two rather than a retry of the same thing. Both earlier crashes
+    // are now believed explained: record+0x60/+0x64 hold handles to the
+    // model/motion filename strings FUN_140286420 dereferences during the
+    // async load, encoded the same session-relative way as record+8 (see
+    // FUN_14038adc0/FUN_14038aee0) -- a cloned template's raw handle NUMBER
+    // for these fields is presumptively invalid in a different session
+    // (it indexes a bucket table of 32MB-aligned heap regions allocated
+    // fresh each run), which is almost certainly what crashed attempt 1.
+    // Attempt 2's crash is separately explained by an unguarded write this
+    // version no longer makes (see below).
+    //
+    // Fix: never copy the captured handle number. Mint a FRESH, this-session
+    // handle for OUR OWN static string data via FUN_14038ad90 (mintHandleFnRva),
+    // confirmed via decompiling its callees (FUN_14038ae10/FUN_14038aee0) to be
+    // a generic, self-registering pointer-to-handle encoder -- it has no
+    // requirement the pointer belong to any pre-existing game allocation,
+    // it just dynamically registers a new bucket for whatever 32MB-aligned
+    // region a never-seen pointer falls in. Only attempted for species with a
+    // verified live-captured resource-string pair in kSpeciesResourceStrings
+    // (species 34/Soldier only so far) -- for any other species this whole
+    // block is skipped and spawn_enemy behaves exactly as before (no crash
+    // risk, just no load trigger).
+    //
+    // Deliberately NOT setting g_EVSystemFlags this time (attempt 2 did,
+    // matching the real caller fnc_0B5_load_model) -- that was a raw,
+    // unguarded pointer write with no SafeCall/__try protection, unlike
+    // everything else in this file, and is the leading theory for attempt 2's
+    // crash (zero breakpoint hits were recorded on the ENTIRE call chain,
+    // including fnc_load_gimmick_assets's own entry, meaning execution never
+    // even reached it -- the flags write was the only new code before that
+    // point). No real evidence it's load-bearing for safety here.
+    // modelPath/motionPath/haveResourceStrings resolved earlier, alongside
+    // the slot-collision guard above (which already ran, before the
+    // placement table was touched).
+    if (loadAssetsFnRva != 0 && mintHandleFnRva != 0 && haveResourceStrings) {
+        unsigned long long mintFnAddr = base + mintHandleFnRva;
+
+        unsigned long long modelArgs[1] = { (unsigned long long)(uintptr_t)modelPath };
+        unsigned long long modelHandle = 0;
+        bool modelOk = SafeCall(mintFnAddr, modelArgs, 1, modelHandle);
+
+        unsigned long long motionArgs[1] = { (unsigned long long)(uintptr_t)motionPath };
+        unsigned long long motionHandle = 0;
+        bool motionOk = SafeCall(mintFnAddr, motionArgs, 1, motionHandle);
+
+        if (modelOk && motionOk) {
+            uint32_t modelHandle32 = (uint32_t)modelHandle;
+            uint32_t motionHandle32 = (uint32_t)motionHandle;
+            memcpy(newRec + PLACEMENT_MODEL_HANDLE_OFFSET, &modelHandle32, 4);
+            memcpy(newRec + PLACEMENT_MOTION_HANDLE_OFFSET, &motionHandle32, 4);
+
+            unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
+            unsigned long long loadResult = 0;
+            bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);
+            if (!loadOk) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "spawn_enemy: asset-load trigger crashed: loadAssetsFnRva=0x%llx id=0x%x species=%d", loadAssetsFnRva, newId, species);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: exception during asset-load trigger call");
+                return 2;
+            }
+
+            // Confirmed live 2026-07-21: a truly cold (first-ever-this-session)
+            // load can take longer than the original 2s timeout -- constructing
+            // anyway after a timeout produced an entity with position stuck at
+            // (0,0,0), invisible and uninteractable, even though every record
+            // field was correct. A second spawn attempt (species already cached
+            // from the first load finishing in the background) worked
+            // perfectly every time. Fix: refuse to construct rather than build
+            // against not-yet-ready data -- the caller can just retry.
+            volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
+            const int kPollIntervalMs = 20;
+            const int kMaxPolls = 500; // ~10 seconds -- generous for a cold first-time load
+            bool loaded = false;
+            for (int i = 0; i < kMaxPolls; ++i) {
+                if (*loadedPtrAddr != 0) { loaded = true; break; }
+                Sleep(kPollIntervalMs);
+            }
+            if (!loaded) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "spawn_enemy: asset load for species=%d did not complete within %dms, refusing to construct -- try again", species, kMaxPolls * kPollIntervalMs);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: asset load did not complete in time -- try again (this is normal for the first spawn of a species in a session)");
+                return 2;
+            }
+        } else {
+            LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- skipping asset-load trigger, constructing without it");
+        }
+    }
+    (void)evSystemFlagsRva;
 
     unsigned long long spawnFnAddr = base + spawnFnRva;
     unsigned long long args[1] = { (unsigned long long)newId };

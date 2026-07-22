@@ -723,7 +723,9 @@ end
 
 local function spawn_enemy(x, y, z, species)
     --[[Spawns a Heartless (or other placement-table-driven entity) at an
-    arbitrary world position via kh1_native.spawn_enemy.
+    arbitrary world position via kh1_native.spawn_enemy. x/y/z all default to
+    Sora's own live position (get_sora_pos()) when omitted -- pass explicit
+    coordinates only if you want it somewhere other than on top of Sora.
 
     Unlike spawn_prize (which wraps a purpose-built fnc_spawn_prize taking an
     explicit position pointer), Heartless have no such convenience wrapper --
@@ -736,13 +738,30 @@ local function spawn_enemy(x, y, z, species)
     KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md for
     how the record format was reverse-engineered.
 
-    IMPORTANT LIMITATION: `species` must already have at least one native
-    placement record in the CURRENT room (e.g. species 30/Shadow works in
-    Traverse Town 2nd District, where Shadows are already part of the room's
-    own encounter data) -- this cannot yet spawn a species with zero
-    presence in the room's placement table, since most of a record's fields
-    aren't understood well enough to synthesize from scratch. `species`
-    defaults to 30 (Shadow) if omitted.
+    CONFIRMED LIVE (2026-07-21): a spawned Shadow can be locked onto,
+    damaged, defeated, and attacks Sora back -- fully functional, not just a
+    rendered prop, for a species already native to the room.
+
+    `species` needs at least one native placement record somewhere the game
+    itself provides one -- either the CURRENT room (e.g. species 30/Shadow
+    in Traverse Town 2nd District), or a captured static fallback template
+    shipped in l_spawn_enemy (currently just species 34/Soldier).
+
+    For a species with zero native presence in the room, l_spawn_enemy also
+    triggers the same asset-load call real EVDL room scripts use
+    (fnc_load_gimmick_assets) and waits for it before constructing, since the
+    record's own self-heal only resolves handles into already-loaded data --
+    it never triggers a load. This crashed the whole game process twice
+    during development (see l_spawn_enemy's comment and session 5 of the
+    investigation doc) before the actual cause was found: two fields in a
+    captured template (the model/motion filename handles) encode a
+    session-relative bucket index that's presumptively invalid in a
+    different session. The fix mints fresh, this-session-valid handles for
+    known species' real filename strings instead of ever reusing a captured
+    number -- currently only species 34/Soldier has a verified entry; every
+    other species just skips the load trigger (old behavior: may render
+    invisible/inert, but no crash risk). `species` defaults to 30 (Shadow) if
+    omitted.
 
     WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
     record-splicing (allocate a new table, copy the old one in, clone/edit a
@@ -754,12 +773,17 @@ local function spawn_enemy(x, y, z, species)
 
     Returns true + the new entity's pointer if the spawn call completed
     without crashing, or false + an error message (e.g. "no existing record
-    of that species in this room to clone from") otherwise. A successful
-    call is not the same as a visually/functionally correct Heartless --
-    this is newly-added and not yet confirmed working end-to-end in a real
-    play session.]]
+    of that species in this room, and no captured fallback template for it")
+    otherwise.]]
     species = species or 30
-    return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount, x, y, z, species)
+    if x == nil or y == nil or z == nil then
+        local pos = get_sora_pos()
+        x = x or pos["X"]
+        y = y or pos["Y"]
+        z = z or pos["Z"]
+    end
+    return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount,
+        fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, evSystemFlags, x, y, z, species)
 end
 
 local function show_custom_item_popup(text)
