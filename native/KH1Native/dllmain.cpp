@@ -408,6 +408,9 @@ static const LearnedCreature* FindLearnedCreature(const char* modelPath) {
 // promising) -- if a future creature's data turns out NOT to be portable
 // across slot numbers this way, this whole approach needs revisiting.
 static const size_t RESOURCE_BLOB_SIZE = 0x40000;
+// FUN_140285db0 (decompiled this session): `(ptr - DAT_140d2ada0) >> 0x12`,
+// refuses if > 0x40 -- the table has exactly 65 valid entries (species 0..64).
+static const int RESOURCE_BLOB_MAX_SPECIES = 0x40;
 struct ResourceBlobEntry {
     char modelPath[64];
     uint8_t* blob; // heap-allocated, RESOURCE_BLOB_SIZE bytes; never freed (session-lifetime cache)
@@ -668,35 +671,49 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
             return 2;
         }
-        // DISABLED 2026-07-22 (session 9, second attempt): tried priming the
-        // per-species resource-blob table (speciesResourceTableRva) here with
-        // a captured copy of a native entry, theorizing it was the root
-        // cause of the fresh-load fallback crash (read_memory on the live
-        // resolved pointer during a real crash had shown garbage, not real
-        // data -- a compelling signal at the time). Live-tested twice after
-        // fixing an ordering bug (the first attempt only primed on a fresh
-        // slot claim, not a reused-elsewhere slot): the constructor STILL
-        // crashed identically both times, and the SECOND attempt was
-        // actually WORSE -- a delayed real game crash after an initially
-        // clean `false` return, not just a caught exception. That's the same
-        // "looks fine, breaks on a later frame" shape as session 8's bug,
-        // strongly suggesting this 256KB memcpy corrupted OTHER memory
-        // rather than fixing anything -- possibly because `species` (a
-        // per-room-LOCAL slot index, proven elsewhere in this investigation
-        // to have no fixed meaning) isn't actually a safe index into this
-        // table the way `record+8`'s self-heal assumes, or because the
-        // table's real bounds are smaller than the 64-slot figure this
-        // investigation has been assuming. NOT re-enabling without: (1)
-        // independently verifying this table's real per-entry size/count
-        // via Ghidra (the bounds-check function `FUN_140285db0` mentioned in
-        // session 5 was never actually decompiled to confirm the 64-slot
-        // claim), (2) testing on a species/room combo where a bad write
-        // would be easy to detect distinctly from other symptoms. Until
-        // then: refuse cleanly, matching this fallback path's pre-session-9
-        // (safe, if incomplete) behavior. See KH1-EVDL-TOOLS's investigation
-        // doc, "Session 9", for the full history.
+        // DISABLED again 2026-07-22 (session 10), after a live test proved
+        // the crash is NOT where session 9 thought. Session 10 tried a much
+        // narrower fix than session 9's full-256KB-blob memcpy: decompiling
+        // the actual resource-blob consumer (FUN_140287e40, reached via
+        // FUN_140288460's kind==3 `default:` case) showed it only reads NINE
+        // 4-byte ints at fixed small offsets (+4/+8/+0xc/+0x10/+0x14/+0x18/
+        // +0x1c/+0x20/+0x24 -- a 0x28-byte header) as self-relative offsets,
+        // so zeroing just that header (not the other ~255KB) seemed like a
+        // safe, targeted fix. Also independently confirmed by decompiling
+        // `FUN_140285db0` (the bounds-check function session 5 only ever
+        // cited secondhand) that `species` IS the correct index into this
+        // table, ruling out session 9's other theory that the index itself
+        // might be wrong.
+        //
+        // Live-tested three times. The header-zero write itself never
+        // crashed. But diagnostic polling (logging the per-species state
+        // byte every ~2s during the existing 10s wait) showed the state
+        // byte stuck at 0 for the ENTIRE wait, every time -- the asset load
+        // job is never serviced at all, not slow. A hardware logging
+        // breakpoint on `fnc_spawn_world_gimmick_entity`'s entry NEVER fired
+        // during any attempt -- the constructor (and therefore
+        // FUN_140287e40, session 9's whole theory) is never even reached.
+        // The crash happens AFTER `l_spawn_enemy` already returned `false`
+        // to Lua, from something else entirely.
+        //
+        // Traced the real pipeline via decompile: `fnc_load_gimmick_assets`
+        // resolves the record via `fnc_find_gimmick_type_def(newId)`
+        // (confirmed correct -- not a wrong-record bug), zeroes the state
+        // byte, mints a handle for the resource-blob address into record+8,
+        // then calls `FUN_14028a900(&DAT_142868bb0, 0, FUN_140286420, 0)` --
+        // a genuine job QUEUE (session 5's "confirmed synchronous" note was
+        // wrong), not a synchronous call. The queue is drained once per
+        // frame by `FUN_140286200` -> `fnc_____main_loop(&DAT_142868bb0,0)`,
+        // confirmed LIVE to fire thousands of times during the 10s wait (so
+        // the drain isn't simply dead/unregistered either). Something about
+        // OUR specific queued job -- not the queue mechanism itself -- never
+        // gets serviced. Root cause NOT yet found. See KH1-EVDL-TOOLS's
+        // investigation doc, "Session 10", before touching this again --
+        // next step is a live logging breakpoint on FUN_140286420's own
+        // entry to see if/when it ever fires, since the eventual crash
+        // implies it does run, just later than our poll window.
         p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: fresh-load fallback for a creature not already loaded in this room is currently disabled -- a real crash was found here, and an attempted fix (priming a resource-blob table) made it worse; see the investigation doc, \"Session 9\", before re-enabling");
+        p_lua_pushstring(L, "spawn_enemy: fresh-load fallback for a creature not already loaded in this room is currently disabled -- the asset-load job never gets serviced and the game crashes later; see the investigation doc, \"Session 10\", before re-enabling");
         return 2;
     }
 
@@ -876,11 +893,24 @@ extern "C" int l_spawn_enemy(void* L) {
             // perfectly every time. Fix: refuse to construct rather than build
             // against not-yet-ready data -- the caller can just retry.
             volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
+            // Diagnostic-only (session 10): also watch the state byte
+            // (LOADED_SPECIES_STATE_OFFSET_FROM_PTR) so the log shows whether
+            // a stuck load is genuinely dead at 0 (job never drained at all)
+            // or climbing through its normal 1/2/4/6 progression but stalling
+            // partway -- these point at very different root causes. No
+            // behavior change, just extra LogDebug calls.
+            volatile uint8_t* stateWatchAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
             const int kPollIntervalMs = 20;
             const int kMaxPolls = 500; // ~10 seconds -- generous for a cold first-time load
+            const int kLogEveryNPolls = 100; // ~2 seconds
             bool loaded = false;
             for (int i = 0; i < kMaxPolls; ++i) {
                 if (*loadedPtrAddr != 0) { loaded = true; break; }
+                if (i % kLogEveryNPolls == 0) {
+                    char pollMsg[128];
+                    snprintf(pollMsg, sizeof(pollMsg), "spawn_enemy: poll i=%d species=%d state=%u ptr=0x%llx", i, species, (unsigned)*stateWatchAddr, (unsigned long long)*loadedPtrAddr);
+                    LogDebug(pollMsg);
+                }
                 Sleep(kPollIntervalMs);
             }
             if (!loaded) {
