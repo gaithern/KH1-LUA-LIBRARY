@@ -546,6 +546,27 @@ static bool FindLoadedSlotByFilename(unsigned long long base, unsigned long long
     return false;
 }
 
+// Both FindLoadedSlotByFilename and FindFreeLoadedSlot only ever scan the
+// SESSION-GLOBAL loadedSpeciesPtrTable (256 raw slot numbers, no notion of
+// which room means what by any of them) -- neither has ever checked whether
+// the CURRENT room's own placement table already uses the chosen species
+// number for a real, unrelated native record. Species is a per-room-LOCAL
+// slot index (see session 5's foundational correction) -- reusing a number
+// another creature/object in THIS room already owns splices our clone right
+// on top of it. Confirmed live 2026-07-22 (session 11): a fallback spawn in
+// Accessory Shop picked up slot 28 (already marked loaded globally from an
+// earlier native Soldier spawn elsewhere), which collided with Accessory
+// Shop's own unrelated native record at that same local slot -- first call
+// spawned something invisible/uninteractable, second call crashed the game.
+static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t species) {
+    for (int32_t i = 0; i < count; ++i) {
+        if (table[(size_t)i * PLACEMENT_RECORD_SIZE + PLACEMENT_SPECIES_OFFSET] == species) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, uint8_t* outSpecies) {
     for (int s = 0; s < SPECIES_SLOT_COUNT; ++s) {
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
@@ -645,10 +666,34 @@ extern "C" int l_spawn_enemy(void* L) {
             return 2;
         }
         usedFallback = true;
+        // Session 12: mintHandleFnRva is now required for BOTH sub-branches
+        // below, not just the genuinely-fresh-slot one -- see the broadened
+        // re-mint block further down for why. Checked here, before the
+        // placement table is touched, for the same "keep refusals a true
+        // no-op" reason the loadAssetsFnRva/mintHandleFnRva check in the
+        // FindFreeLoadedSlot branch already exists.
+        if (mintHandleFnRva == 0) {
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
+            return 2;
+        }
         if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species)) {
             // Already loaded into some slot this session (not via a placement
             // record we can see, or we'd have hit the native path above) --
-            // reuse it, no need to load again.
+            // reuse it, no need to load again. But first: this slot number was
+            // chosen purely from the session-global load table, with no idea
+            // whether THIS room's own placement table already uses it for a
+            // real, different creature/object -- refuse rather than collide
+            // (see RoomHasNativeSpecies's comment for the live crash this
+            // guard is fixing).
+            if (RoomHasNativeSpecies(oldTable, oldCount, species)) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already loaded elsewhere this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
+                return 2;
+            }
             templateRec = fallback.templateRecord;
         } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, &species)) {
             // mintHandleFnRva/loadAssetsFnRva are required for this specific
@@ -659,9 +704,23 @@ extern "C" int l_spawn_enemy(void* L) {
             // refusal bug the timeout/crash refusals there still have --
             // see KH1-EVDL-TOOLS's investigation doc, session 6). Refusing
             // this early keeps this particular check a true no-op.
-            if (loadAssetsFnRva == 0 || mintHandleFnRva == 0) {
+            if (loadAssetsFnRva == 0) {
                 p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: fnc_load_gimmick_assets/fnc_mint_resource_handle not configured for this game build -- can't load a creature with zero presence in this room");
+                p_lua_pushstring(L, "spawn_enemy: fnc_load_gimmick_assets not configured for this game build -- can't load a creature with zero presence in this room");
+                return 2;
+            }
+            // Same room-local collision risk as the reuse branch above: a
+            // slot never touched THIS SESSION globally could still be a real
+            // native record in the CURRENT room if that room simply hasn't
+            // been scanned into the global load table yet for some reason --
+            // refuse rather than assume "session-global free" means "room-
+            // local free" too.
+            if (RoomHasNativeSpecies(oldTable, oldCount, species)) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d is used by a different native record in this room -- refusing", species);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
                 return 2;
             }
             templateRec = fallback.templateRecord;
@@ -671,50 +730,17 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
             return 2;
         }
-        // DISABLED again 2026-07-22 (session 10), after a live test proved
-        // the crash is NOT where session 9 thought. Session 10 tried a much
-        // narrower fix than session 9's full-256KB-blob memcpy: decompiling
-        // the actual resource-blob consumer (FUN_140287e40, reached via
-        // FUN_140288460's kind==3 `default:` case) showed it only reads NINE
-        // 4-byte ints at fixed small offsets (+4/+8/+0xc/+0x10/+0x14/+0x18/
-        // +0x1c/+0x20/+0x24 -- a 0x28-byte header) as self-relative offsets,
-        // so zeroing just that header (not the other ~255KB) seemed like a
-        // safe, targeted fix. Also independently confirmed by decompiling
-        // `FUN_140285db0` (the bounds-check function session 5 only ever
-        // cited secondhand) that `species` IS the correct index into this
-        // table, ruling out session 9's other theory that the index itself
-        // might be wrong.
-        //
-        // Live-tested three times. The header-zero write itself never
-        // crashed. But diagnostic polling (logging the per-species state
-        // byte every ~2s during the existing 10s wait) showed the state
-        // byte stuck at 0 for the ENTIRE wait, every time -- the asset load
-        // job is never serviced at all, not slow. A hardware logging
-        // breakpoint on `fnc_spawn_world_gimmick_entity`'s entry NEVER fired
-        // during any attempt -- the constructor (and therefore
-        // FUN_140287e40, session 9's whole theory) is never even reached.
-        // The crash happens AFTER `l_spawn_enemy` already returned `false`
-        // to Lua, from something else entirely.
-        //
-        // Traced the real pipeline via decompile: `fnc_load_gimmick_assets`
-        // resolves the record via `fnc_find_gimmick_type_def(newId)`
-        // (confirmed correct -- not a wrong-record bug), zeroes the state
-        // byte, mints a handle for the resource-blob address into record+8,
-        // then calls `FUN_14028a900(&DAT_142868bb0, 0, FUN_140286420, 0)` --
-        // a genuine job QUEUE (session 5's "confirmed synchronous" note was
-        // wrong), not a synchronous call. The queue is drained once per
-        // frame by `FUN_140286200` -> `fnc_____main_loop(&DAT_142868bb0,0)`,
-        // confirmed LIVE to fire thousands of times during the 10s wait (so
-        // the drain isn't simply dead/unregistered either). Something about
-        // OUR specific queued job -- not the queue mechanism itself -- never
-        // gets serviced. Root cause NOT yet found. See KH1-EVDL-TOOLS's
-        // investigation doc, "Session 10", before touching this again --
-        // next step is a live logging breakpoint on FUN_140286420's own
-        // entry to see if/when it ever fires, since the eventual crash
-        // implies it does run, just later than our poll window.
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: fresh-load fallback for a creature not already loaded in this room is currently disabled -- the asset-load job never gets serviced and the game crashes later; see the investigation doc, \"Session 10\", before re-enabling");
-        return 2;
+        // Session 9/10 found the fresh-load (needsLoad) case's eventual
+        // CONSTRUCTION call is unsafe (root cause still open -- see
+        // KH1-EVDL-TOOLS's investigation doc, "Session 9"/"Session 10").
+        // Session 11 found this refusal had scope creep: it used to sit here,
+        // unconditionally, covering BOTH sub-cases above -- including the
+        // `FindLoadedSlotByFilename` reuse case (line ~648), which needs no
+        // new asset load at all and was independently validated safe across
+        // sessions 5-8. That reuse case no longer refuses here; the
+        // still-unsafe construction is now refused specifically for the
+        // `needsLoad` case only, after its own trigger+poll block below (see
+        // the `if (needsLoad)` guard right before the constructor call).
     }
 
     // Collision guard, defense in depth: FindLoadedSlotByFilename/
@@ -821,6 +847,18 @@ extern "C" int l_spawn_enemy(void* L) {
         newRec[0x59] = weight;
     }
 
+    // Session 11: publish here, before the load-trigger block below, restoring
+    // session 10's original order. A session-11 attempt to defer this publish
+    // until after every refusal point (to fix session 6's never-fixed phantom-
+    // record-on-refusal bug -- see the rollback comments in the refusal paths
+    // below instead) turned out to be wrong: fnc_load_gimmick_assets resolves
+    // OUR record by looking it up via `newId` in this same live table
+    // (fnc_find_gimmick_type_def), so the record has to already be published
+    // for the trigger call to find it. Deferring the publish made the very
+    // next live test crash inside the trigger call itself -- not a bug in
+    // loadAssetsFnRva (see below), but a self-inflicted regression from
+    // deferring this too far. Publish early again; every refusal path from
+    // here through the needsLoad block now explicitly rolls this back instead.
     *tablePtrAddr = newTable;
     *tableCountAddr = oldCount + 1;
 
@@ -855,7 +893,33 @@ extern "C" int l_spawn_enemy(void* L) {
     // including fnc_load_gimmick_assets's own entry, meaning execution never
     // even reached it -- the flags write was the only new code before that
     // point). No real evidence it's load-bearing for safety here.
-    if (needsLoad) {
+    //
+    // Session 12 (2026-07-22): broadened from `needsLoad`-only to any
+    // `usedFallback` spawn. Live-confirmed the exact crash this comment
+    // already predicted, but for a path believed safe since session 8: the
+    // "already loaded elsewhere this session" reuse branch
+    // (FindLoadedSlotByFilename) also clones `fallback.templateRecord`
+    // without ever reaching this mint block, since it was gated on
+    // `needsLoad` (false for that branch). For a kKnownCreatures entry
+    // specifically, record+0x60/+0x64 are hardcoded at COMPILE TIME, from
+    // whatever session originally captured them -- long gone by the time
+    // this runs. `loadedSpeciesPtrTable`'s state==6 for the chosen slot only
+    // proves the ENGINE's own local-slot asset stream is resident; it says
+    // nothing about whether OUR cloned record's own embedded handle numbers
+    // still resolve in the CURRENT process's bucket table. Confirmed live:
+    // a species=28 reuse in tw11 crashed the constructor
+    // ("spawn_enemy crashed: spawnFnRva=0x290d60 id=0x30010 species=28"),
+    // and reading the live record back showed record+0x60/+0x64
+    // (0xB020808E/0x414B808E) byte-for-byte identical to kKnownCreatures'
+    // hardcoded Soldier template bytes at the same offsets -- proof this
+    // mint had never run for that call. Re-minting is cheap and always safe
+    // (it just registers a fresh handle for OUR OWN caller-supplied
+    // model_path/motion_path strings, which are valid regardless of where
+    // templateRec's other fields came from), so it no longer depends on
+    // needsLoad -- only on usedFallback (an in-room native clone needs
+    // none of this; its handles are already correct as-is).
+    bool handlesMinted = false;
+    if (usedFallback) {
         unsigned long long mintFnAddr = base + mintHandleFnRva;
 
         unsigned long long modelArgs[1] = { (unsigned long long)(uintptr_t)modelPath };
@@ -871,70 +935,162 @@ extern "C" int l_spawn_enemy(void* L) {
             uint32_t motionHandle32 = (uint32_t)motionHandle;
             memcpy(newRec + PLACEMENT_MODEL_HANDLE_OFFSET, &modelHandle32, 4);
             memcpy(newRec + PLACEMENT_MOTION_HANDLE_OFFSET, &motionHandle32, 4);
-
-            unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
-            unsigned long long loadResult = 0;
-            bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);
-            if (!loadOk) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "spawn_enemy: asset-load trigger crashed: loadAssetsFnRva=0x%llx id=0x%x species=%d", loadAssetsFnRva, newId, species);
-                LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: exception during asset-load trigger call");
-                return 2;
-            }
-
-            // Confirmed live 2026-07-21: a truly cold (first-ever-this-session)
-            // load can take longer than the original 2s timeout -- constructing
-            // anyway after a timeout produced an entity with position stuck at
-            // (0,0,0), invisible and uninteractable, even though every record
-            // field was correct. A second spawn attempt (species already cached
-            // from the first load finishing in the background) worked
-            // perfectly every time. Fix: refuse to construct rather than build
-            // against not-yet-ready data -- the caller can just retry.
-            volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
-            // Diagnostic-only (session 10): also watch the state byte
-            // (LOADED_SPECIES_STATE_OFFSET_FROM_PTR) so the log shows whether
-            // a stuck load is genuinely dead at 0 (job never drained at all)
-            // or climbing through its normal 1/2/4/6 progression but stalling
-            // partway -- these point at very different root causes. No
-            // behavior change, just extra LogDebug calls.
-            volatile uint8_t* stateWatchAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
-            const int kPollIntervalMs = 20;
-            const int kMaxPolls = 500; // ~10 seconds -- generous for a cold first-time load
-            const int kLogEveryNPolls = 100; // ~2 seconds
-            bool loaded = false;
-            for (int i = 0; i < kMaxPolls; ++i) {
-                if (*loadedPtrAddr != 0) { loaded = true; break; }
-                if (i % kLogEveryNPolls == 0) {
-                    char pollMsg[128];
-                    snprintf(pollMsg, sizeof(pollMsg), "spawn_enemy: poll i=%d species=%d state=%u ptr=0x%llx", i, species, (unsigned)*stateWatchAddr, (unsigned long long)*loadedPtrAddr);
-                    LogDebug(pollMsg);
-                }
-                Sleep(kPollIntervalMs);
-            }
-            if (!loaded) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "spawn_enemy: asset load for species=%d did not complete within %dms, refusing to construct -- try again", species, kMaxPolls * kPollIntervalMs);
-                LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: asset load did not complete in time -- try again (this is normal for the first spawn of a species in a session)");
-                return 2;
-            }
+            handlesMinted = true;
         } else {
-            LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- skipping asset-load trigger, constructing without it");
+            LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- constructing with the template's original (possibly stale) handles");
         }
+    }
+
+    if (needsLoad && handlesMinted) {
+        // Session 11 correction: an earlier version of this session's work
+        // concluded loadAssetsFnRva (0x285EE0) was garbage -- a mid-
+        // instruction address, not a real function -- based on Ghidra's
+        // static disassembly. That conclusion was WRONG: live disassembly
+        // of the actual running game process at this exact address shows a
+        // clean, valid function prologue (`mov [rsp+8],rbx`, preceded by
+        // proper INT3 alignment padding after the previous function's own
+        // end), matching a real function entry, not Ghidra's apparently
+        // stale/mismatched database. 0x285EE0 is correct and always was.
+        // The real cause of the one crash seen inside this call this
+        // session was the table-publish-ordering regression described
+        // above (this function looks our record up by `newId` in the live
+        // table via fnc_find_gimmick_type_def, which needs it already
+        // published) -- now fixed by publishing before this call again.
+        unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
+        unsigned long long loadResult = 0;
+        bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);
+        if (!loadOk) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: asset-load trigger crashed: loadAssetsFnRva=0x%llx id=0x%x species=%d", loadAssetsFnRva, newId, species);
+            LogDebug(msg);
+            *tablePtrAddr = oldTable;
+            *tableCountAddr = oldCount;
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: exception during asset-load trigger call");
+            return 2;
+        }
+
+        // Confirmed live 2026-07-21: a truly cold (first-ever-this-session)
+        // load can take longer than the original 2s timeout -- constructing
+        // anyway after a timeout produced an entity with position stuck at
+        // (0,0,0), invisible and uninteractable, even though every record
+        // field was correct. A second spawn attempt (species already cached
+        // from the first load finishing in the background) worked
+        // perfectly every time. Fix: refuse to construct rather than build
+        // against not-yet-ready data -- the caller can just retry.
+        volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
+        // Diagnostic-only (session 10): also watch the state byte
+        // (LOADED_SPECIES_STATE_OFFSET_FROM_PTR) so the log shows whether
+        // a stuck load is genuinely dead at 0 (job never drained at all)
+        // or climbing through its normal 1/2/4/6 progression but stalling
+        // partway -- these point at very different root causes. No
+        // behavior change, just extra LogDebug calls.
+        volatile uint8_t* stateWatchAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+        const int kPollIntervalMs = 20;
+        const int kMaxPolls = 500; // ~10 seconds -- generous for a cold first-time load
+        const int kLogEveryNPolls = 100; // ~2 seconds
+        bool loaded = false;
+        for (int i = 0; i < kMaxPolls; ++i) {
+            if (*loadedPtrAddr != 0) { loaded = true; break; }
+            if (i % kLogEveryNPolls == 0) {
+                char pollMsg[128];
+                snprintf(pollMsg, sizeof(pollMsg), "spawn_enemy: poll i=%d species=%d state=%u ptr=0x%llx", i, species, (unsigned)*stateWatchAddr, (unsigned long long)*loadedPtrAddr);
+                LogDebug(pollMsg);
+            }
+            Sleep(kPollIntervalMs);
+        }
+        if (!loaded) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: asset load for species=%d did not complete within %dms, refusing to construct -- try again", species, kMaxPolls * kPollIntervalMs);
+            LogDebug(msg);
+            *tablePtrAddr = oldTable;
+            *tableCountAddr = oldCount;
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: asset load did not complete in time -- try again (this is normal for the first spawn of a species in a session)");
+            return 2;
+        }
+    } else if (needsLoad) {
+        LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- skipping asset-load trigger, constructing without it");
+    }
+
+    if (usedFallback) {
+        // Session 12 (2026-07-22): broadened from `needsLoad`-only to any
+        // `usedFallback` spawn (this covers the "already loaded elsewhere
+        // this session" reuse branch too, previously believed safe). Root
+        // cause finally identified via Ghidra decompile + a live memory
+        // read, not guessed: EVERY construction (regardless of kind) does a
+        // self-heal on record+8 -- if it resolves to 0 (which it always
+        // does here, since this function force-zeroes it for any
+        // non-native-clone spawn), it mints a handle wrapping the RAW
+        // address `&DAT_140d2ada0 + species*0x40000` (a per-species
+        // resource-blob table) and immediately calls FUN_140288460, which
+        // for kind==3 (our case) calls FUN_140287e40 -- the exact function
+        // session 9/10 already suspected, now confirmed reachable from
+        // BOTH the fresh-load and reuse-elsewhere branches, not just
+        // fresh-load. Decompiling FUN_140286290 (the async load's real
+        // completion step, found via Ghidra xrefs to DAT_140d2ada0) shows
+        // it derives the species index PURELY from which 0x40000-byte
+        // slice of DAT_140d2ada0 a pointer happens to point into -- the
+        // blob's CONTENT is keyed by the same room-local slot NUMBER this
+        // whole investigation already proved has no fixed meaning across
+        // rooms. Confirmed live: reading species 28's blob header
+        // (00 00 00 00 02 00 F0 FF 07 37 08 41 ...) shows values
+        // inconsistent with the small ascending self-relative offsets
+        // FUN_140287e40 expects -- looks like a DIFFERENT creature's real
+        // data left over from whatever room most recently used local slot
+        // 28 for something else, not garbage and not Soldier's. Fixing
+        // this needs either priming this table for real before construct
+        // (session 9's attempt at that made things WORSE) or proving which
+        // room "currently owns" a given global slot, neither done yet --
+        // refuse here rather than ever reach the constructor. Every
+        // sibling refusal in this function already rolls the table publish
+        // back; this one now does too, matching that pattern for both the
+        // needsLoad and reuse-elsewhere sub-cases.
+        char msg[160];
+        snprintf(msg, sizeof(msg), "spawn_enemy: fallback-template construction is still disabled for species=%d (see Session 9/10/12)", species);
+        LogDebug(msg);
+        *tablePtrAddr = oldTable;
+        *tableCountAddr = oldCount;
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: fallback-template construction is still disabled (native in-room clones are unaffected) -- see the investigation doc, \"Session 9\"/\"Session 10\"/\"Session 12\"");
+        return 2;
     }
 
     unsigned long long spawnFnAddr = base + spawnFnRva;
     unsigned long long args[1] = { (unsigned long long)newId };
     unsigned long long result = 0;
+
+    // Session 12 temporary diagnostic: log the record's own handle-bearing
+    // fields right before the constructor call, since a crash here rolls
+    // the table publish back (newTable is never freed, but nothing else
+    // still points at newRec once *tablePtrAddr is restored) -- without
+    // this, there's no way to inspect what the constructor actually saw.
+    {
+        uint32_t h8, h60, h64;
+        memcpy(&h8, newRec + 8, 4);
+        memcpy(&h60, newRec + PLACEMENT_MODEL_HANDLE_OFFSET, 4);
+        memcpy(&h64, newRec + PLACEMENT_MOTION_HANDLE_OFFSET, 4);
+        char diagMsg[192];
+        snprintf(diagMsg, sizeof(diagMsg), "spawn_enemy: pre-construct id=0x%x species=%d usedFallback=%d needsLoad=%d handlesMinted=%d rec+8=0x%08x rec+0x60=0x%08x rec+0x64=0x%08x charId=%u weight=%u",
+            newId, species, (int)usedFallback, (int)needsLoad, (int)handlesMinted, h8, h60, h64,
+            (unsigned)(*(uint16_t*)(newRec + 0x4c)), (unsigned)newRec[0x59]);
+        LogDebug(diagMsg);
+    }
+
     bool ok = SafeCall(spawnFnAddr, args, 1, result);
 
     if (!ok) {
         char msg[160];
         snprintf(msg, sizeof(msg), "spawn_enemy crashed: spawnFnRva=0x%llx id=0x%x species=%d", spawnFnRva, newId, species);
         LogDebug(msg);
+        // Session 12: this refusal never rolled the table publish back,
+        // unlike every other refusal path in this function -- confirmed
+        // live (species=28/tw11 crash) that it leaves a phantom half-built
+        // record in the room's live placement table (count off-by-one from
+        // the room's real native total) even though no entity was ever
+        // constructed. Roll back to match every sibling refusal.
+        *tablePtrAddr = oldTable;
+        *tableCountAddr = oldCount;
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: exception during constructor call");
         return 2;
@@ -959,6 +1115,13 @@ extern "C" int l_spawn_enemy(void* L) {
         char msg[192];
         snprintf(msg, sizeof(msg), "spawn_enemy: constructor call succeeded but returned a null entity -- likely the room's concurrent-entity budget is full (id=0x%x)", newId);
         LogDebug(msg);
+        // Session 12: same phantom-record risk as the crash refusal above --
+        // no live entity was constructed here either, so the spliced record
+        // is equally orphaned. Not separately live-confirmed as broken for
+        // this specific branch, but rolling back is free and keeps this
+        // refusal consistent with every other one in this function.
+        *tablePtrAddr = oldTable;
+        *tableCountAddr = oldCount;
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: constructor refused (room's concurrent-entity budget is likely full right now) -- try again after some are cleared");
         return 2;
