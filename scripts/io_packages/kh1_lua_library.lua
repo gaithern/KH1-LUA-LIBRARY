@@ -771,17 +771,23 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
     l_spawn_enemy's comment for the full history of getting this right
     without crashing.
 
-    ALSO for a fallback spawn (a genuinely new species/slot claimed this
-    session): primes the per-species resource-blob table
-    (speciesResourceTable) from a captured copy of that creature's own
-    native entry before ever calling the constructor. Confirmed live
-    2026-07-22 that this table is NEVER populated by the asset-load
-    streaming path above, and the constructor's kind==3 setup blindly
-    parses whatever garbage happens to be there -- this crashed even
-    Soldier's own previously-considered-solid fallback path. See
-    CaptureResourceBlobIfNew in dllmain.cpp and
+    FALLBACK SPAWNS (a species not already native to the current room) ARE
+    CURRENTLY DISABLED, unconditionally, and always return false. This is
+    deliberate, not a missing feature: the constructor's kind==3 self-heal
+    reads a per-species resource-blob table (DAT_140d2ada0+species*0x40000)
+    that's populated only by each room's own upfront static data, never by
+    the asset-load streaming path above -- so a species not native to the
+    CURRENT room finds nothing but a previous room's leftover data for
+    whichever species last used that same room-local slot number, and the
+    constructed entity crashes or hangs later once some other per-frame
+    system touches the resulting bad pointer. Priming this table was
+    live-tested and made the crash strictly worse (an uncaught process
+    crash instead of a clean refusal); no known mechanism exists for
+    l_spawn_enemy to tell whether it still "owns" a given slot at
+    construction time. See
     KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md,
-    "Session 9", for the full story.
+    sessions 9, 12, and 13, for the full history -- only native-record-reuse
+    (a creature already placed in the current room) is proven safe.
 
     WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
     record-splicing (allocate a new table, copy the old one in, clone/edit a
