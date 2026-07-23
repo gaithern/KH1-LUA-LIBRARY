@@ -426,6 +426,39 @@ static const uint8_t* FindResourceBlob(const char* modelPath) {
     return nullptr;
 }
 
+// model_path/motion_path arrive from Lua as p_lua_tolstring pointers, valid only
+// for the duration of this call -- Lua's GC is free to reclaim that string the
+// moment l_spawn_enemy returns. But fnc_load_gimmick_assets's async pipeline
+// (FUN_140286420, queued via the load-trigger call below) doesn't actually
+// dereference the resolved model-path handle until a LATER frame, sometimes
+// 10+ seconds later per the poll timeout -- confirmed live 2026-07-23 via a
+// hardware breakpoint trace: load_trigger_entry and async_tick_entry each fired
+// exactly once, then the process died inside FUN_140286420 itself (never
+// reaching the finalize callback or the constructor), for the same
+// xa_ex_2010.mdls/.mset spawn on every attempt. Minting a handle straight from
+// the raw Lua pointer (as this used to) hands the engine a pointer that can be
+// dangling by the time anything actually reads it -- a use-after-free, not an
+// engine bug. Fix: copy into DLL-owned static storage (mirroring the
+// g_resourceBlobs pattern above, for the same "must outlive this call"
+// reason) and mint handles from that instead.
+struct InternedPathEntry {
+    char path[64];
+};
+static const int MAX_INTERNED_PATHS = 128;
+static InternedPathEntry g_internedPaths[MAX_INTERNED_PATHS];
+static int g_internedPathCount = 0;
+
+static const char* InternPath(const char* s) {
+    for (int i = 0; i < g_internedPathCount; ++i) {
+        if (strcmp(g_internedPaths[i].path, s) == 0) return g_internedPaths[i].path;
+    }
+    if (g_internedPathCount >= MAX_INTERNED_PATHS) return s; // pool exhausted -- fall back to the raw (unsafe) pointer rather than crash here
+    InternedPathEntry& entry = g_internedPaths[g_internedPathCount];
+    strncpy_s(entry.path, s, _TRUNCATE);
+    g_internedPathCount++;
+    return entry.path;
+}
+
 static void CaptureResourceBlobIfNew(const char* modelPath, unsigned long long base, unsigned long long speciesResourceTableRva, uint8_t species) {
     if (speciesResourceTableRva == 0 || FindResourceBlob(modelPath) || g_resourceBlobCount >= MAX_RESOURCE_BLOBS) return;
     uint8_t* blob = (uint8_t*)malloc(RESOURCE_BLOB_SIZE);
@@ -598,6 +631,11 @@ extern "C" int l_spawn_enemy(void* L) {
         p_lua_pushstring(L, "spawn_enemy: model_path/motion_path are required");
         return 2;
     }
+    // Copy off the Lua VM's own string storage immediately -- see InternPath's
+    // comment above. Everything below (mint calls, resource-blob capture,
+    // logging) uses these stable pointers instead of the raw Lua ones.
+    modelPath = InternPath(modelPath);
+    motionPath = InternPath(motionPath);
     // resolveHandleFnRva is load-bearing for the native-record-reuse scan
     // below, which always runs first -- unlike the old species-number API,
     // there's no way to skip it. A 0 RVA (this build's Global address table
