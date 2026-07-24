@@ -343,6 +343,18 @@ fnc_005_set_window_type = 0x1B77A0
 fnc_003_set_window_position = 0x1B7620
 fnc_004_set_window_size = 0x1B7680
 
+-- Game_over (see SteamGlobal_1_0_0_2.lua for the full writeup). Matched from
+-- Steam via Ghidra cross-binary fuzzy match on its callee (score 0.5714),
+-- verified by structural decompile comparison; renamed/commented in Ghidra
+-- 2026-07-20. NOT currently used by ko_sora -- see
+-- fnc_trigger_ko_event_script below.
+fnc_116_game_over = 0x1AA940
+
+-- Trigger_ko_event_script (see SteamGlobal_1_0_0_2.lua for the full
+-- writeup). Matched from Steam via Ghidra fuzzy match (score 0.5714),
+-- structurally identical decompile.
+fnc_trigger_ko_event_script = 0x1C2280
+
 -- custom text box hook (see SteamGlobal_1_0_0_2.lua for the full writeup).
 -- Same 8-byte "mov rdx,[r11+r10*8+g_pEVStringDataPtr]" window, matched
 -- structurally from the Steam build's equivalent window.
