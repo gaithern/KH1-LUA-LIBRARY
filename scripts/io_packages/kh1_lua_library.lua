@@ -575,64 +575,80 @@ local function multiply_summon_time(mult)
     WriteInt(summonTime, new_value)
 end
 
+local partyActorPointers = {soraPointer, donaldPointer, goofyPointer}
+
+-- Per-z rotating position (0-4) into that z's body-text scratch pool -- see
+-- show_prompt's docstring. Free-running mod 5, matching the real engine's
+-- own 5-deep per-party-slot queue depth.
+local promptBodyRingPos = {0, 0, 0}
+
 local function show_prompt(input_title, input_party, duration, colour)
-    --[[Writes to memory the message to be displayed in a Level Up prompt.]]
     if colour == nil then
         colour = 0
     end
 
-    local _partyOffset = 0x3A20
-
-    for i = 1, #input_title do
-        if input_title[i] then
-            WriteArray(textMemory + 0x20 * (i - 1), GetKHSCII(input_title[i]))
-        end
-    end
+    local allOk = true
 
     for z = 1, 3 do
-        local _boxArray = input_party[z];
-        
-        local _colorBox  = colorBox + colour
-        local _colorText = colorText + colour
-
+        local _boxArray = input_party[z]
         if _boxArray then
-            local _textAddress = (textMemory + 0x70) + (0x140 * (z - 1)) + (0x40 * 0)
-            local _boxAddress = boxMemory + (_partyOffset * (z - 1)) + (0xBA0 * 0)
-
-            -- Write the box count.
-            WriteInt(boxMemory - 0x10 + 0x04 * (z - 1), 1)
-
-            -- Write the Title Pointer.
-            WriteLong(_boxAddress + 0x30, BASE_ADDR  + textMemory + 0x20 * (z - 1))
-
-            if _boxArray[2] then
-                -- String Count is 2.
-                WriteInt(_boxAddress + 0x18, 0x02)
-
-                -- Second Line Text.
-                WriteArray(_textAddress + 0x20, GetKHSCII(_boxArray[2]))
-                WriteLong(_boxAddress + 0x28, BASE_ADDR  + _textAddress + 0x20)
+            local actor_ptr = GetPointer(partyActorPointers[z])
+            if actor_ptr == 0 then
+                allOk = false
             else
-                -- String Count is 1
-                WriteInt(_boxAddress + 0x18, 0x01)
+                -- Title: one fixed per-z scratch address (see docstring).
+                -- Body: rotate through 5 per-z sub-slots so near-simultaneous
+                -- same-z calls get distinguishable text pointers.
+                local _titleAddress = textMemory + 0x20 * (z - 1)
+                local ringPos = promptBodyRingPos[z]
+                promptBodyRingPos[z] = (ringPos + 1) % 5
+                local _textAddress = (textMemory + 0x70) + (0x140 * (z - 1)) + (0x40 * ringPos)
+
+                if input_title[z] then
+                    WriteArray(_titleAddress, GetKHSCII(input_title[z]))
+                end
+                WriteArray(_textAddress, GetKHSCII(_boxArray[1]))
+                local line1_ptr = BASE_ADDR + _textAddress
+                local line2_ptr = 0
+                if _boxArray[2] then
+                    WriteArray(_textAddress + 0x20, GetKHSCII(_boxArray[2]))
+                    line2_ptr = BASE_ADDR + _textAddress + 0x20
+                end
+
+                local ok = kh1_native.call_function(fnc_enqueue_levelup_prompt, actor_ptr, line1_ptr, line2_ptr)
+                if not ok then
+                    allOk = false
+                else
+                    -- Find which of the 3 party-slot x 5-deep queue entries
+                    -- this call just used by matching the text pointer just
+                    -- passed in (see fnc_enqueue_levelup_prompt's Ghidra
+                    -- plate comment for the ring-buffer layout), then
+                    -- override its title/color pointers.
+                    local found = nil
+                    for slot = 0, 2 do
+                        for q = 0, 4 do
+                            local boxAddr = boxMemory + slot * 0xE88 + q * 0x2E8
+                            if ReadLong(boxAddr + 0x20) == line1_ptr then
+                                found = boxAddr
+                                break
+                            end
+                        end
+                        if found then break end
+                    end
+
+                    if found then
+                        WriteLong(found + 0x30, BASE_ADDR + _titleAddress)
+                        WriteLong(found + 0xB88, BASE_ADDR + colorBox + colour)
+                        WriteLong(found + 0xB90, BASE_ADDR + colorText + colour)
+                    else
+                        allOk = false
+                    end
+                end
             end
-
-            -- First Line Text
-            WriteArray(_textAddress, GetKHSCII(_boxArray[1]))
-            WriteLong(_boxAddress + 0x20, BASE_ADDR  + _textAddress)
-
-            -- Reset box timers.
-            WriteInt(_boxAddress + 0x0C, duration)
-            WriteFloat(_boxAddress + 0xB80, 1)
-
-            -- Set box colors.
-            WriteLong(_boxAddress + 0xB88, BASE_ADDR  + _colorBox)
-            WriteLong(_boxAddress + 0xB90, BASE_ADDR  + _colorText)
-
-            -- Show the box.
-            WriteInt(_boxAddress, 0x01)
         end
     end
+
+    return allOk
 end
 
 local function is_pressed(button_array, only)
