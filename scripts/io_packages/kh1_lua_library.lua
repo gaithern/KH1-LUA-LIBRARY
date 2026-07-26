@@ -586,6 +586,18 @@ end
 -- own 5-deep per-party-slot queue depth.
 local promptBodyRingPos = {0, 0, 0}
 
+local function ClampKHSCII(khscii, maxBytes)
+    if #khscii <= maxBytes then
+        return khscii
+    end
+    local clamped = {}
+    for i = 1, maxBytes - 1 do
+        clamped[i] = khscii[i]
+    end
+    clamped[maxBytes] = 0x00
+    return clamped
+end
+
 local function show_prompt(input_title, input_party, duration, colour)
     if colour == nil then
         colour = 0
@@ -609,13 +621,13 @@ local function show_prompt(input_title, input_party, duration, colour)
                 local _textAddress = (textMemory + 0x70) + (0x140 * (z - 1)) + (0x40 * ringPos)
 
                 if input_title[z] then
-                    WriteArray(_titleAddress, GetKHSCII(input_title[z]))
+                    WriteArray(_titleAddress, ClampKHSCII(GetKHSCII(input_title[z]), 0x20))
                 end
-                WriteArray(_textAddress, GetKHSCII(_boxArray[1]))
+                WriteArray(_textAddress, ClampKHSCII(GetKHSCII(_boxArray[1]), 0x20))
                 local line1_ptr = BASE_ADDR + _textAddress
                 local line2_ptr = 0
                 if _boxArray[2] then
-                    WriteArray(_textAddress + 0x20, GetKHSCII(_boxArray[2]))
+                    WriteArray(_textAddress + 0x20, ClampKHSCII(GetKHSCII(_boxArray[2]), 0x20))
                     line2_ptr = BASE_ADDR + _textAddress + 0x20
                 end
 
