@@ -297,6 +297,8 @@ textMemory = 0x2DC2668
 colorBox = 0x527A10
 colorText = 0x527A50
 
+fnc_enqueue_levelup_prompt = 0x272540
+
 -- giftTableScale fix
 giftTableScale = 0x1B7E5C 
 
