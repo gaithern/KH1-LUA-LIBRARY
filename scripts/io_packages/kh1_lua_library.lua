@@ -631,7 +631,7 @@ local function show_prompt(input_title, input_party, duration, colour)
                     local found = nil
                     for slot = 0, 2 do
                         for q = 0, 4 do
-                            local boxAddr = boxMemory + slot * 0xE88 + q * 0x2E8
+                            local boxAddr = boxMemory + slot * 0x3A20 + q * 0xBA0
                             if ReadLong(boxAddr + 0x20) == line1_ptr then
                                 found = boxAddr
                                 break
