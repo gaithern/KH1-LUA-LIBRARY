@@ -416,7 +416,7 @@ local function set_spell_cost(spell, value)
         local memory_location = nil
             if spell == "Fire"     then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x00 * 0x70)
         elseif spell == "Fira"     then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x01 * 0x70)
-        elseif spell == "Firaga"   then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x02 * 0x70)
+        elseif spell == "Firaga"   then memory_location = jumpHzights - 0xAC + 0x5F58 + (0x02 * 0x70)
         elseif spell == "Blizzard" then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x03 * 0x70)
         elseif spell == "Blizzara" then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x04 * 0x70)
         elseif spell == "Blizzaga" then memory_location = jumpHeights - 0xAC + 0x5F58 + (0x05 * 0x70)
@@ -575,7 +575,11 @@ local function multiply_summon_time(mult)
     WriteInt(summonTime, new_value)
 end
 
-local partyActorPointers = {soraPointer, donaldPointer, goofyPointer}
+local function partyActorRVA(z)
+    if z == 1 then return soraPointer end
+    if z == 2 then return donaldPointer end
+    return goofyPointer
+end
 
 -- Per-z rotating position (0-4) into that z's body-text scratch pool -- see
 -- show_prompt's docstring. Free-running mod 5, matching the real engine's
@@ -592,8 +596,8 @@ local function show_prompt(input_title, input_party, duration, colour)
     for z = 1, 3 do
         local _boxArray = input_party[z]
         if _boxArray then
-            local actor_ptr = GetPointer(partyActorPointers[z])
-            if actor_ptr == 0 then
+            local actor_ptr = GetPointer(partyActorRVA(z))
+            if actor_ptr == 0 or ReadInt(actor_ptr + 0x130, true) == 0 then
                 allOk = false
             else
                 -- Title: one fixed per-z scratch address (see docstring).
