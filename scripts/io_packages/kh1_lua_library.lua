@@ -222,8 +222,10 @@ end
 local function get_sora_stats_component()
     local sora_entity = ReadLong(soraPointer)
     local handle = ReadLong(sora_entity + 0x6C)
-    local _, component = kh1_native.call_function(fnc_resolve_resource_handle, handle)
-    return component
+    local bucket_index = (handle & 0x7FFFFFFF) >> 25
+    local offset = handle & 0x1FFFFFF
+    local bucket_base = ReadLong(halfPointersAddress + bucket_index * 8)
+    return bucket_base | offset
 end
 
 local function get_ground_combo_length_limit()
