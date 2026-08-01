@@ -362,12 +362,26 @@ local function set_animation_speed(animation_speed)
     WriteFloat(GetPointer(soraHUD - 0xA94) + 0x284, animation_speed, true)
 end
 
+local function apply_combo_limit_patch(ground_value, air_value)
+    WriteArray(fnc_recalc_combo_limit_patch, {
+        0xC6, 0x83, 0xD4, 0x00, 0x00, 0x00, ground_value,
+        0xC6, 0x83, 0xD5, 0x00, 0x00, 0x00, air_value,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    })
+    WriteByte(soraHP + 0x98, ground_value)
+    WriteByte(soraHP + 0x99, air_value)
+end
+
 local function set_ground_combo_length_limit(ground_combo_length_limit)
-    WriteByte(soraHP + 0x98, ground_combo_length_limit)
+    apply_combo_limit_patch(ground_combo_length_limit, get_air_combo_length_limit())
 end
 
 local function set_air_combo_length_limit(air_combo_length_limit)
-    WriteByte(soraHP + 0x99, air_combo_length_limit)
+    apply_combo_limit_patch(get_ground_combo_length_limit(), air_combo_length_limit)
+end
+
+local function clear_combo_length_limit_override()
+    WriteArray(fnc_recalc_combo_limit_patch, fnc_recalc_combo_limit_patch_original)
 end
 
 local function set_stock_at_index(index, qty)
@@ -1095,6 +1109,7 @@ return {
     set_animation_speed = set_animation_speed,
     set_ground_combo_length_limit = set_ground_combo_length_limit,
     set_air_combo_length_limit = set_air_combo_length_limit,
+    clear_combo_length_limit_override = clear_combo_length_limit_override,
     set_stock_at_index = set_stock_at_index,
     set_sora_walk_speed = set_sora_walk_speed,
     set_sora_run_speed = set_sora_run_speed,
