@@ -219,6 +219,13 @@ local function get_current_animation()
     return ReadByte(ReadLong(soraPointer)+0x164, true)
 end
 
+local function get_sora_stats_component()
+    local sora_entity = ReadLong(soraPointer)
+    local handle = ReadLong(sora_entity + 0x6C)
+    local _, component = kh1_native.call_function(fnc_resolve_resource_handle, handle)
+    return component
+end
+
 local function get_ground_combo_length_limit()
     return ReadByte(soraHP + 0x98)
 end
@@ -363,11 +370,11 @@ local function set_animation_speed(animation_speed)
 end
 
 local function set_ground_combo_length_limit(ground_combo_length_limit)
-    WriteByte(soraHP + 0x98, ground_combo_length_limit)
+    WriteByte(get_sora_stats_component() + 0xD4, ground_combo_length_limit)
 end
 
 local function set_air_combo_length_limit(air_combo_length_limit)
-    WriteByte(soraHP + 0x99, air_combo_length_limit)
+    WriteByte(get_sora_stats_component() + 0xD5, air_combo_length_limit)
 end
 
 local function set_stock_at_index(index, qty)
