@@ -221,7 +221,13 @@ end
 
 local function get_sora_stats_component()
     local sora_entity = ReadLong(soraPointer)
-    local handle = ReadLong(sora_entity + 0x6C)
+    if sora_entity == 0 then
+        return 0
+    end
+    local handle = ReadLong(sora_entity + 0x6C, true)
+    if handle == 0 then
+        return 0
+    end
     local bucket_index = (handle & 0x7FFFFFFF) >> 25
     local offset = handle & 0x1FFFFFF
     local bucket_base = ReadLong(halfPointersAddress + bucket_index * 8)
@@ -372,11 +378,17 @@ local function set_animation_speed(animation_speed)
 end
 
 local function set_ground_combo_length_limit(ground_combo_length_limit)
-    WriteByte(get_sora_stats_component() + 0xD4, ground_combo_length_limit)
+    local component = get_sora_stats_component()
+    if component ~= 0 then
+        WriteByte(component + 0xD4, ground_combo_length_limit, true)
+    end
 end
 
 local function set_air_combo_length_limit(air_combo_length_limit)
-    WriteByte(get_sora_stats_component() + 0xD5, air_combo_length_limit)
+    local component = get_sora_stats_component()
+    if component ~= 0 then
+        WriteByte(component + 0xD5, air_combo_length_limit, true)
+    end
 end
 
 local function set_stock_at_index(index, qty)
