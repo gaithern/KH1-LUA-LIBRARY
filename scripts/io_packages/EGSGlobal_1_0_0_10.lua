@@ -45,7 +45,6 @@ khamaActive = 0x2D38AB0
 OCseed = 0x238D800
 roomWarp = 0x2340EF4
 soraPointer = 0x2538A10
-fnc_resolve_resource_handle = 0x38B0B0
 soraStats = 0x2DE9D96
 theonActive = 0x2D3A220
 worldFlagBase = 0x2DEBEB0
