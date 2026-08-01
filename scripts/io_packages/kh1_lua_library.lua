@@ -219,12 +219,11 @@ local function get_current_animation()
     return ReadByte(ReadLong(soraPointer)+0x164, true)
 end
 
-local function get_sora_stats_component()
-    local sora_entity = ReadLong(soraPointer)
-    if sora_entity == 0 then
+local function get_stats_page(entity)
+    if entity == 0 then
         return 0
     end
-    local handle = ReadLong(sora_entity + 0x6C, true)
+    local handle = ReadLong(entity + 0x6C, true)
     if handle == 0 then
         return 0
     end
@@ -235,19 +234,19 @@ local function get_sora_stats_component()
 end
 
 local function get_ground_combo_length_limit()
-    local component = get_sora_stats_component()
-    if component == 0 then
+    local stats_page = get_stats_page(ReadLong(soraPointer))
+    if stats_page == 0 then
         return 0
     end
-    return ReadByte(component + 0xD4, true)
+    return ReadByte(stats_page + 0xD4, true)
 end
 
 local function get_air_combo_length_limit()
-    local component = get_sora_stats_component()
-    if component == 0 then
+    local stats_page = get_stats_page(ReadLong(soraPointer))
+    if stats_page == 0 then
         return 0
     end
-    return ReadByte(component + 0xD5, true)
+    return ReadByte(stats_page + 0xD5, true)
 end
 
 local function get_animation_time()
@@ -386,16 +385,16 @@ local function set_animation_speed(animation_speed)
 end
 
 local function set_ground_combo_length_limit(ground_combo_length_limit)
-    local component = get_sora_stats_component()
-    if component ~= 0 then
-        WriteByte(component + 0xD4, ground_combo_length_limit, true)
+    local stats_page = get_stats_page(ReadLong(soraPointer))
+    if stats_page ~= 0 then
+        WriteByte(stats_page + 0xD4, ground_combo_length_limit, true)
     end
 end
 
 local function set_air_combo_length_limit(air_combo_length_limit)
-    local component = get_sora_stats_component()
-    if component ~= 0 then
-        WriteByte(component + 0xD5, air_combo_length_limit, true)
+    local stats_page = get_stats_page(ReadLong(soraPointer))
+    if stats_page ~= 0 then
+        WriteByte(stats_page + 0xD5, air_combo_length_limit, true)
     end
 end
 
@@ -1084,10 +1083,10 @@ end
 
 local function heartless_angel_sora()
     if not sora_koed() then
-        local component = get_sora_stats_component()
-        if component ~= 0 then
-            WriteByte(component + 0x3C, 1, true)
-            WriteByte(component + 0x44, 0, true)
+        local stats_page = get_stats_page(ReadLong(soraPointer))
+        if stats_page ~= 0 then
+            WriteByte(stats_page + 0x3C, 1, true)
+            WriteByte(stats_page + 0x44, 0, true)
         end
         WriteByte(maxHP - 0x1, 1)
         WriteByte(maxHP - 0x1 + 2, 0)
