@@ -1086,8 +1086,8 @@ local function heartless_angel_sora()
     if not sora_koed() then
         local component = get_sora_stats_component()
         if component ~= 0 then
-            WriteByte(component, 1, true)
-            WriteByte(component + 0x8, 0, true)
+            WriteByte(component + 0x3C, 1, true)
+            WriteByte(component + 0x44, 0, true)
         end
         WriteByte(maxHP - 0x1, 1)
         WriteByte(maxHP - 0x1 + 2, 0)
