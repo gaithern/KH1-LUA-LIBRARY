@@ -235,11 +235,19 @@ local function get_sora_stats_component()
 end
 
 local function get_ground_combo_length_limit()
-    return ReadByte(soraHP + 0x98)
+    local component = get_sora_stats_component()
+    if component == 0 then
+        return 0
+    end
+    return ReadByte(component + 0xD4, true)
 end
 
 local function get_air_combo_length_limit()
-    return ReadByte(soraHP + 0x99)
+    local component = get_sora_stats_component()
+    if component == 0 then
+        return 0
+    end
+    return ReadByte(component + 0xD5, true)
 end
 
 local function get_animation_time()
@@ -1076,9 +1084,12 @@ end
 
 local function heartless_angel_sora()
     if not sora_koed() then
-        WriteByte(soraHP, 1)
+        local component = get_sora_stats_component()
+        if component ~= 0 then
+            WriteByte(component, 1, true)
+            WriteByte(component + 0x8, 0, true)
+        end
         WriteByte(maxHP - 0x1, 1)
-        WriteByte(soraHP + 0x8, 0)
         WriteByte(maxHP - 0x1 + 2, 0)
     end
 end
