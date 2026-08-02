@@ -3,7 +3,7 @@
 A shared Lua library of helper functions for reading, writing, and manipulating
 Kingdom Hearts 1 Final Mix (PC) memory, for use in [randomizer](https://github.com/tommadness/KH1Randomizer)
 and other [LuaBackend](https://github.com/Sirius902/LuaBackend) mods. Supports both the
-Steam and Epic Games Store builds.
+Steam and EGS builds.
 
 ## Layout
 
