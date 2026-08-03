@@ -430,6 +430,43 @@ static int g_resourceBlobCount = 0;
 // 11+ other unrelated callers. Not read anywhere in this DLL itself.
 static volatile uint32_t g_lastSpawnAttemptId = 0;
 
+// Session 19 fix -- see InstallJobRecordGuardHook's plate comment. Set to the
+// exact placement-record pointer we're about to hand to fnc_load_gimmick_assets,
+// right before that call. fnc_load_gimmick_assets/FUN_140286420 is genuinely
+// shared, engine-wide infrastructure -- EVERY EVDL room script's own gimmick
+// asset loads (treasure chests, NPCs, scenery) go through the exact same job
+// struct shape, most of them with a real, non-null completion callback at
+// job+0x28 that something else in the engine blocks on. A first live test that
+// guarded ALL jobs indiscriminately (not just our own) skipped one of those
+// unrelated real jobs' callback and hard-froze the game -- confirmed via
+// decompile: `fnc_load_gimmick_assets`'s only caller path relevant to us
+// (`l_spawn_enemy`, below) always passes `0` for that callback argument, so
+// OUR jobs alone are safe to skip without invoking it. The guard hook compares
+// the job's own (always-safe-to-read) `job+0x20` pointer VALUE against this
+// global -- not a dereference of what it points to -- before ever applying its
+// staleness check, so every other caller's job is left completely untouched.
+static volatile uint64_t g_lastQueuedGimmickRecordPtr = 0;
+
+// Live-confirmed fix, same session: the check above (comparing the job's
+// captured record pointer against the CURRENT placementTablePtr/Count) has a
+// real false-positive -- `l_spawn_enemy`'s own 10s-timeout refusal path rolls
+// placementTablePtr back to the OLD table (the session-11 anti-phantom-record
+// fix) BEFORE this job's callback can possibly fire, which makes our own
+// freshly-queued job look "stale" purely because of that self-rollback, with
+// zero room transition ever happening. Confirmed live: two consecutive
+// timeout attempts both got skipped this way, permanently starving that
+// species' background load from ever completing (the callback we skip is
+// also what would have written its real completion state). The actual
+// question is "did the ROOM change", not "does the record still match
+// whatever placementTablePtr says right now" -- so snapshot the room's own
+// identity (g_WorldNumber/g_AreaNumber/g_SetNumber, read -- never written --
+// by the same room-load routine, FUN_140287c60, that recomputes
+// placementTablePtr) at tag time instead, and compare THAT at check time.
+static volatile int32_t g_lastQueuedGimmickWorld = 0;
+static volatile int32_t g_lastQueuedGimmickArea = 0;
+static volatile int32_t g_lastQueuedGimmickSet = 0;
+static volatile bool g_lastQueuedGimmickRoomIdentityValid = false;
+
 static const uint8_t* FindResourceBlob(const char* modelPath) {
     for (int i = 0; i < g_resourceBlobCount; ++i) {
         if (strcmp(g_resourceBlobs[i].modelPath, modelPath) == 0) return g_resourceBlobs[i].blob;
@@ -624,8 +661,24 @@ static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t sp
 // clean refusal. SPECIES_SLOT_COUNT (a uint8_t's full range) remains correct
 // for FindLoadedSlotByFilename above, which only ever reads existing state,
 // never hands out a fresh species number to be used as a table index.
+// Starts scanning from 20 instead of 0 (session 19, 2026-08-02): low slot
+// numbers (species=1, picked every time from a fresh session) collide with
+// something ALREADY relying on that resource-blob slot that isn't tracked
+// in the room's placement table at all -- some other live entity's own
+// cached `entity+0x134` type-def handle, corrupted by our unconditional
+// resource-blob remint, causing an unrelated entity's velocity-blend read
+// to underflow (FUN_1402b6af0/FUN_1402b6c10's `count-1`-style loop) minutes
+// later -- live-confirmed as the mechanism behind an intermittent crash on
+// this whole path. RoomHasNativeSpecies only checks placement-table
+// records, not arbitrary live entities, so it can't catch this class of
+// collision. Not a complete fix (that would mean walking live entities the
+// way FUN_1402b6390 does via FUN_140291b20 and checking their own +0x134
+// handles), but a real, load-bearing avoidance -- do not revert to
+// starting at 0. Session 15 found slots ~48-64 are hardcoded-reserved by
+// unrelated engine subsystems (menu/JP-sysfont, voice, event motion/
+// effect), so this stays well clear of that range too.
 static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, uint8_t* outSpecies) {
-    for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
+    for (int s = 20; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
         if (*stateAddr == 0) {
             *outSpecies = (uint8_t)s;
@@ -634,6 +687,16 @@ static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loade
     }
     return false;
 }
+
+// Forward declarations -- both hooks are defined later in this file (near
+// the rest of the code-cave/JMP-trampoline hook infrastructure) but need to
+// be installed from here, unconditionally, before any fallback-template
+// spawn. See each function's own definition for the full mechanism.
+static bool InstallJobRecordGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                        unsigned long long tablePtrRva, unsigned long long tableCountRva,
+                                        unsigned long long worldNumRva, unsigned long long areaNumRva,
+                                        unsigned long long setNumRva);
+static bool InstallVelocityBlendGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 
 extern "C" int l_spawn_enemy(void* L) {
     unsigned long long spawnFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -649,6 +712,23 @@ extern "C" int l_spawn_enemy(void* L) {
     float x = (float)p_lua_tonumberx(L, 11, nullptr);
     float y = (float)p_lua_tonumberx(L, 12, nullptr);
     float z = (float)p_lua_tonumberx(L, 13, nullptr);
+    // Room-identity globals (g_WorldNumber/g_AreaNumber/g_SetNumber), added
+    // for InstallJobRecordGuardHook's room-identity fix -- see the tag site
+    // below and CheckJobRecordPointerSafe's comment. Optional: 0/unset on a
+    // build where they haven't been located yet (EGS as of this writing);
+    // the guard hook falls back to its older, more conservative table-bounds
+    // heuristic in that case.
+    unsigned long long worldNumRva = (unsigned long long)p_lua_tointegerx(L, 14, nullptr);
+    unsigned long long areaNumRva = (unsigned long long)p_lua_tointegerx(L, 15, nullptr);
+    unsigned long long setNumRva = (unsigned long long)p_lua_tointegerx(L, 16, nullptr);
+    // Entry points for InstallJobRecordGuardHook/InstallVelocityBlendGuardHook
+    // -- installed below (idempotent, once per process) before any fallback-
+    // template spawn is attempted. Both are load-bearing fixes for real,
+    // live-confirmed crashes on this exact path (session 19); a fallback
+    // spawn refuses cleanly rather than proceed unprotected if either RVA
+    // is 0 (not configured on this build) or either install fails.
+    unsigned long long jobCallbackFnRva = (unsigned long long)p_lua_tointegerx(L, 17, nullptr);
+    unsigned long long velocityBlendFnRva = (unsigned long long)p_lua_tointegerx(L, 18, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -728,6 +808,24 @@ extern "C" int l_spawn_enemy(void* L) {
             return 2;
         }
         usedFallback = true;
+        // Install both crash-fixing hooks (idempotent -- a no-op if already
+        // installed this process) before touching anything else on the
+        // fallback path. Both are load-bearing, live-confirmed fixes for
+        // real crashes on this exact path (session 19) -- refuse cleanly
+        // rather than proceed unprotected if either RVA is unconfigured for
+        // this build or either install itself fails.
+        if (jobCallbackFnRva == 0 || velocityBlendFnRva == 0) {
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: job-record-guard/velocity-blend-guard hook addresses not configured for this game build -- fallback spawning unavailable");
+            return 2;
+        }
+        if (!InstallJobRecordGuardHook(base + jobCallbackFnRva, base + jobCallbackFnRva + 5,
+                                         tablePtrRva, tableCountRva, worldNumRva, areaNumRva, setNumRva) ||
+            !InstallVelocityBlendGuardHook(base + velocityBlendFnRva, base + velocityBlendFnRva + 5)) {
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend guard hooks -- refusing fallback spawn rather than risk the crash they fix");
+            return 2;
+        }
         // Session 12: mintHandleFnRva is now required for BOTH sub-branches
         // below, not just the genuinely-fresh-slot one -- see the broadened
         // re-mint block further down for why. Checked here, before the
@@ -1018,6 +1116,19 @@ extern "C" int l_spawn_enemy(void* L) {
         // above (this function looks our record up by `newId` in the live
         // table via fnc_find_gimmick_type_def, which needs it already
         // published) -- now fixed by publishing before this call again.
+        // Tag this record pointer as "ours" for InstallJobRecordGuardHook
+        // BEFORE queuing the job -- fnc_load_gimmick_assets synchronously
+        // captures newRec into the job struct during this same call, so the
+        // global must already be set when the guard hook can first see it.
+        g_lastQueuedGimmickRecordPtr = (uint64_t)(uintptr_t)newRec;
+        if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
+            g_lastQueuedGimmickWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
+            g_lastQueuedGimmickArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
+            g_lastQueuedGimmickSet = *(int32_t*)(uintptr_t)(base + setNumRva);
+            g_lastQueuedGimmickRoomIdentityValid = true;
+        } else {
+            g_lastQueuedGimmickRoomIdentityValid = false;
+        }
         unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
         unsigned long long loadResult = 0;
         bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);
@@ -1075,104 +1186,33 @@ extern "C" int l_spawn_enemy(void* L) {
         LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- skipping asset-load trigger, constructing without it");
     }
 
-    // Session 16 (2026-07-23) TEMPORARY diagnostic bypass: flip this back to
-    // false before shipping. Lets a fallback-template spawn reach the
-    // constructor so a live CE hook (narrowed to match g_lastSpawnAttemptId,
-    // unlike session 15's magnitude-check/blanket-substitution attempts) can
-    // be tested against the real crashing call. MUST be false in any build
-    // that isn't actively running this specific live experiment.
-    // Session 17 (2026-07-23): re-enabled to test InstallVelocityBlendGuardHook
-    // against the real fallback-spawn crash. Reverted to false at end of
-    // session -- two subsequent live attempts produced a NEW failure mode
-    // (instant process termination, zero Windows crash telemetry, unlike
-    // every other crash in this investigation) not yet root-caused; do not
-    // re-enable without static review of InstallVelocityBlendGuardHook first.
-    static const bool DEBUG_BYPASS_FALLBACK_REFUSAL_SESSION16 = false;
-    if (usedFallback && !DEBUG_BYPASS_FALLBACK_REFUSAL_SESSION16) {
-        // Session 12 (2026-07-22): broadened from `needsLoad`-only to any
-        // `usedFallback` spawn (this covers the "already loaded elsewhere
-        // this session" reuse branch too, previously believed safe). Root
-        // cause finally identified via Ghidra decompile + a live memory
-        // read, not guessed: EVERY construction (regardless of kind) does a
-        // self-heal on record+8 -- if it resolves to 0 (which it always
-        // does here, since this function force-zeroes it for any
-        // non-native-clone spawn), it mints a handle wrapping the RAW
-        // address `&DAT_140d2ada0 + species*0x40000` (a per-species
-        // resource-blob table) and immediately calls FUN_140288460, which
-        // for kind==3 (our case) calls FUN_140287e40 -- the exact function
-        // session 9/10 already suspected, now confirmed reachable from
-        // BOTH the fresh-load and reuse-elsewhere branches, not just
-        // fresh-load. Decompiling FUN_140286290 (the async load's real
-        // completion step, found via Ghidra xrefs to DAT_140d2ada0) shows
-        // it derives the species index PURELY from which 0x40000-byte
-        // slice of DAT_140d2ada0 a pointer happens to point into -- the
-        // blob's CONTENT is keyed by the same room-local slot NUMBER this
-        // whole investigation already proved has no fixed meaning across
-        // rooms. Confirmed live: reading species 28's blob header
-        // (00 00 00 00 02 00 F0 FF 07 37 08 41 ...) shows values
-        // inconsistent with the small ascending self-relative offsets
-        // FUN_140287e40 expects -- looks like a DIFFERENT creature's real
-        // data left over from whatever room most recently used local slot
-        // 28 for something else, not garbage and not Soldier's. Fixing
-        // this needs either priming this table for real before construct
-        // (session 9's attempt at that made things WORSE) or proving which
-        // room "currently owns" a given global slot, neither done yet --
-        // refuse here rather than ever reach the constructor. Every
-        // sibling refusal in this function already rolls the table publish
-        // back; this one now does too, matching that pattern for both the
-        // needsLoad and reuse-elsewhere sub-cases.
-        //
-        // Session 15 (2026-07-23, third attempt): a proper JMP-based CE
-        // code-injection hook (not a raw INT3) at the confirmed fault site
-        // (RVA 0x2b5e66) proved stable across many ordinary-gameplay hits,
-        // then correctly caught and survived logging the actual crashing
-        // call before a `cmp rdx,0x10000 / jb skip-the-real-read` safety
-        // heuristic let it through anyway -- the real crash happened
-        // one instruction later, INSIDE the hook, at the real
-        // `movzx edx,[rdx+02]`. Confirmed via Windows crash telemetry: the
-        // fault module showed as "unknown" at an absolute address falling
-        // inside the hook's own allocated code, not the game module. This
-        // proves the bad RDX in the real crashing case is a large,
-        // plausible-looking but genuinely unmapped/dangling pointer, NOT a
-        // null/near-null one -- a magnitude-only heuristic can't catch it.
-        // Next attempt should either always skip the real read
-        // unconditionally (accepting a cosmetic side effect during the
-        // test window, already proven not to crash anything on its own)
-        // or find a real "is this readable" check. Refusal restored here,
-        // still load-bearing -- do not remove without a real fix.
-        //
-        // Session 15 (2026-07-23, fourth attempt): reran the hook with the
-        // real dereference unconditionally skipped (never executes
-        // `movzx edx,[rdx+02]` at all, substituting edx=0 for EVERY call
-        // through this hot, generic, 11+-call-site function). The game
-        // still crashed -- but this time with NO standard Windows crash-
-        // report event and no WerFault.exe, unlike every prior crash this
-        // investigation has hit (all showed exception 0xc0000005 at a
-        // specific address). This is a DIFFERENT failure mode: since the
-        // hook no longer touches the risky address at all, the crash must
-        // be a consequence of the substitution ITSELF corrupting downstream
-        // behavior for the many legitimate, non-buggy calls -- the earlier
-        // "stable during a few seconds of casual play" test only showed no
-        // IMMEDIATE crash, not that forcing edx=0 for every caller is
-        // actually safe over time or across whatever later code reads that
-        // value. Lesson: substituting a placeholder for a hot shared
-        // function's real output is not a safe default just because it
-        // doesn't fault immediately -- next attempt needs a conditional
-        // check specific enough to only intervene for the actual bug's own
-        // call (e.g. matching the spawned entity's own id/pointer), not a
-        // blanket substitution for the whole function. Stopped live
-        // experimentation here after 5 total live incidents this session
-        // (2 WinDbg hangs, 3 crashes) -- refusal restored, reverted clean.
-        char msg[160];
-        snprintf(msg, sizeof(msg), "spawn_enemy: fallback-template construction is still disabled for species=%d (see Session 9/10/12)", species);
-        LogDebug(msg);
-        *tablePtrAddr = oldTable;
-        *tableCountAddr = oldCount;
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: fallback-template construction is still disabled (native in-room clones are unaffected) -- see the investigation doc, \"Session 9\"/\"Session 10\"/\"Session 12\"");
-        return 2;
-    }
-
+    // Fallback-template construction (usedFallback: a fresh-load or reuse-
+    // elsewhere spawn, as opposed to an in-room native clone) was refused
+    // unconditionally from session 9 through session 18 -- the real root
+    // cause spanned two independent bugs, both now fixed and live-verified
+    // end-to-end (session 19, 2026-08-02, species=20 in a non-native room:
+    // visible, lockable, damageable, first full success this investigation
+    // has ever had on this path):
+    //   1. InstallVelocityBlendGuardHook (FUN_1402b5e50's entry) -- the
+    //      real fault this whole thing chased since session 8. Zero-fills
+    //      the caller's uninitialized output buffer on an unreadable
+    //      descriptor instead of leaving it as garbage the caller folds
+    //      into live entity state; a later TOCTOU fix (session 19) closes a
+    //      probe-then-independently-reread race by redirecting the replayed
+    //      original code to a stable snapshot instead of the live pointer.
+    //   2. InstallJobRecordGuardHook (FUN_140286420's entry) -- the async
+    //      asset-load job captures a raw, unrevalidated pointer that can go
+    //      stale (a room transition, or this function's own timeout-refusal
+    //      rolling placementTablePtr back). Validates against a snapshot of
+    //      the room's own identity (g_WorldNumber/g_AreaNumber/g_SetNumber)
+    //      taken when the job was queued, not placementTablePtr itself,
+    //      which this function mutates for unrelated reasons.
+    // Both are installed once per process by kh1_native_test.lua on F6-panel
+    // load (not from this DLL itself -- see that repo). FindFreeLoadedSlot
+    // also starts scanning from species 20 instead of 0, avoiding a live-
+    // confirmed collision between low slot numbers and another entity's own
+    // cached type-def handle. Full session-by-session history: the
+    // heartless field-spawn investigation memory/doc.
     unsigned long long spawnFnAddr = base + spawnFnRva;
     unsigned long long args[1] = { (unsigned long long)newId };
     unsigned long long result = 0;
@@ -2109,20 +2149,38 @@ extern "C" int l_clear_custom_popup_text(void* L) {
 static bool g_velocityBlendGuardHookInstalled = false;
 static volatile uint64_t g_velocityBlendGuardSkipCount = 0;
 
+// Session 19 (2026-08-02) live-confirmed fix for a real TOCTOU race in the
+// original "probe, then let the original instructions independently re-read
+// the same live pointer" design: this game is heavily multithreaded (90+
+// threads during an active asset load), and the gap between a successful
+// readability probe and the original code's own later read of the exact
+// same address was wide enough for another thread to invalidate that memory
+// in between -- confirmed live: the probe passed, the hook replayed the
+// original instructions believing it safe, and the SAME fault (RVA 0x2b5e66)
+// still happened moments later, with the guard fully installed and active.
+// Fix: never let the original code re-touch the live pointer at all. Copy
+// the probed bytes into a thread-local snapshot (each calling thread gets
+// its own, so concurrent callers can't race each other either) and redirect
+// the original code to operate on that stable copy instead -- once copied,
+// nothing external can invalidate our own memory, closing the window
+// entirely rather than just narrowing it.
+static thread_local uint8_t g_veloBlendSnapshot[0x14];
+
 // Wrapped the same way SafeCall wraps a risky game call: __except turns the
-// hardware fault into a normal false return instead of taking the process
+// hardware fault into a normal zero return instead of taking the process
 // down. Probes the whole range the original function actually dereferences
 // (up to param2+0x13, the last byte of the +0x10 float read) in one copy.
-// On failure, zero-fills param3's real 0x20-byte output footprint (see the
-// plate comment above) in its own nested __try/__except -- param3 is
-// ordinarily just the caller's own stack, so this should never fault, but
-// it costs nothing to guard the same way every other game-memory touch in
-// this file already is.
-static int CheckVelocityBlendParamSafe(uint64_t param2, uint64_t param3) {
+// Returns 0 if unreadable (and zero-fills param3's real 0x20-byte output
+// footprint, in its own nested __try/__except -- param3 is ordinarily just
+// the caller's own stack, so this should never fault, but it costs nothing
+// to guard the same way every other game-memory touch in this file already
+// is). Returns the snapshot's own address on success -- the caller (the
+// hook stub) redirects the original code to that address instead of the
+// live param2.
+static uint64_t CheckVelocityBlendParamSafe(uint64_t param2, uint64_t param3) {
     __try {
-        volatile uint8_t buf[0x14];
-        memcpy((void*)buf, (const void*)(uintptr_t)param2, sizeof(buf));
-        return 1;
+        memcpy(g_veloBlendSnapshot, (const void*)(uintptr_t)param2, sizeof(g_veloBlendSnapshot));
+        return (uint64_t)(uintptr_t)g_veloBlendSnapshot;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         __try {
             memset((void*)(uintptr_t)param3, 0, 0x20);
@@ -2152,11 +2210,14 @@ static int CheckVelocityBlendParamSafe(uint64_t param2, uint64_t param3) {
 //   mov rcx, rax                        ; arg1 for the check = param2
 //   sub rsp, 0x20                       ; shadow space (net 16-aligned before CALL)
 //   mov rax, &CheckVelocityBlendParamSafe
-//   call rax
+//   call rax                            ; rax <- 0 (unreadable) or the snapshot's own address
 //   add rsp, 0x20
-//   test eax, eax
-//   pop r8 / pop rdx / pop rcx          ; restore regardless of outcome
+//   test rax, rax                       ; full 64-bit test -- rax is a real pointer now, not a bool
+//   pop r8 / pop rdx / pop rcx          ; restore regardless of outcome (rax untouched by pops)
 //   jz skipCall                         ; unreadable -> abandon the whole function (output already zeroed)
+//   mov rdx, rax                        ; redirect the replayed original code to the SNAPSHOT, not the
+//                                        ; live (possibly now-racy) param2 -- see CheckVelocityBlendParamSafe's
+//                                        ; comment for the live-confirmed TOCTOU this closes
 //   <original 5 bytes, replayed verbatim -- mov [rsp+8],rbx>
 //   jmp resumeAddr
 //   skipCall:
@@ -2198,7 +2259,7 @@ static bool InstallVelocityBlendGuardHook(unsigned long long hookAddr, unsigned 
 
     stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
 
-    stub[off++] = 0x85; stub[off++] = 0xC0; // test eax, eax
+    stub[off++] = 0x48; stub[off++] = 0x85; stub[off++] = 0xC0; // test rax, rax (64-bit -- rax is a pointer)
 
     stub[off++] = 0x41; stub[off++] = 0x58; // pop r8
     stub[off++] = 0x5A;                     // pop rdx
@@ -2206,6 +2267,8 @@ static bool InstallVelocityBlendGuardHook(unsigned long long hookAddr, unsigned 
 
     stub[off++] = 0x0F; stub[off++] = 0x84; // jz rel32 (patched below) -> skipCall
     size_t jzOperand = off; off += 4;
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC2; // mov rdx, rax (redirect to the safe snapshot)
 
     memcpy(stub + off, hookPtr, 5); off += 5; // replay original mov [rsp+8],rbx
 
@@ -2311,6 +2374,9 @@ static bool g_jobRecordGuardHookInstalled = false;
 static volatile uint64_t g_jobRecordGuardSkipCount = 0;
 static unsigned long long g_jobRecordGuardTablePtrRva = 0;
 static unsigned long long g_jobRecordGuardTableCountRva = 0;
+static unsigned long long g_jobRecordGuardWorldNumRva = 0;
+static unsigned long long g_jobRecordGuardAreaNumRva = 0;
+static unsigned long long g_jobRecordGuardSetNumRva = 0;
 
 // Wrapped the same way every other risky-pointer probe in this file is:
 // __except turns a hardware fault into a clean "treat as stale" instead of
@@ -2322,6 +2388,61 @@ static int CheckJobRecordPointerSafe(uint64_t jobNodePtr) {
     __try {
         unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
         uint8_t* recordPtr = *(uint8_t**)(uintptr_t)(jobNodePtr + 0x20);
+
+        // Session 19 fix: only ever apply the staleness check to a job we
+        // ourselves queued (l_spawn_enemy tags g_lastQueuedGimmickRecordPtr
+        // right before calling fnc_load_gimmick_assets). This is a plain
+        // pointer-VALUE comparison, not a dereference of recordPtr -- always
+        // safe regardless of whether recordPtr itself is still valid. Every
+        // other caller's job (this function is shared, engine-wide asset-
+        // load infrastructure -- ordinary EVDL room scripts queue jobs
+        // through the exact same path) is let through completely untouched,
+        // callback included -- a first live test that skipped ALL jobs
+        // indiscriminately hard-froze the game by skipping a real EVDL job's
+        // non-null completion callback that something else was blocked on.
+        if (recordPtr != (uint8_t*)(uintptr_t)g_lastQueuedGimmickRecordPtr) {
+            return 1;
+        }
+
+        // Live-confirmed fix: room identity, not placementTablePtr, is the
+        // real staleness signal. l_spawn_enemy's own 10s-timeout refusal
+        // rolls placementTablePtr back to the OLD table before this exact
+        // job's callback can possibly fire -- with the table-bounds check
+        // that used to live here, that made our own successfully-queued job
+        // look "stale" on every single timeout, with zero room transition
+        // involved, permanently starving that species' load (the callback
+        // being skipped is also what would have recorded its real
+        // completion). g_WorldNumber/g_AreaNumber/g_SetNumber are read, not
+        // written, by the same room-load routine that recomputes
+        // placementTablePtr -- comparing those instead answers the actual
+        // question ("did the room change") instead of a mutable proxy for it.
+        if (g_lastQueuedGimmickRoomIdentityValid &&
+            g_jobRecordGuardWorldNumRva != 0 && g_jobRecordGuardAreaNumRva != 0 && g_jobRecordGuardSetNumRva != 0) {
+            int32_t curWorld = *(int32_t*)(uintptr_t)(base + g_jobRecordGuardWorldNumRva);
+            int32_t curArea = *(int32_t*)(uintptr_t)(base + g_jobRecordGuardAreaNumRva);
+            int32_t curSet = *(int32_t*)(uintptr_t)(base + g_jobRecordGuardSetNumRva);
+            if (curWorld != g_lastQueuedGimmickWorld || curArea != g_lastQueuedGimmickArea ||
+                curSet != g_lastQueuedGimmickSet) {
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                    "JobRecordGuard: room changed since this job was queued (was %d/%d/%d, now %d/%d/%d) -- genuinely stale, skipping (skipsSoFar=%llu)",
+                    g_lastQueuedGimmickWorld, g_lastQueuedGimmickArea, g_lastQueuedGimmickSet,
+                    curWorld, curArea, curSet, (unsigned long long)g_jobRecordGuardSkipCount + 1);
+                LogDebug(msg);
+                ++g_jobRecordGuardSkipCount;
+                return 0;
+            }
+            // Same room the whole time -- the record is exactly as valid as
+            // it was the moment it was queued, regardless of what
+            // placementTablePtr currently says. Let the real body run.
+            return 1;
+        }
+
+        // Fallback for a build where room-identity RVAs aren't wired up yet
+        // (e.g. EGS as of this writing): the older, more conservative
+        // table-bounds heuristic. Known to false-positive on our own
+        // timeout-refusal rollback (see above) but still strictly safer
+        // than applying no check at all.
         uint8_t* tableStart = *(uint8_t**)(uintptr_t)(base + g_jobRecordGuardTablePtrRva);
         int32_t tableCount = *(int32_t*)(uintptr_t)(base + g_jobRecordGuardTableCountRva);
         if (tableCount <= 0 || tableCount > 4096 || tableStart == nullptr) {
@@ -2370,11 +2491,16 @@ static int CheckJobRecordPointerSafe(uint64_t jobNodePtr) {
 //   mov eax, 4                          ; matches this function's own "job done" exit code
 //   ret
 static bool InstallJobRecordGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
-                                        unsigned long long tablePtrRva, unsigned long long tableCountRva) {
+                                        unsigned long long tablePtrRva, unsigned long long tableCountRva,
+                                        unsigned long long worldNumRva, unsigned long long areaNumRva,
+                                        unsigned long long setNumRva) {
     if (g_jobRecordGuardHookInstalled) return true;
 
     g_jobRecordGuardTablePtrRva = tablePtrRva;
     g_jobRecordGuardTableCountRva = tableCountRva;
+    g_jobRecordGuardWorldNumRva = worldNumRva;
+    g_jobRecordGuardAreaNumRva = areaNumRva;
+    g_jobRecordGuardSetNumRva = setNumRva;
 
     unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
     static const unsigned char expected[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
@@ -2455,18 +2581,26 @@ static bool InstallJobRecordGuardHook(unsigned long long hookAddr, unsigned long
     return true;
 }
 
-// install_job_record_guard_hook(hookRva, resumeRva, tablePtrRva, tableCountRva) -> ok(boolean)
-// Idempotent. Session 18 fix -- see the plate comment above. hookRva
-// should be FUN_140286420's entry (Steam 0x286420), resumeRva its entry+5.
-// tablePtrRva/tableCountRva are placementTablePtr/placementTableCount
-// (already known per-version constants in SteamGlobal_*.lua/EGSGlobal_*.lua).
+// install_job_record_guard_hook(hookRva, resumeRva, tablePtrRva, tableCountRva,
+//     worldNumRva, areaNumRva, setNumRva) -> ok(boolean)
+// Idempotent. Session 18 fix, room-identity-corrected same session -- see the
+// plate comment above and CheckJobRecordPointerSafe's comment. hookRva should
+// be FUN_140286420's entry (Steam 0x286420), resumeRva its entry+5.
+// tablePtrRva/tableCountRva are placementTablePtr/placementTableCount, kept
+// only as an EGS-era fallback now; worldNumRva/areaNumRva/setNumRva
+// (g_WorldNumber/g_AreaNumber/g_SetNumber) are the real staleness signal on a
+// build where they're known -- pass 0 for all three to force the fallback.
 extern "C" int l_install_job_record_guard_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
     unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
     unsigned long long tablePtrRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
     unsigned long long tableCountRva = (unsigned long long)p_lua_tointegerx(L, 4, nullptr);
-    bool ok = InstallJobRecordGuardHook(base + hookRva, base + resumeRva, tablePtrRva, tableCountRva);
+    unsigned long long worldNumRva = (unsigned long long)p_lua_tointegerx(L, 5, nullptr);
+    unsigned long long areaNumRva = (unsigned long long)p_lua_tointegerx(L, 6, nullptr);
+    unsigned long long setNumRva = (unsigned long long)p_lua_tointegerx(L, 7, nullptr);
+    bool ok = InstallJobRecordGuardHook(base + hookRva, base + resumeRva, tablePtrRva, tableCountRva,
+                                          worldNumRva, areaNumRva, setNumRva);
     p_lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }

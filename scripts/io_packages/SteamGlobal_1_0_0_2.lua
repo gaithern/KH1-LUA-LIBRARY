@@ -321,6 +321,27 @@ fnc_spawn_world_gimmick_entity = 0x290D60
 -- DAT_14296b628 in Ghidra)
 placementTablePtr = 0x296B630
 placementTableCount = 0x296B628
+-- Room-identity globals (g_WorldNumber/g_AreaNumber/g_SetNumber in Ghidra) --
+-- read (never written) by the room-load routine FUN_140287c60 as that load's
+-- own configuration, and extensively cross-referenced elsewhere (113/108/56
+-- xrefs) as the game's own canonical "which room am I in" state. Used by
+-- spawn_enemy's InstallJobRecordGuardHook fix to detect a genuine room
+-- transition, distinct from placementTablePtr itself -- which spawn_enemy's
+-- own refusal paths mutate (roll back) for unrelated reasons, making it an
+-- unreliable staleness signal on its own. EGS twins not yet located.
+g_WorldNumber = 0x233FE84
+g_AreaNumber = 0x233FE8C
+g_SetNumber = 0x233FE90
+-- Entry points for the two in-process hooks spawn_enemy installs (once,
+-- idempotently) before any fallback-template spawn -- both are load-bearing
+-- fixes for real, live-confirmed crashes on this path, not optional
+-- diagnostics; see l_spawn_enemy's comment and the heartless field-spawn
+-- investigation memory/doc, session 19. Each is a genuine function entry
+-- (kh1_native.dll computes entry+5 as the resume address itself). EGS
+-- twins not yet located -- a fallback spawn refuses cleanly on a build
+-- where these are unconfigured rather than proceed unprotected.
+fnc_async_load_job_callback = 0x286420
+fnc_velocity_blend_util = 0x2B5E50
 -- Triggers an async load of a species' model/animation/AI data (FUN_140285ee0
 -- in Ghidra) -- the same function real EVDL room scripts use (fnc_0B5_load_model
 -- calls it identically: type_id, completion callback). Needed for spawn_enemy

@@ -831,23 +831,19 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
     l_spawn_enemy's comment for the full history of getting this right
     without crashing.
 
-    FALLBACK SPAWNS (a species not already native to the current room) ARE
-    CURRENTLY DISABLED, unconditionally, and always return false. This is
-    deliberate, not a missing feature: the constructor's kind==3 self-heal
-    reads a per-species resource-blob table (DAT_140d2ada0+species*0x40000)
-    that's populated only by each room's own upfront static data, never by
-    the asset-load streaming path above -- so a species not native to the
-    CURRENT room finds nothing but a previous room's leftover data for
-    whichever species last used that same room-local slot number, and the
-    constructed entity crashes or hangs later once some other per-frame
-    system touches the resulting bad pointer. Priming this table was
-    live-tested and made the crash strictly worse (an uncaught process
-    crash instead of a clean refusal); no known mechanism exists for
-    l_spawn_enemy to tell whether it still "owns" a given slot at
-    construction time. See
-    KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md,
-    sessions 9, 12, and 13, for the full history -- only native-record-reuse
-    (a creature already placed in the current room) is proven safe.
+    FALLBACK SPAWNS (a species not already native to the current room) WORK
+    as of session 19 (2026-08-02) -- live-confirmed end-to-end: visible,
+    lockable, damageable. This was unconditionally disabled from session 9
+    through 18 while two independent, real crash mechanisms on this path
+    got root-caused and fixed (see l_spawn_enemy's comment for exactly
+    what/why); this function now installs both fixes itself, idempotently,
+    before ever attempting a fallback spawn, so no separate setup call is
+    needed. On a build where either fix's target address isn't configured
+    yet (EGS as of this writing), a fallback spawn refuses cleanly rather
+    than proceed unprotected -- only native-record-reuse (a creature
+    already placed in the current room) is unaffected by that restriction.
+    See the heartless field-spawn investigation memory/doc for the full
+    session-by-session history.
 
     WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
     record-splicing (allocate a new table, copy the old one in, clone/edit a
@@ -869,7 +865,9 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
     end
     return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount,
         fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, fnc_resolve_resource_handle,
-        speciesResourceTable, model_path, motion_path, x, y, z)
+        speciesResourceTable, model_path, motion_path, x, y, z,
+        g_WorldNumber, g_AreaNumber, g_SetNumber,
+        fnc_async_load_job_callback, fnc_velocity_blend_util)
 end
 
 local function show_custom_item_popup(text)
