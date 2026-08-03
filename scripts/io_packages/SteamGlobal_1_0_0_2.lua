@@ -342,6 +342,27 @@ g_SetNumber = 0x233FE90
 -- where these are unconfigured rather than proceed unprotected.
 fnc_async_load_job_callback = 0x286420
 fnc_velocity_blend_util = 0x2B5E50
+-- Iterates the 96-slot live entity pool (DAT_142d372a0..DAT_142d5349f):
+-- pass 0 to get the first live entity, pass the previous result to get the
+-- next, 0 means done. Decompiled and confirmed pure/read-only (FUN_140291b20).
+-- Used by spawn_enemy (session 20) to avoid handing out a species number
+-- some live entity's own entity+0x134 handle already references -- see
+-- kh1_native.dll's MarkSpeciesInUseByLiveEntities. Optional: a fallback
+-- spawn still works without it (degrades to session 19's start-at-20
+-- heuristic alone), just without this extra collision check. EGS twin not
+-- yet located.
+fnc_iterate_live_entities = 0x291B20
+-- The `call fnc_resolve_resource_handle` instruction (NOT the function's own
+-- entry) inside FUN_1401d62e0, a tiny shared array-index helper. Hooked by
+-- spawn_enemy (session 20) to fix a real, live-confirmed crash: an unrelated
+-- per-party ability-data rebuild routine calls this helper, which then reads
+-- `resolved_ptr[index*4+0x10]` with no bounds check -- confirmed live twice,
+-- byte-identical fault, after our own fallback spawn's fresh species-blob
+-- write happened to alias the memory a completely different subsystem's
+-- cached handle pointed into. See InstallPartyAbilityIndexGuardHook's
+-- comment in kh1_native.dll for the full mechanism and why hooking here (not
+-- FUN_1401d62e0's entry) was necessary. EGS twin not yet located.
+fnc_party_ability_index_resolve_call = 0x1D62F2
 -- Triggers an async load of a species' model/animation/AI data (FUN_140285ee0
 -- in Ghidra) -- the same function real EVDL room scripts use (fnc_0B5_load_model
 -- calls it identically: type_id, completion callback). Needed for spawn_enemy

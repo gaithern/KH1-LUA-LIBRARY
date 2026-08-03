@@ -856,7 +856,24 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
     Returns true + the new entity's pointer if the spawn call completed
     without crashing, or false + an error message (e.g. "no native record of
     this creature in the room, and no verified fallback data for it")
-    otherwise.]]
+    otherwise. For a fallback spawn whose asset load hasn't finished yet, also
+    returns a third value (true) so callers can tell "still loading, call me
+    again" apart from a hard refusal -- see spawn_enemy_async below, which
+    handles that automatically instead of making you poll by hand.
+
+    IMPORTANT (2026-08-02, session 20): this call USED to block for up to 10
+    real seconds on a creature's first-ever load this session (a Sleep-based
+    poll in l_spawn_enemy), always needing a second call afterward. A live
+    trace proved that poll was actively self-defeating, not just slow: the
+    asset-load job is drained by the game's own per-frame loop, which runs on
+    this SAME thread -- blocking it in a Sleep loop doesn't wait for the load,
+    it PREVENTS the load from ever starting, since no frame can run while
+    Lua's call hasn't returned. l_spawn_enemy no longer blocks at all; a
+    still-loading fallback spawn now returns immediately (third return value
+    true) instead. If you call this directly for a fallback spawn, you are
+    responsible for calling again on a LATER real frame (not the same frame,
+    not in a tight loop) -- use spawn_enemy_async instead unless you have a
+    specific reason to poll by hand.]]
     if x == nil or y == nil or z == nil then
         local pos = get_sora_pos()
         x = x or pos["X"]
@@ -867,7 +884,77 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
         fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, fnc_resolve_resource_handle,
         speciesResourceTable, model_path, motion_path, x, y, z,
         g_WorldNumber, g_AreaNumber, g_SetNumber,
-        fnc_async_load_job_callback, fnc_velocity_blend_util)
+        fnc_async_load_job_callback, fnc_velocity_blend_util, fnc_iterate_live_entities,
+        fnc_party_ability_index_resolve_call)
+end
+
+-- Pending spawn_enemy_async requests, keyed by an opaque incrementing id --
+-- same shape/lifecycle idea as open_text_boxes above. kh1_lua_library has no
+-- persistent per-frame hook of its own (see open_text_box's comment), so
+-- these only make progress while the caller's own script drives
+-- update_spawn_enemy_async() from its _OnFrame.
+local pending_spawn_requests = {}
+local next_spawn_request_id = 1
+
+local function spawn_enemy_async(model_path, motion_path, x, y, z, callback)
+    --[[Non-blocking version of spawn_enemy, for the fallback-spawn case
+    where the asset load hasn't finished yet. Queues a request and returns
+    immediately; call update_spawn_enemy_async() every frame from your own
+    script's _OnFrame (harmless/no-op if nothing is pending) to actually
+    drive it, the same convention open_text_box/update_text_boxes uses.
+
+    `callback(ok, result_or_error)` fires once, on a later frame, with
+    exactly what spawn_enemy itself would have returned (true + entity
+    pointer, or false + error message) -- except a "still loading" result
+    is never handed to you: this function keeps retrying that case on your
+    behalf, one real spawn_enemy call per frame, until it resolves for real
+    or a ~10-second wall-clock budget (os.clock()-based, matching the
+    timeout l_spawn_enemy itself used to enforce internally before session
+    20's fix) runs out, at which point callback gets a clean false + "timed
+    out waiting for asset load".
+
+    Why this exists instead of just calling spawn_enemy in a loop: spawn_enemy
+    for a fallback spawn can only actually complete once the game's own
+    thread gets to run a real frame between attempts (see spawn_enemy's own
+    comment) -- calling it repeatedly within the same frame/tight loop would
+    reproduce the exact self-blocking bug this was built to fix instead of
+    avoiding it. Retrying from _OnFrame guarantees at least one real frame
+    elapses between attempts.
+
+    x/y/z default to Sora's own position, same as spawn_enemy. callback is
+    optional -- omit it if you don't need to know when/whether it finished.]]
+    local id = next_spawn_request_id
+    next_spawn_request_id = next_spawn_request_id + 1
+    pending_spawn_requests[id] = {
+        model_path = model_path,
+        motion_path = motion_path,
+        x = x, y = y, z = z,
+        callback = callback,
+        deadline = os.clock() + 10.0,
+    }
+end
+
+local function update_spawn_enemy_async()
+    --[[Drives every pending spawn_enemy_async request one step forward.
+    Call this every frame from your own script's _OnFrame -- see
+    spawn_enemy_async's comment for why this can't happen automatically.]]
+    for id, req in pairs(pending_spawn_requests) do
+        local ok, result, stillLoading = spawn_enemy(req.model_path, req.motion_path, req.x, req.y, req.z)
+        if stillLoading then
+            if os.clock() >= req.deadline then
+                pending_spawn_requests[id] = nil
+                if req.callback then
+                    req.callback(false, "spawn_enemy_async: timed out waiting for asset load")
+                end
+            end
+            -- else: still within budget, leave it queued for next frame.
+        else
+            pending_spawn_requests[id] = nil
+            if req.callback then
+                req.callback(ok, result)
+            end
+        end
+    end
 end
 
 local function show_custom_item_popup(text)
@@ -1273,6 +1360,8 @@ return {
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = spawn_enemy,
+    spawn_enemy_async = spawn_enemy_async,
+    update_spawn_enemy_async = update_spawn_enemy_async,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     apply_status_effect_to_sora = apply_status_effect_to_sora,

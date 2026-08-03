@@ -467,6 +467,54 @@ static volatile int32_t g_lastQueuedGimmickArea = 0;
 static volatile int32_t g_lastQueuedGimmickSet = 0;
 static volatile bool g_lastQueuedGimmickRoomIdentityValid = false;
 
+// Session 20 (2026-08-02): tracks every model_path we've ourselves already
+// called fnc_load_gimmick_assets for this session, and which species slot we
+// used. Exists because removing the old blocking Sleep-poll (see
+// spawn_enemy's comment in kh1_lua_library.lua) means l_spawn_enemy can now
+// be re-entered on a LATER real frame while a load is still in flight --
+// and fnc_load_gimmick_assets itself zeroes the engine's own state byte at
+// the START of a fresh load (only the async callback advances it once it
+// actually runs), so FindLoadedSlotByFilename (which skips state==0 slots)
+// cannot see an in-flight load of ours and would otherwise let
+// FindFreeLoadedSlot hand out a trigger call again on every single retry
+// frame until the callback finally runs -- queuing multiple concurrent async
+// jobs for the same record. Live-confirmed this is a real crash, not a
+// theoretical one: the first per-frame-retry build crashed with zero Windows
+// crash telemetry (matching session 17's "no WerFault" signature for a
+// stacked/concurrent job corruption, as opposed to the well-understood
+// single-job 0x2b5e66 fault sessions 8-19 chased). This table is checked
+// BEFORE FindLoadedSlotByFilename so our own in-flight loads are always
+// recognized immediately, not just once the engine's table catches up.
+struct TriggeredLoadEntry {
+    char modelPath[64];
+    uint8_t species;
+};
+static const int MAX_TRIGGERED_LOADS = 64;
+static TriggeredLoadEntry g_triggeredLoads[MAX_TRIGGERED_LOADS];
+static int g_triggeredLoadCount = 0;
+
+static bool FindTriggeredLoad(const char* modelPath, uint8_t* outSpecies) {
+    for (int i = 0; i < g_triggeredLoadCount; ++i) {
+        if (strcmp(g_triggeredLoads[i].modelPath, modelPath) == 0) {
+            *outSpecies = g_triggeredLoads[i].species;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Never removed once added (not even once the load completes) -- the
+// species assignment remains this session's correct slot for this creature
+// for the same reason FindLoadedSlotByFilename's own matches stay valid
+// indefinitely once made.
+static void RecordTriggeredLoad(const char* modelPath, uint8_t species) {
+    if (g_triggeredLoadCount >= MAX_TRIGGERED_LOADS) return;
+    TriggeredLoadEntry& entry = g_triggeredLoads[g_triggeredLoadCount];
+    strncpy_s(entry.modelPath, modelPath, _TRUNCATE);
+    entry.species = species;
+    g_triggeredLoadCount++;
+}
+
 static const uint8_t* FindResourceBlob(const char* modelPath) {
     for (int i = 0; i < g_resourceBlobCount; ++i) {
         if (strcmp(g_resourceBlobs[i].modelPath, modelPath) == 0) return g_resourceBlobs[i].blob;
@@ -648,6 +696,50 @@ static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t sp
     return false;
 }
 
+// Session 20 (2026-08-02): walks every live entity in the same 96-slot pool
+// and iteration order FUN_1402b6390 itself uses (FUN_140291b20(0) to start,
+// FUN_140291b20(prevEntity) to advance, 0 means done -- decompiled and
+// confirmed to be a pure, read-only, always-safe walk over a fixed,
+// session-lifetime-allocated array, `DAT_142d372a0`..`DAT_142d5349f`, no
+// special calling context required). For each entity, reads its own
+// `entity+0x134` resource handle (a per-species type-def reference,
+// confirmed by session 19's callgraph trace of FUN_1402b6af0/FUN_1402b6c10
+// to be exactly what those functions -- and now also the unrelated
+// party-ability-rebuild routine found this session -- depend on) and, if it
+// resolves into the shared resource-blob table's address range, marks that
+// species as "in use by something live right now" using the same
+// `(ptr - tableBase) >> 18` slice math FUN_140285db0 itself uses for its own
+// bounds check. This is the live-entity walk every prior session since 15
+// scoped out as the real fix but never implemented -- FindFreeLoadedSlot
+// below now refuses to hand out any species number this marks, in addition
+// to its existing "session-global load state" check, closing the collision
+// class that starting the scan at 20 (session 19) only partially avoided.
+static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned long long entityIterFnRva,
+                                             unsigned long long resolveHandleFnRva, unsigned long long speciesResourceTableRva,
+                                             bool outInUse[RESOURCE_BLOB_MAX_SPECIES + 1]) {
+    if (entityIterFnRva == 0 || speciesResourceTableRva == 0) return;
+    unsigned long long tableBase = base + speciesResourceTableRva;
+    unsigned long long entity = 0;
+    unsigned long long iterArgs[1] = { 0 };
+    if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) return;
+    int guard = 0; // hard cap matching the pool's own real size -- never trust an external loop to self-terminate
+    while (entity != 0 && guard < 128) {
+        ++guard;
+        uint32_t handle = *(volatile uint32_t*)(uintptr_t)(entity + 0x134);
+        if (handle != 0) {
+            unsigned long long resolveArgs[1] = { (unsigned long long)handle };
+            unsigned long long resolved = 0;
+            if (SafeCall(base + resolveHandleFnRva, resolveArgs, 1, resolved) && resolved != 0 &&
+                resolved >= tableBase && resolved < tableBase + (unsigned long long)(RESOURCE_BLOB_MAX_SPECIES + 1) * RESOURCE_BLOB_SIZE) {
+                int species = (int)((resolved - tableBase) >> 18);
+                if (species >= 0 && species <= RESOURCE_BLOB_MAX_SPECIES) outInUse[species] = true;
+            }
+        }
+        iterArgs[0] = entity;
+        if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) return;
+    }
+}
+
 // Bounded by RESOURCE_BLOB_MAX_SPECIES (64), NOT SPECIES_SLOT_COUNT (256) --
 // found via static analysis 2026-07-23 (session 15) while investigating the
 // fresh-load fallback crash: fnc_load_gimmick_assets itself
@@ -671,14 +763,22 @@ static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t sp
 // later -- live-confirmed as the mechanism behind an intermittent crash on
 // this whole path. RoomHasNativeSpecies only checks placement-table
 // records, not arbitrary live entities, so it can't catch this class of
-// collision. Not a complete fix (that would mean walking live entities the
-// way FUN_1402b6390 does via FUN_140291b20 and checking their own +0x134
-// handles), but a real, load-bearing avoidance -- do not revert to
-// starting at 0. Session 15 found slots ~48-64 are hardcoded-reserved by
-// unrelated engine subsystems (menu/JP-sysfont, voice, event motion/
-// effect), so this stays well clear of that range too.
-static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, uint8_t* outSpecies) {
+// collision. Session 20 (2026-08-02) found starting at 20 wasn't a complete
+// fix either -- species=20 collided with a completely different live
+// system (an unrelated per-party ability-data rebuild routine, crashing
+// inside FUN_1401d62e0 with zero relation to entity rendering/velocity at
+// all) -- proving there is no fixed "safe" species range; it depends on
+// whatever's currently loaded. Session 20 implemented the walk this
+// comment already called for: see MarkSpeciesInUseByLiveEntities below,
+// which mirrors FUN_1402b6390's own iteration (FUN_140291b20 over the
+// 96-slot entity pool, each entity's own +0x134 handle resolved and mapped
+// back to a species number) and is now consulted here in addition to the
+// engine's own loadedSpeciesPtrTable state. Session 15 found slots ~48-64
+// are hardcoded-reserved by unrelated engine subsystems (menu/JP-sysfont,
+// voice, event motion/effect), so this stays well clear of that range too.
+static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, uint8_t* outSpecies) {
     for (int s = 20; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
+        if (speciesInUseByLiveEntity && speciesInUseByLiveEntity[s]) continue;
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
         if (*stateAddr == 0) {
             *outSpecies = (uint8_t)s;
@@ -697,6 +797,8 @@ static bool InstallJobRecordGuardHook(unsigned long long hookAddr, unsigned long
                                         unsigned long long worldNumRva, unsigned long long areaNumRva,
                                         unsigned long long setNumRva);
 static bool InstallVelocityBlendGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallPartyAbilityIndexGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                                unsigned long long resolveHandleFnAddr);
 
 extern "C" int l_spawn_enemy(void* L) {
     unsigned long long spawnFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -729,6 +831,21 @@ extern "C" int l_spawn_enemy(void* L) {
     // is 0 (not configured on this build) or either install fails.
     unsigned long long jobCallbackFnRva = (unsigned long long)p_lua_tointegerx(L, 17, nullptr);
     unsigned long long velocityBlendFnRva = (unsigned long long)p_lua_tointegerx(L, 18, nullptr);
+    // Session 20: entry point for FUN_140291b20 (the 96-slot live-entity pool
+    // iterator), used by MarkSpeciesInUseByLiveEntities to avoid handing out
+    // a species number some live entity's own +0x134 handle already
+    // references. Optional (0 = not configured on this build, e.g. EGS as of
+    // this writing) -- FindFreeLoadedSlot degrades to session 19's
+    // start-at-20 heuristic alone in that case, same as before this session.
+    unsigned long long entityIterFnRva = (unsigned long long)p_lua_tointegerx(L, 19, nullptr);
+    // Session 20: entry point of the CALL-to-fnc_resolve_resource_handle
+    // instruction inside FUN_1401d62e0 (Steam RVA 0x1D62F2, five bytes
+    // before the 0x1D62F7 fault site) -- see
+    // InstallPartyAbilityIndexGuardHook's comment for the crash this fixes.
+    // Optional (0 = not configured on this build) -- a fallback spawn
+    // refuses cleanly rather than proceed unprotected, same as the other
+    // two guard hooks.
+    unsigned long long partyAbilityIndexFnRva = (unsigned long long)p_lua_tointegerx(L, 20, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -808,22 +925,29 @@ extern "C" int l_spawn_enemy(void* L) {
             return 2;
         }
         usedFallback = true;
-        // Install both crash-fixing hooks (idempotent -- a no-op if already
-        // installed this process) before touching anything else on the
-        // fallback path. Both are load-bearing, live-confirmed fixes for
-        // real crashes on this exact path (session 19) -- refuse cleanly
-        // rather than proceed unprotected if either RVA is unconfigured for
-        // this build or either install itself fails.
-        if (jobCallbackFnRva == 0 || velocityBlendFnRva == 0) {
+        // Install all three crash-fixing hooks (idempotent -- a no-op if
+        // already installed this process) before touching anything else on
+        // the fallback path. All are load-bearing, live-confirmed fixes for
+        // real crashes on this exact path (sessions 19-20) -- refuse
+        // cleanly rather than proceed unprotected if any RVA is
+        // unconfigured for this build or any install itself fails.
+        if (jobCallbackFnRva == 0 || velocityBlendFnRva == 0 || partyAbilityIndexFnRva == 0) {
             p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: job-record-guard/velocity-blend-guard hook addresses not configured for this game build -- fallback spawning unavailable");
+            p_lua_pushstring(L, "spawn_enemy: job-record-guard/velocity-blend-guard/party-ability-index-guard hook addresses not configured for this game build -- fallback spawning unavailable");
             return 2;
         }
         if (!InstallJobRecordGuardHook(base + jobCallbackFnRva, base + jobCallbackFnRva + 5,
                                          tablePtrRva, tableCountRva, worldNumRva, areaNumRva, setNumRva) ||
-            !InstallVelocityBlendGuardHook(base + velocityBlendFnRva, base + velocityBlendFnRva + 5)) {
+            !InstallVelocityBlendGuardHook(base + velocityBlendFnRva, base + velocityBlendFnRva + 5) ||
+            // +9, not +5: the hook replaces BOTH the 5-byte call and the
+            // 4-byte risky read that immediately follows it (see
+            // InstallPartyAbilityIndexGuardHook's comment) -- resumeAddr
+            // must skip past both, landing at "add rsp,0x20", or the stub's
+            // own jmp lands back on the original unpatched read and
+            // re-triggers the exact crash this hook exists to prevent.
+            !InstallPartyAbilityIndexGuardHook(base + partyAbilityIndexFnRva, base + partyAbilityIndexFnRva + 9, base + resolveHandleFnRva)) {
             p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend guard hooks -- refusing fallback spawn rather than risk the crash they fix");
+            p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend/party-ability-index guard hooks -- refusing fallback spawn rather than risk the crash they fix");
             return 2;
         }
         // Session 12: mintHandleFnRva is now required for BOTH sub-branches
@@ -837,7 +961,34 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
             return 2;
         }
-        if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species)) {
+        // Session 20: only needed for the genuinely-fresh-slot branch below
+        // (FindFreeLoadedSlot), but computed here, once, regardless of which
+        // branch ends up taken -- cheap (a few dozen native calls at most,
+        // only when a fallback spawn is already in play) and keeps the
+        // three-way branch below simple. See MarkSpeciesInUseByLiveEntities's
+        // comment for what this protects against.
+        bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
+        MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, speciesInUseByLiveEntity);
+        if (FindTriggeredLoad(modelPath, &species)) {
+            // We already called fnc_load_gimmick_assets for this exact
+            // creature earlier this session (possibly on a previous frame's
+            // retry, possibly still in flight right now) -- reuse that
+            // species number and do NOT trigger another load. See
+            // FindTriggeredLoad's declaration comment for why re-triggering
+            // here on every retry frame is unsafe.
+            if (RoomHasNativeSpecies(oldTable, oldCount, species)) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already triggered by us this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
+                return 2;
+            }
+            templateRec = fallback.templateRecord;
+            // needsLoad stays false -- readiness is verified uniformly by
+            // the usedFallback-wide check further below regardless of which
+            // branch got us here.
+        } else if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species)) {
             // Already loaded into some slot this session (not via a placement
             // record we can see, or we'd have hit the native path above) --
             // reuse it, no need to load again. But first: this slot number was
@@ -855,7 +1006,7 @@ extern "C" int l_spawn_enemy(void* L) {
                 return 2;
             }
             templateRec = fallback.templateRecord;
-        } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, &species)) {
+        } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, &species)) {
             // mintHandleFnRva/loadAssetsFnRva are required for this specific
             // case (a genuinely fresh slot, nothing loaded into it yet) --
             // checked here, before the placement table is touched at all,
@@ -1142,48 +1293,99 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: exception during asset-load trigger call");
             return 2;
         }
+        // Record this immediately -- see FindTriggeredLoad's declaration
+        // comment. Must happen even though the load hasn't completed yet;
+        // that's the entire point (stop a later retry frame from triggering
+        // a second, concurrent load for the same record).
+        RecordTriggeredLoad(modelPath, species);
 
-        // Confirmed live 2026-07-21: a truly cold (first-ever-this-session)
-        // load can take longer than the original 2s timeout -- constructing
-        // anyway after a timeout produced an entity with position stuck at
-        // (0,0,0), invisible and uninteractable, even though every record
-        // field was correct. A second spawn attempt (species already cached
-        // from the first load finishing in the background) worked
-        // perfectly every time. Fix: refuse to construct rather than build
-        // against not-yet-ready data -- the caller can just retry.
+        // Session 19 used a Sleep(20ms)*500 (~10s) blocking poll here,
+        // confirmed live 2026-08-02 (session 20) to be actively
+        // counterproductive, not just slow: fnc_load_gimmick_assets's async
+        // job is drained by the game's own per-frame loop, which runs on
+        // THIS SAME THREAD (the one this native call executes on, called
+        // synchronously from the Lua frame hook). Blocking this thread in a
+        // Sleep loop doesn't wait for the load -- it PREVENTS the load from
+        // ever starting, since the frame that would drain the job queue can
+        // never run while we're inside the loop. A 3-breakpoint live trace
+        // (trigger call, the async callback FUN_140286420, and its
+        // completion-pointer write at RVA 0x2866EA) proved this
+        // definitively: zero callback hits for the entire 10-second window,
+        // then the callback (a burst of 9, the whole queue's backlog) and
+        // the completion write both landing at the EXACT SAME timestamp,
+        // exactly 10.000s after the trigger -- the instant the poll gave up
+        // and this function returned control to the game's own thread. This
+        // also explains why session 19 always needed exactly one retry,
+        // deterministically: the poll's own final check can never observe
+        // the completion, because the completion is structurally impossible
+        // until after the poll has already given up.
+        //
+        // Fix: don't block at all. Check once (no Sleep), and if not ready
+        // yet, roll back and refuse with a distinct third return value
+        // (stillLoading=true) so the caller knows this is a normal
+        // "call me again once you've let a real frame run" case, not a hard
+        // error -- see kh1_lua_library.lua's spawn_enemy_async, which
+        // drives this via the caller's own _OnFrame instead of blocking.
+        //
+        // Checks state==6, not just loadedPtrAddr!=0 (session 20, revised
+        // after live-testing the ptr-only version): a genuinely fresh
+        // species's FIRST real callback invocation (FUN_140286420, state==0
+        // entry) takes a "first-time registration" branch that writes the
+        // completion pointer but leaves state at 0 -- the model-handle scan
+        // that would advance state through 1/3/5/6 only succeeds on a LATER
+        // invocation, once that same registration has populated whatever
+        // table it checks. Live-confirmed: checking ptr!=0 alone let a
+        // spawn through one real frame too early, producing a visible-but-
+        // functionally-broken entity (invisible, matching session 5's
+        // original "position stuck at (0,0,0)" symptom that the old 10s
+        // poll existed specifically to avoid) on the first attempt, working
+        // correctly only on a second, separate call. Requiring state==6
+        // forces the extra non-blocking retry cycle needed to actually
+        // reach it.
         volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
-        // Diagnostic-only (session 10): also watch the state byte
-        // (LOADED_SPECIES_STATE_OFFSET_FROM_PTR) so the log shows whether
-        // a stuck load is genuinely dead at 0 (job never drained at all)
-        // or climbing through its normal 1/2/4/6 progression but stalling
-        // partway -- these point at very different root causes. No
-        // behavior change, just extra LogDebug calls.
-        volatile uint8_t* stateWatchAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
-        const int kPollIntervalMs = 20;
-        const int kMaxPolls = 500; // ~10 seconds -- generous for a cold first-time load
-        const int kLogEveryNPolls = 100; // ~2 seconds
-        bool loaded = false;
-        for (int i = 0; i < kMaxPolls; ++i) {
-            if (*loadedPtrAddr != 0) { loaded = true; break; }
-            if (i % kLogEveryNPolls == 0) {
-                char pollMsg[128];
-                snprintf(pollMsg, sizeof(pollMsg), "spawn_enemy: poll i=%d species=%d state=%u ptr=0x%llx", i, species, (unsigned)*stateWatchAddr, (unsigned long long)*loadedPtrAddr);
-                LogDebug(pollMsg);
-            }
-            Sleep(kPollIntervalMs);
-        }
-        if (!loaded) {
+        volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+        if (*loadedPtrAddr == 0 || *stateAddr != 6) {
             char msg[160];
-            snprintf(msg, sizeof(msg), "spawn_enemy: asset load for species=%d did not complete within %dms, refusing to construct -- try again", species, kMaxPolls * kPollIntervalMs);
+            snprintf(msg, sizeof(msg), "spawn_enemy: asset load for species=%d not ready yet (state=%u), refusing without blocking -- caller should retry next frame", species, (unsigned)*stateAddr);
             LogDebug(msg);
             *tablePtrAddr = oldTable;
             *tableCountAddr = oldCount;
             p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: asset load did not complete in time -- try again (this is normal for the first spawn of a species in a session)");
-            return 2;
+            p_lua_pushstring(L, "spawn_enemy: asset load still in progress -- call again next frame (this is normal for a creature's first load this session)");
+            p_lua_pushboolean(L, 1);
+            return 3;
         }
     } else if (needsLoad) {
-        LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- skipping asset-load trigger, constructing without it");
+        // Minting the fresh resource-string handles crashed (handlesMinted
+        // false) -- previously this fell through and constructed anyway
+        // with the template's possibly-stale handles. The readiness check
+        // right below now catches this too (a species that was never
+        // triggered will read loadedPtrAddr==0), refusing cleanly instead
+        // of risking a construct against known-bad handles.
+        LogDebug("spawn_enemy: minting a fresh resource-string handle crashed -- refusing rather than constructing with possibly-stale handles");
+    }
+
+    // Same readiness check as above (state==6, not just ptr!=0 -- see the
+    // needsLoad block's comment for why), but unconditional on usedFallback
+    // -- covers the FindLoadedSlotByFilename reuse-elsewhere branch too,
+    // which never triggers a load itself (needsLoad is false there) and,
+    // before this session, went straight to construction on nothing
+    // stronger than "state != 0" (the load merely STARTED, not necessarily
+    // finished).
+    if (usedFallback && !needsLoad) {
+        volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
+        volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+        if (*loadedPtrAddr == 0 || *stateAddr != 6) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: slot %d marked loaded but not fully ready yet (state=%u) -- refusing without blocking", species, (unsigned)*stateAddr);
+            LogDebug(msg);
+            *tablePtrAddr = oldTable;
+            *tableCountAddr = oldCount;
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: asset load still in progress -- call again next frame (this is normal for a creature's first load this session)");
+            p_lua_pushboolean(L, 1);
+            return 3;
+        }
     }
 
     // Fallback-template construction (usedFallback: a fresh-load or reuse-
@@ -2330,6 +2532,143 @@ extern "C" int l_install_velocity_blend_guard_hook(void* L) {
 extern "C" int l_get_velocity_blend_guard_skip_count(void* L) {
     p_lua_pushinteger(L, (long long)g_velocityBlendGuardSkipCount);
     return 1;
+}
+
+// --- PARTY ABILITY ARRAY-INDEX GUARD HOOK ---
+// Session 20 (2026-08-02) fix for a crash discovered while testing the
+// non-blocking spawn_enemy redesign: a completely unrelated per-party
+// ability-data rebuild routine (FUN_1402d94d0/FUN_1402da720, run for each
+// of the 3 party members, checking g_pInventory's own equipped-ability
+// state) crashed live, reproducibly, at Steam RVA 0x1D62F7, inside a tiny
+// shared helper (FUN_1401d62e0) -- confirmed via Windows crash telemetry
+// (Get-WinEvent Id 1000) on 2 separate live attempts, byte-identical fault
+// offset both times. Full decompile of FUN_1401d62e0:
+//   rax = *param1; rcx = *rax; ecx = *(rcx+8);
+//   rax = fnc_resolve_resource_handle(ecx);
+//   return *(int*)(rax + param2*4 + 0x10);   // <-- the fault: no bounds check
+// Both real callers pass param2=0x34 (52) and already treat a negative
+// return as this function's own "not found" sentinel (falling back to a
+// default/unset state) -- so returning -1 on an unreadable read is not a
+// behavior change invented for this fix, it's the function's own existing
+// contract, just reached safely instead of by luck.
+//
+// This is NOT the live-entity-handle collision session 19 found and this
+// session initially (wrongly) assumed was the same mechanism -- confirmed
+// by testing MarkSpeciesInUseByLiveEntities first and seeing the identical
+// crash, at the identical address, with species=20 still not marked in use
+// by anything in the 96-slot gimmick-entity pool. The handle here
+// (`(&DAT_142e1fe24)[partyMember*0x44]`, a static per-party-member global,
+// not any entity's own field) is cached ability-icon data, unrelated to the
+// gimmick/heartless entity system entirely. It crashes for the same root
+// reason sessions 3-5 already established generally (fnc_mint_resource_handle's
+// bucket table assigns handles purely by which 32MB-aligned heap region a
+// pointer falls in, shared globally across every subsystem in the game,
+// with no isolation between them) -- our fresh species-blob write can
+// happen to alias memory ANY unrelated cached handle's bucket points into,
+// not just another entity's. Enumerating every possible colliding
+// subsystem ahead of time isn't tractable; guarding the actual unsafe read
+// (the same approach that already fixed the two other fault sites chased
+// since session 8) is.
+static bool g_partyAbilityIndexGuardHookInstalled = false;
+static volatile uint64_t g_partyAbilityIndexGuardSkipCount = 0;
+
+// __fastcall(rcx=resolved base pointer, rdx=index) -> the real int value if
+// readable, or -1 (this function's own pre-existing "not found" sentinel,
+// already handled by both real callers) if not.
+static int32_t CheckPartyAbilityIndexSafe(uint64_t basePtr, uint64_t index) {
+    __try {
+        return *(int32_t*)(uintptr_t)(basePtr + index * 4 + 0x10);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "PartyAbilityIndexGuard: basePtr=0x%llX index=%llu unreadable, returning -1 (skipsSoFar=%llu)",
+            (unsigned long long)basePtr, (unsigned long long)index,
+            (unsigned long long)g_partyAbilityIndexGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_partyAbilityIndexGuardSkipCount;
+        return -1;
+    }
+}
+
+// Hooks at the CALL to fnc_resolve_resource_handle (5 bytes, `E8 xx xx xx xx`)
+// rather than the 4-byte faulting read right after it -- the read alone is
+// too short for a 5-byte JMP trampoline, but the call+read together (9
+// bytes) give enough room, and both get replaced: the stub replicates the
+// resolve call itself (via an absolute call through resolveHandleFnAddr,
+// avoiding any RIP-relative relocation math) then feeds its result straight
+// into the safety-checked read, so nothing about the original 4-byte
+// instruction survives to fault. ecx (the resolve call's argument) is set
+// by the instruction immediately before this hook and is untouched by
+// installing it. rbx (the index) was already computed earlier in the
+// function and stays valid across this whole hook.
+static bool InstallPartyAbilityIndexGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                                unsigned long long resolveHandleFnAddr) {
+    if (g_partyAbilityIndexGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[5] = { 0xE8, 0xC9, 0x4A, 0x1B, 0x00 };
+    if (memcmp(hookPtr, expected, 5) != 0) {
+        LogDebug("InstallPartyAbilityIndexGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallPartyAbilityIndexGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[64] = {};
+    size_t off = 0;
+    uint64_t checkFnAddr = (uint64_t)(uintptr_t)&CheckPartyAbilityIndexSafe;
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, resolveHandleFnAddr
+    memcpy(stub + off, &resolveHandleFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (rax <- resolved pointer, same effect as the original call)
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC1; // mov rcx, rax  (arg1 = resolved pointer)
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xDA; // mov rdx, rbx  (arg2 = index)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, checkFnAddr
+    memcpy(stub + off, &checkFnAddr, 8); off += 8;
+
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (eax <- safe result)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0xE9; // jmp rel32 -> resumeAddr (past both replaced instructions)
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_partyAbilityIndexGuardHookInstalled = true;
+    LogDebug("InstallPartyAbilityIndexGuardHook: installed successfully");
+    return true;
 }
 
 // --- ASYNC LOAD JOB RECORD GUARD HOOK ---
