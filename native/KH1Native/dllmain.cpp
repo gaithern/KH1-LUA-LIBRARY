@@ -216,26 +216,22 @@ extern "C" int l_write_floats(void* L) {
 //    filename pair (e.g. "xa_ex_2010.mdls"/"xa_ex_2010.mset" = Soldier) --
 //    never by species/slot number, which was proven this investigation to be
 //    a per-room-LOCAL index with no fixed meaning (the same number is a
-//    different creature in different rooms). Three cases, in order:
-//     a. A record already native to this room resolves (via
-//        fnc_resolve_resource_handle) to the requested filename -- clone
-//        that record as-is (most of a placement record's ~30 fields aren't
-//        independently understood well enough to synthesize from scratch,
-//        so cloning a real one is the only reliable source) and reuse its
-//        own local slot number. No asset loading needed at all.
-//     b. No native record, but kKnownCreatures has a verified captured
-//        template/char-id/resource-strings entry for this filename, AND some
-//        local slot is already loaded with it this session -- reuse that
-//        slot's number via the fallback template, no reload needed.
-//     c. Same as (b) but no slot has it loaded yet -- claim the first slot
-//        untouched this session (state byte == 0 in the per-species
-//        asset-load struct) and go through the full mint-handle +
-//        load-trigger path. See FindNativeRecordByModel/FindKnownCreature/
-//        FindLoadedSlotByFilename/FindFreeLoadedSlot above.
-//    Only creatures with a kKnownCreatures entry can use (b)/(c) --
-//    otherwise this refuses rather than guess. See KH1-EVDL-TOOLS's
-//    investigation doc for the full capture-and-verify checklist required
-//    before adding another creature there.
+//    different creature in different rooms). char-id/weight/a full template
+//    record for this filename come from kh1_creature_data.lua (generated
+//    offline from every room's own .ard file -- see generate_creature_data.py);
+//    this refuses cleanly rather than guess if the model isn't in that table.
+//    Two cases, in order:
+//     a. Some local slot is already loaded with this exact creature this
+//        session -- reuse that slot's number via the template, no reload
+//        needed. See FindLoadedSlotByFilename/FindFreeLoadedSlot above.
+//     b. No slot has it loaded yet -- claim the first slot untouched this
+//        session (state byte == 0 in the per-species asset-load struct) and
+//        go through the full mint-handle + load-trigger path.
+//    (Session 21: this used to have a third, first-preference case --
+//    cloning a record already native to the current room, via
+//    fnc_resolve_resource_handle -- removed once the .ard table made
+//    deriving data from a live room visit redundant. See the heartless
+//    field-spawn investigation memory, "Session 21 continued".)
 // 3. Allocates a fresh (count+1)-record buffer, copies the old table in,
 //    appends a clone of the template record with a new id built from a real
 //    category (3, character/actor) and this slot's own real index in the
@@ -303,121 +299,30 @@ static const int SPECIES_SLOT_COUNT = 256; // species/slot index is a uint8_t (r
 // pair, and l_spawn_enemy below figures out which local slot number (if any)
 // already holds it, or claims a free one, entirely on its own.
 //
-// Per-creature data below is keyed by that filename pair instead of by a
-// species number. Only creatures with a live-captured, verified entry here
-// can use the FALLBACK path (spawning into a room with zero native presence
-// of that creature) -- see KH1-EVDL-TOOLS's investigation doc, session 5,
-// for the full capture-and-verify checklist (species byte, char-id, weight,
-// model/motion filename strings) required before adding another creature.
-// A creature already native to the room (found by resolving an EXISTING
-// placement record's own model handle) never needs any of this -- see
-// FindNativeRecordByModel.
-struct KnownCreature {
-    const char* modelPath;
-    const char* motionPath;
-    uint16_t charId; // record+0x4c -- see the safety note on FindKnownCreature below
-    uint8_t weight;  // record+0x59
-    const uint8_t fallbackTemplate[PLACEMENT_RECORD_SIZE];
-};
-
-// Captured live via Cheat Engine from a room where the creature actually
-// spawns (Green Room, session 5), rather than hand-built -- most of a
-// record's ~30 fields still aren't independently understood, so cloning a
-// real one is the only reliable source. id (+0x0), position
-// (+0x1C/+0x20/+0x24), species (+0x55), char-id (+0x4c), and weight (+0x59)
-// all get overwritten/forced by l_spawn_enemy regardless of what this
-// template carries -- every field NOT in that list is trusted as-is from
-// the capture, so a still-unverified field could in principle cause a
-// similar problem to the ones already found and fixed (record+8's stale
-// resolved-handle crash, the species-byte transcription bug, the
-// record+0x4c g_SoraObjPtr-hijack bug -- see l_spawn_enemy and the
-// investigation doc, session 5, for all three).
-static const KnownCreature kKnownCreatures[] = {
-    {
-        "xa_ex_2010.mdls", "xa_ex_2010.mset", // Soldier
-        // record+0x4c ("character id"): fnc_spawn_world_gimmick_entity reads
-        // this for any kind==3 entity, and a value that resolves (via
-        // FUN_140285030) to < 3 gets treated as an actual PARTY MEMBER,
-        // overwriting g_SoraObjPtr[that index] -- confirmed live 2026-07-21
-        // that the raw captured template's char-id of 0 hijacked Sora's own
-        // party slot. Real, natively-placed Soldier records all read 0x12C
-        // (300) here instead -- a fixed, species-constant value, not
-        // session-local data, so it's safe to force. weight (39 in the raw
-        // capture) is also confirmed wrong; real records read 4.
-        300, 4,
-        {
-            0x03, 0x00, 0x03, 0x00, 0x22, 0x1C, 0x00, 0x00, 0xA0, 0xAD, 0x3F, 0x81, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x42, 0x00, 0x00,
-            0x3F, 0xC3, 0x00, 0x00, 0xC8, 0xC3, 0x00, 0x80, 0xB5, 0x43, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,
-            0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x05, 0x22, 0x05, 0x00, 0x06, 0x04, 0x01, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0xB0,
-            0x8E, 0x80, 0x20, 0xB0, 0x8E, 0x80, 0x4B, 0x41, 0x47, 0x45, 0x5F, 0x36, 0x5F, 0x31, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        },
-    },
-};
-
-// Creatures learned live this session, in addition to kKnownCreatures above.
-// Whenever spawn_enemy finds a creature already native to a room (see
-// FindNativeRecordByModel below), it opportunistically captures that record's
-// real char-id/weight/full bytes here -- straight from live memory, not a
-// hand transcription, so none of the transcription bugs that hit the
-// original Soldier capture (session 5) are possible. Once learned, a
-// creature becomes spawnable via the fallback path anywhere else for the
-// rest of this game session (lost on restart -- purely in-memory, no disk
-// persistence, matching this project's live-only conventions elsewhere).
-struct LearnedCreature {
-    char modelPath[64];
-    char motionPath[64];
-    uint16_t charId;
-    uint8_t weight;
-    uint8_t record[PLACEMENT_RECORD_SIZE];
-};
-static const int MAX_LEARNED_CREATURES = 64;
-static LearnedCreature g_learnedCreatures[MAX_LEARNED_CREATURES];
-static int g_learnedCreatureCount = 0;
-
-static const LearnedCreature* FindLearnedCreature(const char* modelPath) {
-    for (int i = 0; i < g_learnedCreatureCount; ++i) {
-        if (strcmp(g_learnedCreatures[i].modelPath, modelPath) == 0) return &g_learnedCreatures[i];
-    }
-    return nullptr;
-}
-
+// Per-creature char-id/weight/template data (session 21 onward) lives
+// entirely in kh1_creature_data.lua, generated offline from every room's own
+// .ard file (see generate_creature_data.py) -- Lua looks it up and passes it
+// into l_spawn_enemy as luaCharId/luaWeight/luaTemplateRecord. This used to
+// also be sourced from a hardcoded kKnownCreatures array and a
+// live-learned-this-session cache (g_learnedCreatures), both keyed the same
+// way but far more limited in coverage; both were removed once the .ard
+// table made them redundant -- see the heartless field-spawn investigation
+// memory, "Session 21 continued".
+//
 // A per-species resource-blob table (DAT_140d2ada0 on Steam RVA 0xd2ada0,
 // DAT_140d2b880 on EGS RVA 0xd2b880 -- 0x40000/256KB stride per species/slot
 // index) that fnc_spawn_world_gimmick_entity's kind==3 setup path
 // (FUN_140288460 -> FUN_140287e40 on Steam) reads and parses as a small
-// section-offset table. Confirmed live 2026-07-22 (KH1-EVDL-TOOLS
-// investigation doc, "Session 9") that the fresh-load fallback path
-// (a genuinely new species/slot claimed this session) NEVER populates this
-// table -- the asset-load streaming path only drives model/motion filename
-// resolution and loadedSpeciesPtrTable's own state, not this separate blob.
-// read_memory on the actual resolved pointer during a real crash showed a
-// smooth gradient of garbage bytes, nothing like the small structured
-// offsets that code expects -- it blindly parses that garbage and
-// dereferences pointers computed from it. The only known-good source of
-// real data here is a native room's own already-populated entry for this
-// creature, so this cache captures a byte-for-byte copy of it (independent
-// of kKnownCreatures/g_learnedCreatures, keyed purely by model filename)
-// whenever a native record is found, and l_spawn_enemy primes a freshly
-// claimed slot's table entry from this cache before ever calling the
-// constructor. Untested whether the format is genuinely slot-position-
-// independent (the header's own section offsets are self-relative, which is
-// promising) -- if a future creature's data turns out NOT to be portable
-// across slot numbers this way, this whole approach needs revisiting.
+// section-offset table. RESOURCE_BLOB_MAX_SPECIES bounds
+// MarkSpeciesInUseByLiveEntities/FindFreeLoadedSlot below (FUN_140285db0:
+// `(ptr - DAT_140d2ada0) >> 0x12`, refuses if > 0x40 -- 65 valid entries,
+// species 0..64). A session 9-era mechanism that captured and re-primed this
+// table's content per-species was live-tested, made a crash WORSE, and was
+// fully reverted -- the fresh-load path never actually needed it (sessions
+// 13-14 found `fnc_load_gimmick_assets` mints record+8 into the correct
+// slice itself, unconditionally, before construction).
 static const size_t RESOURCE_BLOB_SIZE = 0x40000;
-// FUN_140285db0 (decompiled this session): `(ptr - DAT_140d2ada0) >> 0x12`,
-// refuses if > 0x40 -- the table has exactly 65 valid entries (species 0..64).
 static const int RESOURCE_BLOB_MAX_SPECIES = 0x40;
-struct ResourceBlobEntry {
-    char modelPath[64];
-    uint8_t* blob; // heap-allocated, RESOURCE_BLOB_SIZE bytes; never freed (session-lifetime cache)
-};
-static const int MAX_RESOURCE_BLOBS = 64;
-static ResourceBlobEntry g_resourceBlobs[MAX_RESOURCE_BLOBS];
-static int g_resourceBlobCount = 0;
 
 // Session 16 (2026-07-23) live-debugging aid: the entity id of whichever
 // spawn_enemy call most recently reached the constructor. Exists purely so
@@ -515,13 +420,6 @@ static void RecordTriggeredLoad(const char* modelPath, uint8_t species) {
     g_triggeredLoadCount++;
 }
 
-static const uint8_t* FindResourceBlob(const char* modelPath) {
-    for (int i = 0; i < g_resourceBlobCount; ++i) {
-        if (strcmp(g_resourceBlobs[i].modelPath, modelPath) == 0) return g_resourceBlobs[i].blob;
-    }
-    return nullptr;
-}
-
 // model_path/motion_path arrive from Lua as p_lua_tolstring pointers, valid only
 // for the duration of this call -- Lua's GC is free to reclaim that string the
 // moment l_spawn_enemy returns. But fnc_load_gimmick_assets's async pipeline
@@ -534,9 +432,8 @@ static const uint8_t* FindResourceBlob(const char* modelPath) {
 // xa_ex_2010.mdls/.mset spawn on every attempt. Minting a handle straight from
 // the raw Lua pointer (as this used to) hands the engine a pointer that can be
 // dangling by the time anything actually reads it -- a use-after-free, not an
-// engine bug. Fix: copy into DLL-owned static storage (mirroring the
-// g_resourceBlobs pattern above, for the same "must outlive this call"
-// reason) and mint handles from that instead.
+// engine bug. Fix: copy into DLL-owned static storage (a "must outlive this
+// call" cache) and mint handles from that instead.
 struct InternedPathEntry {
     char path[64];
 };
@@ -555,105 +452,7 @@ static const char* InternPath(const char* s) {
     return entry.path;
 }
 
-static void CaptureResourceBlobIfNew(const char* modelPath, unsigned long long base, unsigned long long speciesResourceTableRva, uint8_t species) {
-    if (speciesResourceTableRva == 0 || FindResourceBlob(modelPath) || g_resourceBlobCount >= MAX_RESOURCE_BLOBS) return;
-    uint8_t* blob = (uint8_t*)malloc(RESOURCE_BLOB_SIZE);
-    if (!blob) return;
-    memcpy(blob, (const void*)(uintptr_t)(base + speciesResourceTableRva + (size_t)species * RESOURCE_BLOB_SIZE), RESOURCE_BLOB_SIZE);
-    ResourceBlobEntry& entry = g_resourceBlobs[g_resourceBlobCount];
-    strncpy_s(entry.modelPath, modelPath, _TRUNCATE);
-    entry.blob = blob;
-    g_resourceBlobCount++;
-
-    char msg[160];
-    snprintf(msg, sizeof(msg), "spawn_enemy: captured per-species resource blob for model=\"%s\" (species=%u) -- fresh-load fallback can now safely prime a new slot with it", modelPath, (unsigned)species);
-    LogDebug(msg);
-}
-
-// Called after any successful native-record match, regardless of whether
-// that spawn attempt goes on to use it -- capturing is opportunistic and
-// free once we've already resolved the record right here. A no-op if
-// already known (either hardcoded or previously learned) or if the learned
-// table is full (silently skipped -- 64 is far more than any single session
-// is likely to need, and this is a nice-to-have cache, not load-bearing).
-static void LearnCreatureIfNew(const char* modelPath, const char* motionPath, const uint8_t* nativeRecord) {
-    for (const auto& entry : kKnownCreatures) {
-        if (strcmp(entry.modelPath, modelPath) == 0) return;
-    }
-    if (FindLearnedCreature(modelPath) || g_learnedCreatureCount >= MAX_LEARNED_CREATURES) return;
-
-    LearnedCreature& entry = g_learnedCreatures[g_learnedCreatureCount];
-    strncpy_s(entry.modelPath, modelPath, _TRUNCATE);
-    strncpy_s(entry.motionPath, motionPath, _TRUNCATE);
-    memcpy(&entry.charId, nativeRecord + 0x4c, 2);
-    entry.weight = nativeRecord[0x59];
-    memcpy(entry.record, nativeRecord, PLACEMENT_RECORD_SIZE);
-    g_learnedCreatureCount++;
-
-    char msg[192];
-    snprintf(msg, sizeof(msg), "spawn_enemy: learned creature model=\"%s\" charId=%u weight=%u -- spawnable anywhere else this session now", modelPath, (unsigned)entry.charId, (unsigned)entry.weight);
-    LogDebug(msg);
-}
-
-// Unifies kKnownCreatures (hardcoded, hand-verified) and g_learnedCreatures
-// (captured live this session) into one lookup for the fallback path -- the
-// caller doesn't need to know or care which source a creature came from.
-struct CreatureFallbackData {
-    uint16_t charId;
-    uint8_t weight;
-    const uint8_t* templateRecord;
-};
-
-static bool FindCreatureFallbackData(const char* modelPath, CreatureFallbackData* out) {
-    for (const auto& entry : kKnownCreatures) {
-        if (strcmp(entry.modelPath, modelPath) == 0) {
-            out->charId = entry.charId;
-            out->weight = entry.weight;
-            out->templateRecord = entry.fallbackTemplate;
-            return true;
-        }
-    }
-    const LearnedCreature* learned = FindLearnedCreature(modelPath);
-    if (learned) {
-        out->charId = learned->charId;
-        out->weight = learned->weight;
-        out->templateRecord = learned->record;
-        return true;
-    }
-    return false;
-}
-
-// record+0x60/+0x64 hold handles (same bucket-table encoding as record+8) to
-// the model/motion filename strings the async load callback (FUN_140286420)
-// dereferences, and that fnc_resolve_resource_handle (Steam RVA 0x38ADC0,
-// EGS 0x38B0B0 -- confirmed live 2026-07-22 against real Alleyway records)
-// resolves back to a real, in-process-readable string pointer -- this DLL
-// runs inside the game process, so no external memory-read is needed, a
-// plain strncmp against the resolved pointer works. Used to find a creature
-// ALREADY native to the current room by its real identity, regardless of
-// whatever local slot number the room happens to use for it.
-static bool ResolvedModelMatches(unsigned long long resolveFnAddr, uint32_t modelHandle, const char* wantModel) {
-    if (modelHandle == 0) return false;
-    unsigned long long args[1] = { (unsigned long long)modelHandle };
-    unsigned long long resolved = 0;
-    if (!SafeCall(resolveFnAddr, args, 1, resolved) || resolved == 0) return false;
-    return strncmp((const char*)(uintptr_t)resolved, wantModel, LOADED_SPECIES_MODEL_NAME_SIZE) == 0;
-}
-
-static const uint8_t* FindNativeRecordByModel(const uint8_t* table, int32_t count, unsigned long long resolveFnAddr, const char* modelPath, uint8_t* outSpecies) {
-    for (int32_t i = 0; i < count; ++i) {
-        const uint8_t* rec = table + (size_t)i * PLACEMENT_RECORD_SIZE;
-        uint32_t modelHandle;
-        memcpy(&modelHandle, rec + PLACEMENT_MODEL_HANDLE_OFFSET, 4);
-        if (ResolvedModelMatches(resolveFnAddr, modelHandle, modelPath)) {
-            *outSpecies = rec[PLACEMENT_SPECIES_OFFSET];
-            return rec;
-        }
-    }
-    return nullptr;
-}
-
-// Fallback path only (no native record found above): scan the per-species
+// Fallback path only: scan the per-species
 // asset-load state struct across every possible slot for one already
 // holding this exact creature (state != 0, cached filename matches --
 // reuse it, e.g. a prior fallback spawn of the same creature this session)
@@ -687,9 +486,39 @@ static bool FindLoadedSlotByFilename(unsigned long long base, unsigned long long
 // earlier native Soldier spawn elsewhere), which collided with Accessory
 // Shop's own unrelated native record at that same local slot -- first call
 // spawned something invisible/uninteractable, second call crashed the game.
-static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t species) {
+// record+0x60 holds a handle (same bucket-table encoding as record+8) to the
+// model filename string, and fnc_resolve_resource_handle (Steam RVA
+// 0x38ADC0, EGS 0x38B0B0 -- confirmed live 2026-07-22 against real Alleyway
+// records) resolves it back to a real, in-process-readable string pointer --
+// this DLL runs inside the game process, so no external memory-read is
+// needed, a plain strncmp against the resolved pointer works.
+static bool ResolvedModelMatches(unsigned long long resolveFnAddr, uint32_t modelHandle, const char* wantModel) {
+    if (modelHandle == 0) return false;
+    unsigned long long args[1] = { (unsigned long long)modelHandle };
+    unsigned long long resolved = 0;
+    if (!SafeCall(resolveFnAddr, args, 1, resolved) || resolved == 0) return false;
+    return strncmp((const char*)(uintptr_t)resolved, wantModel, LOADED_SPECIES_MODEL_NAME_SIZE) == 0;
+}
+
+// Session 21 (2026-08-02) fix: a room's own native record of the EXACT
+// creature being spawned used to never reach this check at all (caught
+// earlier by the now-removed native-clone case). Once that case was removed,
+// spawning a creature already native to its own room started false-positive
+// refusing here -- RoomHasNativeSpecies only checked "is this species number
+// used by ANY record", with no notion of "used by the SAME creature we're
+// about to spawn" being perfectly fine (we're about to reuse that exact
+// slot). Now resolves each same-species record's own model handle and only
+// treats it as a real collision if it belongs to a genuinely DIFFERENT
+// creature. Live-confirmed: the false-positive refusal (spawning Soldier in
+// a room where Soldier is already native, broken immediately after the
+// native-clone case was removed) is fixed by this change.
+static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t species, unsigned long long resolveFnAddr, const char* modelPath) {
     for (int32_t i = 0; i < count; ++i) {
-        if (table[(size_t)i * PLACEMENT_RECORD_SIZE + PLACEMENT_SPECIES_OFFSET] == species) {
+        const uint8_t* rec = table + (size_t)i * PLACEMENT_RECORD_SIZE;
+        if (rec[PLACEMENT_SPECIES_OFFSET] != species) continue;
+        uint32_t modelHandle;
+        memcpy(&modelHandle, rec + PLACEMENT_MODEL_HANDLE_OFFSET, 4);
+        if (!ResolvedModelMatches(resolveFnAddr, modelHandle, modelPath)) {
             return true;
         }
     }
@@ -846,6 +675,21 @@ extern "C" int l_spawn_enemy(void* L) {
     // refuses cleanly rather than proceed unprotected, same as the other
     // two guard hooks.
     unsigned long long partyAbilityIndexFnRva = (unsigned long long)p_lua_tointegerx(L, 20, nullptr);
+    // Session 21: the only source of fallback char-id/weight/template data,
+    // looked up Lua-side (kh1_creature_data.lua, generated from every room's
+    // own .ard file -- see generate_creature_data.py and the heartless
+    // field-spawn investigation memory, "Session 21"/"Session 21 continued").
+    // charId==0 is never a real value (record+0x4c==0 is Sora's own party
+    // slot, forced below) so it doubles as "no offline data for this model",
+    // matching every other optional trailing arg's 0-means-unset convention
+    // in this function.
+    // luaTemplateRecord is a raw (possibly-embedded-NUL) byte string, so its
+    // real length MUST come from lua_tolstring's own out-param, not strlen --
+    // uninitialized here first since a nil Lua value leaves *len untouched.
+    long long luaCharId = (long long)p_lua_tointegerx(L, 21, nullptr);
+    long long luaWeight = (long long)p_lua_tointegerx(L, 22, nullptr);
+    size_t luaTemplateLen = 0;
+    const char* luaTemplateRecord = p_lua_tolstring(L, 23, &luaTemplateLen);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -857,12 +701,11 @@ extern "C" int l_spawn_enemy(void* L) {
     // logging) uses these stable pointers instead of the raw Lua ones.
     modelPath = InternPath(modelPath);
     motionPath = InternPath(motionPath);
-    // resolveHandleFnRva is load-bearing for the native-record-reuse scan
-    // below, which always runs first -- unlike the old species-number API,
-    // there's no way to skip it. A 0 RVA (this build's Global address table
-    // hasn't got it yet -- see EGSGlobal_1_0_0_10.lua's TODO) must refuse
-    // cleanly rather than compute `base + 0` and treat the module header as
-    // a function address.
+    // resolveHandleFnRva is load-bearing for MarkSpeciesInUseByLiveEntities
+    // and InstallPartyAbilityIndexGuardHook below. A 0 RVA (this build's
+    // Global address table hasn't got it yet -- see EGSGlobal_1_0_0_10.lua's
+    // TODO) must refuse cleanly rather than compute `base + 0` and treat the
+    // module header as a function address.
     if (resolveHandleFnRva == 0) {
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: fnc_resolve_resource_handle address not configured for this game build");
@@ -882,177 +725,165 @@ extern "C" int l_spawn_enemy(void* L) {
     }
 
     // species (the local slot number, record+0x55) is never chosen by the
-    // caller anymore -- it's derived here, in one of three ways, checked in
-    // order of preference:
-    //  1. A record already native to this room resolves to the requested
-    //     creature (by real filename, not by a guessed species number) --
-    //     reuse it as-is. The creature's assets are already loaded; no mint,
-    //     no load trigger, no collision risk at all.
-    //  2. No native record, but some local slot is already loaded with this
-    //     exact creature this session (e.g. a prior fallback spawn of it) --
-    //     reuse that slot number via the fallback template.
-    //  3. Neither -- claim the first slot untouched this session and go
-    //     through the full fallback-template + mint + load-trigger path.
+    // caller -- it's derived below from whichever of two cases applies:
+    //  1. Some local slot is already loaded with this exact creature this
+    //     session (e.g. a prior spawn of it) -- reuse that slot number, no
+    //     reload needed.
+    //  2. Neither -- claim the first slot untouched this session and go
+    //     through the full mint + load-trigger path.
+    // (Session 21: this used to have a third, first-preference case --
+    // cloning a record already native to the current room -- removed once
+    // kh1_creature_data.lua's offline .ard data made deriving char-id/
+    // weight/template from a live room visit redundant. See the heartless
+    // field-spawn investigation memory, "Session 21 continued".)
     uint8_t species = 0;
-    const uint8_t* templateRec = nullptr;
-    bool usedFallback = false;
     bool needsLoad = false;
 
-    templateRec = FindNativeRecordByModel(oldTable, oldCount, base + resolveHandleFnRva, modelPath, &species);
-    if (templateRec) {
-        // Opportunistic: this creature is native to the current room, so its
-        // real char-id/weight/full record are all right here in memory --
-        // learn them now (a no-op if already known) so this creature becomes
-        // spawnable via the fallback path anywhere else for the rest of the
-        // session, with zero manual capture. See LearnCreatureIfNew.
-        LearnCreatureIfNew(modelPath, motionPath, templateRec);
-        CaptureResourceBlobIfNew(modelPath, base, speciesResourceTableRva, species);
+    // kh1_creature_data.lua (looked up Lua-side, generated offline from
+    // every room's own .ard file -- see generate_creature_data.py) is now
+    // the only source of char-id/weight/template data; refuse cleanly if
+    // this model isn't in it rather than guess. luaTemplateRecord is
+    // consumed synchronously below (memcpy'd into the new placement record
+    // well before this function returns), so pointing directly at Lua's own
+    // string storage is safe, unlike modelPath/motionPath (which the async
+    // load callback dereferences up to ~10s later -- see InternPath's
+    // comment -- and therefore must be interned).
+    if (luaCharId == 0 || !luaTemplateRecord || luaTemplateLen != PLACEMENT_RECORD_SIZE) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: no offline fallback data for this creature (missing from kh1_creature_data.lua)");
+        return 2;
     }
+    const uint8_t* templateRec = (const uint8_t*)luaTemplateRecord;
+    uint16_t charId = (uint16_t)luaCharId;
+    uint8_t weight = (uint8_t)luaWeight;
 
-    CreatureFallbackData fallback{};
-    if (!templateRec) {
-        if (!FindCreatureFallbackData(modelPath, &fallback)) {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: no native record of this creature in the room, and no verified fallback data for it (visit a room where it's native once to learn it)");
-            return 2;
-        }
-        // loadedPtrTableRva is load-bearing for both slot-scan helpers below --
-        // a 0 RVA here (this build's Global address table hasn't got it yet)
-        // must refuse cleanly rather than scan garbage at `base + 0 + offset`.
-        if (loadedPtrTableRva == 0) {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: loadedSpeciesPtrTable address not configured for this game build -- fallback spawning unavailable");
-            return 2;
-        }
-        usedFallback = true;
-        // Install all three crash-fixing hooks (idempotent -- a no-op if
-        // already installed this process) before touching anything else on
-        // the fallback path. All are load-bearing, live-confirmed fixes for
-        // real crashes on this exact path (sessions 19-20) -- refuse
-        // cleanly rather than proceed unprotected if any RVA is
-        // unconfigured for this build or any install itself fails.
-        if (jobCallbackFnRva == 0 || velocityBlendFnRva == 0 || partyAbilityIndexFnRva == 0) {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: job-record-guard/velocity-blend-guard/party-ability-index-guard hook addresses not configured for this game build -- fallback spawning unavailable");
-            return 2;
-        }
-        if (!InstallJobRecordGuardHook(base + jobCallbackFnRva, base + jobCallbackFnRva + 5,
-                                         tablePtrRva, tableCountRva, worldNumRva, areaNumRva, setNumRva) ||
-            !InstallVelocityBlendGuardHook(base + velocityBlendFnRva, base + velocityBlendFnRva + 5) ||
-            // +9, not +5: the hook replaces BOTH the 5-byte call and the
-            // 4-byte risky read that immediately follows it (see
-            // InstallPartyAbilityIndexGuardHook's comment) -- resumeAddr
-            // must skip past both, landing at "add rsp,0x20", or the stub's
-            // own jmp lands back on the original unpatched read and
-            // re-triggers the exact crash this hook exists to prevent.
-            !InstallPartyAbilityIndexGuardHook(base + partyAbilityIndexFnRva, base + partyAbilityIndexFnRva + 9, base + resolveHandleFnRva)) {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend/party-ability-index guard hooks -- refusing fallback spawn rather than risk the crash they fix");
-            return 2;
-        }
-        // Session 12: mintHandleFnRva is now required for BOTH sub-branches
-        // below, not just the genuinely-fresh-slot one -- see the broadened
-        // re-mint block further down for why. Checked here, before the
-        // placement table is touched, for the same "keep refusals a true
-        // no-op" reason the loadAssetsFnRva/mintHandleFnRva check in the
-        // FindFreeLoadedSlot branch already exists.
-        if (mintHandleFnRva == 0) {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
-            return 2;
-        }
-        // Session 20: only needed for the genuinely-fresh-slot branch below
-        // (FindFreeLoadedSlot), but computed here, once, regardless of which
-        // branch ends up taken -- cheap (a few dozen native calls at most,
-        // only when a fallback spawn is already in play) and keeps the
-        // three-way branch below simple. See MarkSpeciesInUseByLiveEntities's
-        // comment for what this protects against.
-        bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
-        MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, speciesInUseByLiveEntity);
-        if (FindTriggeredLoad(modelPath, &species)) {
-            // We already called fnc_load_gimmick_assets for this exact
-            // creature earlier this session (possibly on a previous frame's
-            // retry, possibly still in flight right now) -- reuse that
-            // species number and do NOT trigger another load. See
-            // FindTriggeredLoad's declaration comment for why re-triggering
-            // here on every retry frame is unsafe.
-            if (RoomHasNativeSpecies(oldTable, oldCount, species)) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already triggered by us this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
-                LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
-                return 2;
-            }
-            templateRec = fallback.templateRecord;
-            // needsLoad stays false -- readiness is verified uniformly by
-            // the usedFallback-wide check further below regardless of which
-            // branch got us here.
-        } else if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species)) {
-            // Already loaded into some slot this session (not via a placement
-            // record we can see, or we'd have hit the native path above) --
-            // reuse it, no need to load again. But first: this slot number was
-            // chosen purely from the session-global load table, with no idea
-            // whether THIS room's own placement table already uses it for a
-            // real, different creature/object -- refuse rather than collide
-            // (see RoomHasNativeSpecies's comment for the live crash this
-            // guard is fixing).
-            if (RoomHasNativeSpecies(oldTable, oldCount, species)) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already loaded elsewhere this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
-                LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
-                return 2;
-            }
-            templateRec = fallback.templateRecord;
-        } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, &species)) {
-            // mintHandleFnRva/loadAssetsFnRva are required for this specific
-            // case (a genuinely fresh slot, nothing loaded into it yet) --
-            // checked here, before the placement table is touched at all,
-            // rather than down in the load-trigger block below (which runs
-            // AFTER the table swap and would hit the same phantom-record-on-
-            // refusal bug the timeout/crash refusals there still have --
-            // see KH1-EVDL-TOOLS's investigation doc, session 6). Refusing
-            // this early keeps this particular check a true no-op.
-            if (loadAssetsFnRva == 0) {
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: fnc_load_gimmick_assets not configured for this game build -- can't load a creature with zero presence in this room");
-                return 2;
-            }
-            // Same room-local collision risk as the reuse branch above: a
-            // slot never touched THIS SESSION globally could still be a real
-            // native record in the CURRENT room if that room simply hasn't
-            // been scanned into the global load table yet for some reason --
-            // refuse rather than assume "session-global free" means "room-
-            // local free" too.
-            if (RoomHasNativeSpecies(oldTable, oldCount, species)) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d is used by a different native record in this room -- refusing", species);
-                LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
-                return 2;
-            }
-            templateRec = fallback.templateRecord;
-            needsLoad = true;
-        } else {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
-            return 2;
-        }
-        // Session 9/10 found the fresh-load (needsLoad) case's eventual
-        // CONSTRUCTION call is unsafe (root cause still open -- see
-        // KH1-EVDL-TOOLS's investigation doc, "Session 9"/"Session 10").
-        // Session 11 found this refusal had scope creep: it used to sit here,
-        // unconditionally, covering BOTH sub-cases above -- including the
-        // `FindLoadedSlotByFilename` reuse case (line ~648), which needs no
-        // new asset load at all and was independently validated safe across
-        // sessions 5-8. That reuse case no longer refuses here; the
-        // still-unsafe construction is now refused specifically for the
-        // `needsLoad` case only, after its own trigger+poll block below (see
-        // the `if (needsLoad)` guard right before the constructor call).
+    // loadedPtrTableRva is load-bearing for both slot-scan helpers below --
+    // a 0 RVA here (this build's Global address table hasn't got it yet)
+    // must refuse cleanly rather than scan garbage at `base + 0 + offset`.
+    if (loadedPtrTableRva == 0) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: loadedSpeciesPtrTable address not configured for this game build");
+        return 2;
     }
+    // Install all three crash-fixing hooks (idempotent -- a no-op if already
+    // installed this process) before touching anything else. All are
+    // load-bearing, live-confirmed fixes for real crashes on this exact path
+    // (sessions 19-20) -- refuse cleanly rather than proceed unprotected if
+    // any RVA is unconfigured for this build or any install itself fails.
+    if (jobCallbackFnRva == 0 || velocityBlendFnRva == 0 || partyAbilityIndexFnRva == 0) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: job-record-guard/velocity-blend-guard/party-ability-index-guard hook addresses not configured for this game build");
+        return 2;
+    }
+    if (!InstallJobRecordGuardHook(base + jobCallbackFnRva, base + jobCallbackFnRva + 5,
+                                     tablePtrRva, tableCountRva, worldNumRva, areaNumRva, setNumRva) ||
+        !InstallVelocityBlendGuardHook(base + velocityBlendFnRva, base + velocityBlendFnRva + 5) ||
+        // +9, not +5: the hook replaces BOTH the 5-byte call and the
+        // 4-byte risky read that immediately follows it (see
+        // InstallPartyAbilityIndexGuardHook's comment) -- resumeAddr
+        // must skip past both, landing at "add rsp,0x20", or the stub's
+        // own jmp lands back on the original unpatched read and
+        // re-triggers the exact crash this hook exists to prevent.
+        !InstallPartyAbilityIndexGuardHook(base + partyAbilityIndexFnRva, base + partyAbilityIndexFnRva + 9, base + resolveHandleFnRva)) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend/party-ability-index guard hooks -- refusing rather than risk the crash they fix");
+        return 2;
+    }
+    // Session 12: mintHandleFnRva is required regardless of which of the two
+    // sub-branches below ends up taken -- see the re-mint block further down
+    // for why. Checked here, before the placement table is touched, for the
+    // same "keep refusals a true no-op" reason the loadAssetsFnRva check in
+    // the FindFreeLoadedSlot branch already exists.
+    if (mintHandleFnRva == 0) {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
+        return 2;
+    }
+    // Session 20: only needed for the genuinely-fresh-slot branch below
+    // (FindFreeLoadedSlot), but computed here, once, regardless of which
+    // branch ends up taken -- cheap (a few dozen native calls at most) and
+    // keeps the two-way branch below simple. See MarkSpeciesInUseByLiveEntities's
+    // comment for what this protects against.
+    bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
+    MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, speciesInUseByLiveEntity);
+    if (FindTriggeredLoad(modelPath, &species)) {
+        // We already called fnc_load_gimmick_assets for this exact
+        // creature earlier this session (possibly on a previous frame's
+        // retry, possibly still in flight right now) -- reuse that
+        // species number and do NOT trigger another load. See
+        // FindTriggeredLoad's declaration comment for why re-triggering
+        // here on every retry frame is unsafe.
+        if (RoomHasNativeSpecies(oldTable, oldCount, species, base + resolveHandleFnRva, modelPath)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already triggered by us this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
+            LogDebug(msg);
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
+            return 2;
+        }
+        // needsLoad stays false -- readiness is verified uniformly by the
+        // check further below regardless of which branch got us here.
+    } else if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species)) {
+        // Already loaded into some slot this session (not via a placement
+        // record we can see) -- reuse it, no need to load again. But first:
+        // this slot number was chosen purely from the session-global load
+        // table, with no idea whether THIS room's own placement table
+        // already uses it for a real, different creature/object -- refuse
+        // rather than collide (see RoomHasNativeSpecies's comment for the
+        // live crash this guard is fixing).
+        if (RoomHasNativeSpecies(oldTable, oldCount, species, base + resolveHandleFnRva, modelPath)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already loaded elsewhere this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
+            LogDebug(msg);
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
+            return 2;
+        }
+    } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, &species)) {
+        // mintHandleFnRva/loadAssetsFnRva are required for this specific
+        // case (a genuinely fresh slot, nothing loaded into it yet) --
+        // checked here, before the placement table is touched at all,
+        // rather than down in the load-trigger block below (which runs
+        // AFTER the table swap and would hit the same phantom-record-on-
+        // refusal bug the timeout/crash refusals there still have --
+        // see KH1-EVDL-TOOLS's investigation doc, session 6). Refusing
+        // this early keeps this particular check a true no-op.
+        if (loadAssetsFnRva == 0) {
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: fnc_load_gimmick_assets not configured for this game build -- can't load a creature with zero presence in this room");
+            return 2;
+        }
+        // Same room-local collision risk as the reuse branch above: a
+        // slot never touched THIS SESSION globally could still be a real
+        // native record in the CURRENT room if that room simply hasn't
+        // been scanned into the global load table yet for some reason --
+        // refuse rather than assume "session-global free" means "room-
+        // local free" too.
+        if (RoomHasNativeSpecies(oldTable, oldCount, species, base + resolveHandleFnRva, modelPath)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: slot %d is used by a different native record in this room -- refusing", species);
+            LogDebug(msg);
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
+            return 2;
+        }
+        needsLoad = true;
+    } else {
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
+        return 2;
+    }
+    // Session 9/10 found the fresh-load (needsLoad) case's eventual
+    // CONSTRUCTION call is unsafe (root cause still open -- see
+    // KH1-EVDL-TOOLS's investigation doc, "Session 9"/"Session 10").
+    // Session 11 found this refusal had scope creep: it used to sit here,
+    // unconditionally, covering BOTH sub-cases above -- including the
+    // `FindLoadedSlotByFilename` reuse case, which needs no new asset load
+    // at all and was independently validated safe across sessions 5-8. That
+    // reuse case no longer refuses here; the still-unsafe construction is
+    // now refused specifically for the `needsLoad` case only, after its own
+    // trigger+poll block below (see the `if (needsLoad)` guard right before
+    // the constructor call).
 
     // Collision guard, defense in depth: FindLoadedSlotByFilename/
     // FindFreeLoadedSlot above already choose a slot that should be safe by
@@ -1102,9 +933,7 @@ extern "C" int l_spawn_enemy(void* L) {
     // handle most likely resolved to something non-zero-but-wrong in the new room
     // rather than cleanly 0, so the self-heal never triggered. Zeroing it here
     // forces the constructor's own existing fallback to always resolve it fresh
-    // for whatever room this actually runs in, whether templateRec came from the
-    // current room (harmless -- it'll just re-resolve the same thing) or a
-    // captured fallback template (the actual fix). Untested against other
+    // for whatever room this actually runs in. Untested against other
     // possibly-similar fields elsewhere in the record as of this change.
     memset(newRec + 8, 0, 4);
 
@@ -1126,37 +955,23 @@ extern "C" int l_spawn_enemy(void* L) {
     memcpy(newRec + PLACEMENT_POS_Z_OFFSET, &z, 4);
 
     // Force the species byte to the slot number chosen above rather than trusting
-    // whatever's baked into templateRec at this offset. For an in-room clone this
-    // is a no-op (it's already equal, that's how templateRec was found). For a
-    // captured fallback template it's a real safety net: confirmed live 2026-07-21
-    // that a hand-transcribed static template (the original species-34-only
-    // Soldier template, since folded into kKnownCreatures) had a transcription
-    // error that put the WRONG byte at this exact offset, spawning as slot 0
-    // (Sora) instead of 34 -- rendered as another Sora and fell endlessly,
-    // presumably because the neighboring char-id field this constructor checks
-    // (species_def+0x4c, see fnc_spawn_world_gimmick_entity) was corrupted the
-    // same way and got misread as a party-member slot. This line guarantees the
-    // species byte specifically is always correct regardless of template
-    // provenance; it does NOT fix other fields a mistranscribed template might
-    // still get wrong (that needs a clean re-capture, ideally generated
-    // mechanically rather than hand-typed, to avoid repeating this mistake).
+    // whatever's baked into templateRec at this offset (a stale value from
+    // whichever room's .ard record generate_creature_data.py happened to pick
+    // as this creature's template). This line guarantees the species byte
+    // specifically is always correct regardless of template provenance; it
+    // does NOT fix other fields the template might carry from a different
+    // room (scale/rotation/etc. -- see kh1_creature_data.lua's own header).
     newRec[PLACEMENT_SPECIES_OFFSET] = species;
 
-    // Only for a captured fallback template (never an in-room clone, which
-    // already carries a correct real value): force record+0x4c ("character
-    // id") and record+0x59 (weight) to live-verified, per-creature values
-    // instead of whatever the template happened to carry. This is the
-    // critical safety fix for the g_SoraObjPtr hijack documented above --
-    // confirmed live 2026-07-21 that the raw captured template's char-id (0)
-    // hijacked Sora's own party slot; real Soldier records read 300.
-    // usedFallback implies `fallback` was populated (that's the only path
-    // that sets both together, see above).
-    if (usedFallback) {
-        uint16_t charId = fallback.charId;
-        uint8_t weight = fallback.weight;
-        memcpy(newRec + 0x4c, &charId, 2);
-        newRec[0x59] = weight;
-    }
+    // Force record+0x4c ("character id") and record+0x59 (weight) to the
+    // offline-derived, per-creature values instead of whatever the template
+    // happened to carry -- this is the critical safety fix for the
+    // g_SoraObjPtr hijack documented above: char-id 0 gets treated as an
+    // actual PARTY MEMBER index and overwrites g_SoraObjPtr[0] (Sora
+    // himself). charId/weight above are already validated non-placeholder
+    // (charId != 0) before this point.
+    memcpy(newRec + 0x4c, &charId, 2);
+    newRec[0x59] = weight;
 
     // Session 11: publish here, before the load-trigger block below, restoring
     // session 10's original order. A session-11 attempt to defer this publish
@@ -1205,32 +1020,28 @@ extern "C" int l_spawn_enemy(void* L) {
     // even reached it -- the flags write was the only new code before that
     // point). No real evidence it's load-bearing for safety here.
     //
-    // Session 12 (2026-07-22): broadened from `needsLoad`-only to any
-    // `usedFallback` spawn. Live-confirmed the exact crash this comment
-    // already predicted, but for a path believed safe since session 8: the
-    // "already loaded elsewhere this session" reuse branch
-    // (FindLoadedSlotByFilename) also clones `fallback.templateRecord`
-    // without ever reaching this mint block, since it was gated on
-    // `needsLoad` (false for that branch). For a kKnownCreatures entry
-    // specifically, record+0x60/+0x64 are hardcoded at COMPILE TIME, from
-    // whatever session originally captured them -- long gone by the time
-    // this runs. `loadedSpeciesPtrTable`'s state==6 for the chosen slot only
-    // proves the ENGINE's own local-slot asset stream is resident; it says
-    // nothing about whether OUR cloned record's own embedded handle numbers
-    // still resolve in the CURRENT process's bucket table. Confirmed live:
-    // a species=28 reuse in tw11 crashed the constructor
-    // ("spawn_enemy crashed: spawnFnRva=0x290d60 id=0x30010 species=28"),
-    // and reading the live record back showed record+0x60/+0x64
-    // (0xB020808E/0x414B808E) byte-for-byte identical to kKnownCreatures'
-    // hardcoded Soldier template bytes at the same offsets -- proof this
-    // mint had never run for that call. Re-minting is cheap and always safe
-    // (it just registers a fresh handle for OUR OWN caller-supplied
-    // model_path/motion_path strings, which are valid regardless of where
-    // templateRec's other fields came from), so it no longer depends on
-    // needsLoad -- only on usedFallback (an in-room native clone needs
-    // none of this; its handles are already correct as-is).
+    // Session 12 (2026-07-22): broadened from `needsLoad`-only to every
+    // spawn, regardless of which of the two slot-selection branches above
+    // was taken. Live-confirmed the exact crash this comment already
+    // predicted, but for a path believed safe since session 8: the "already
+    // loaded elsewhere this session" reuse branch (FindLoadedSlotByFilename)
+    // also clones templateRec without ever reaching this mint block, since
+    // it was gated on `needsLoad` (false for that branch). record+0x60/+0x64
+    // in kh1_creature_data.lua's template are baked in from whatever room's
+    // .ard file generate_creature_data.py picked -- meaningless in the
+    // CURRENT process's bucket table (a session-relative handle encoding,
+    // see FUN_14038ad90/mintHandleFnRva below). Confirmed live (pre-.ard-table
+    // era, a kKnownCreatures entry
+    // with compile-time-hardcoded handles): a species=28 reuse in tw11
+    // crashed the constructor, and reading the live record back showed
+    // record+0x60/+0x64 byte-for-byte identical to the hardcoded template's
+    // bytes at those offsets -- proof this mint had never run for that call.
+    // Re-minting is cheap and always safe (it just registers a fresh handle
+    // for OUR OWN caller-supplied model_path/motion_path strings, which are
+    // valid regardless of where templateRec's other fields came from), so it
+    // runs for every spawn now, not just needsLoad.
     bool handlesMinted = false;
-    if (usedFallback) {
+    {
         unsigned long long mintFnAddr = base + mintHandleFnRva;
 
         unsigned long long modelArgs[1] = { (unsigned long long)(uintptr_t)modelPath };
@@ -1366,13 +1177,12 @@ extern "C" int l_spawn_enemy(void* L) {
     }
 
     // Same readiness check as above (state==6, not just ptr!=0 -- see the
-    // needsLoad block's comment for why), but unconditional on usedFallback
-    // -- covers the FindLoadedSlotByFilename reuse-elsewhere branch too,
-    // which never triggers a load itself (needsLoad is false there) and,
-    // before this session, went straight to construction on nothing
-    // stronger than "state != 0" (the load merely STARTED, not necessarily
-    // finished).
-    if (usedFallback && !needsLoad) {
+    // needsLoad block's comment for why) -- covers the FindLoadedSlotByFilename
+    // reuse-elsewhere branch too, which never triggers a load itself
+    // (needsLoad is false there) and, before this session, went straight to
+    // construction on nothing stronger than "state != 0" (the load merely
+    // STARTED, not necessarily finished).
+    if (!needsLoad) {
         volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
         if (*loadedPtrAddr == 0 || *stateAddr != 6) {
@@ -1388,10 +1198,9 @@ extern "C" int l_spawn_enemy(void* L) {
         }
     }
 
-    // Fallback-template construction (usedFallback: a fresh-load or reuse-
-    // elsewhere spawn, as opposed to an in-room native clone) was refused
-    // unconditionally from session 9 through session 18 -- the real root
-    // cause spanned two independent bugs, both now fixed and live-verified
+    // Fallback-template construction was refused unconditionally from
+    // session 9 through session 18 -- the real root cause spanned two
+    // independent bugs, both now fixed and live-verified
     // end-to-end (session 19, 2026-08-02, species=20 in a non-native room:
     // visible, lockable, damageable, first full success this investigation
     // has ever had on this path):
@@ -1409,9 +1218,9 @@ extern "C" int l_spawn_enemy(void* L) {
     //      the room's own identity (g_WorldNumber/g_AreaNumber/g_SetNumber)
     //      taken when the job was queued, not placementTablePtr itself,
     //      which this function mutates for unrelated reasons.
-    // Both are installed once per process by kh1_native_test.lua on F6-panel
-    // load (not from this DLL itself -- see that repo). FindFreeLoadedSlot
-    // also starts scanning from species 20 instead of 0, avoiding a live-
+    // Both are installed once per process, automatically, right above in
+    // this same function. FindFreeLoadedSlot also starts scanning from
+    // species 20 instead of 0, avoiding a live-
     // confirmed collision between low slot numbers and another entity's own
     // cached type-def handle. Full session-by-session history: the
     // heartless field-spawn investigation memory/doc.
@@ -1430,8 +1239,8 @@ extern "C" int l_spawn_enemy(void* L) {
         memcpy(&h60, newRec + PLACEMENT_MODEL_HANDLE_OFFSET, 4);
         memcpy(&h64, newRec + PLACEMENT_MOTION_HANDLE_OFFSET, 4);
         char diagMsg[192];
-        snprintf(diagMsg, sizeof(diagMsg), "spawn_enemy: pre-construct id=0x%x species=%d usedFallback=%d needsLoad=%d handlesMinted=%d rec+8=0x%08x rec+0x60=0x%08x rec+0x64=0x%08x charId=%u weight=%u",
-            newId, species, (int)usedFallback, (int)needsLoad, (int)handlesMinted, h8, h60, h64,
+        snprintf(diagMsg, sizeof(diagMsg), "spawn_enemy: pre-construct id=0x%x species=%d needsLoad=%d handlesMinted=%d rec+8=0x%08x rec+0x60=0x%08x rec+0x64=0x%08x charId=%u weight=%u",
+            newId, species, (int)needsLoad, (int)handlesMinted, h8, h60, h64,
             (unsigned)(*(uint16_t*)(newRec + 0x4c)), (unsigned)newRec[0x59]);
         LogDebug(diagMsg);
     }
@@ -1461,7 +1270,7 @@ extern "C" int l_spawn_enemy(void* L) {
     // itself refuses (returns 0, no crash, table already spliced) when a
     // global concurrent-entity budget (DAT_142d60c98 cap vs DAT_142d60c9c
     // running total, incremented by the species-def's own weight byte at
-    // +0x59 -- the same "weight" field kKnownCreatures stores) would be
+    // +0x59 -- the same "weight" field kh1_creature_data.lua stores) would be
     // exceeded. Observed directly: spawning into a room with a live,
     // player-untouched ambient Heartless returned a null entity pointer;
     // clearing that Heartless first (freeing budget via its own despawn path)

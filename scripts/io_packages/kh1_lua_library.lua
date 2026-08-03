@@ -21,6 +21,15 @@
 -- call into game code (rather than just read/write memory) go through it.
 local kh1_native = require("kh1_native")
 
+-- Per-creature char-id/weight/template-record data extracted offline from
+-- every room's own .ard file -- see kh1_creature_data.lua's own header and
+-- the heartless field-spawn investigation memory ("Session 21") for how this
+-- was derived and validated. Lets spawn_enemy's fallback path work for any
+-- creature immediately, without ever needing to visit its native room live
+-- first (the old auto-learn-on-native-visit mechanism in dllmain.cpp still
+-- exists as a fallback for anything missing here).
+local kh1_creature_data = require("kh1_creature_data")
+
 -- ########### --
 -- # Helpers # --
 -- ########### --
@@ -803,47 +812,44 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
     explicit position pointer), Heartless have no such convenience wrapper --
     this calls the lower-level fnc_spawn_world_gimmick_entity directly. That
     function resolves its argument by exact-matching it against a record in
-    the current room's own live placement table, so this works by cloning an
-    existing (or captured fallback) record, editing its id, species/slot, and
-    position, and appending it -- see native/KH1Native/dllmain.cpp's
-    l_spawn_enemy for the full mechanism.
+    the current room's own live placement table, so this works by cloning a
+    template record, editing its id/species/slot/position, and appending it
+    -- see native/KH1Native/dllmain.cpp's l_spawn_enemy for the full
+    mechanism.
 
-    CONFIRMED LIVE (2026-07-21): a spawned Shadow can be locked onto,
-    damaged, defeated, and attacks Sora back -- fully functional, not just a
-    rendered prop, for a creature already native to the room.
-
-    For a creature with zero native presence in the room, l_spawn_enemy needs
-    a verified fallback-template entry (species byte, char-id, weight, and
-    these same model/motion filenames) -- either hardcoded in kKnownCreatures
-    (currently just Soldier, xa_ex_2010) or learned automatically. Every
-    successful call that finds this creature already native to a room
-    opportunistically captures its real char-id/weight/full record straight
-    from live memory (see LearnCreatureIfNew) -- no manual capture, no
-    transcription risk. Once learned, a creature is spawnable anywhere for
-    the rest of the game session, even in rooms with zero native presence of
-    it (lost on restart -- purely in-memory). Requesting a creature that's
-    neither native to the current room nor known/learned yet returns an
-    error rather than guessing; visit a room where it's native once first.
-    For a fallback spawn, it also triggers the same asset-load call real EVDL
-    room scripts use (fnc_load_gimmick_assets) and waits for it before
+    Every call looks the model up in kh1_creature_data.lua for its char-id,
+    weight, and a full template record -- data extracted offline from every
+    room's own .ard file (see generate_creature_data.py), covering every
+    creature in the game without ever needing to visit its native room live.
+    Requesting a model that isn't in that table returns an error rather than
+    guessing. (Session 21: this used to also special-case a creature already
+    placed in the current room, cloning its live record directly and/or
+    learning its data on the fly -- removed once the .ard table made both
+    redundant. See the heartless field-spawn investigation memory, "Session
+    21 continued", for why.) It also triggers the same asset-load call real
+    EVDL room scripts use (fnc_load_gimmick_assets) if this creature isn't
+    already loaded into a slot this session, and waits for it before
     constructing, since the record's own self-heal only resolves handles
     into already-loaded data -- it never triggers a load itself; see
     l_spawn_enemy's comment for the full history of getting this right
     without crashing.
 
-    FALLBACK SPAWNS (a species not already native to the current room) WORK
-    as of session 19 (2026-08-02) -- live-confirmed end-to-end: visible,
-    lockable, damageable. This was unconditionally disabled from session 9
-    through 18 while two independent, real crash mechanisms on this path
-    got root-caused and fixed (see l_spawn_enemy's comment for exactly
-    what/why); this function now installs both fixes itself, idempotently,
-    before ever attempting a fallback spawn, so no separate setup call is
-    needed. On a build where either fix's target address isn't configured
-    yet (EGS as of this writing), a fallback spawn refuses cleanly rather
-    than proceed unprotected -- only native-record-reuse (a creature
-    already placed in the current room) is unaffected by that restriction.
-    See the heartless field-spawn investigation memory/doc for the full
-    session-by-session history.
+    CONFIRMED LIVE (2026-07-21, and repeatedly since): a spawned creature can
+    be locked onto, damaged, defeated, and attacks Sora back -- fully
+    functional, not just a rendered prop. This was unconditionally disabled
+    from session 9 through 18 while two independent, real crash mechanisms
+    on this path got root-caused and fixed (see l_spawn_enemy's comment for
+    exactly what/why); this function now installs both fixes itself,
+    idempotently, before attempting a spawn, so no separate setup call is
+    needed. On a build where any fix's target address isn't configured,
+    spawn_enemy refuses cleanly rather than proceed unprotected -- there is
+    currently no unaffected path on such a build. EGS's addresses were all
+    located via static Ghidra cross-binary matching in session 21
+    (2026-08-03) -- see EGSGlobal_1_0_0_10.lua -- but are NOT YET
+    independently live-verified on an actual EGS game session; treat EGS
+    spawn_enemy as untested, not confirmed working, until someone runs it
+    there. See the heartless field-spawn investigation memory/doc for the
+    full session-by-session history.
 
     WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
     record-splicing (allocate a new table, copy the old one in, clone/edit a
@@ -854,12 +860,12 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
     function) is the fix.
 
     Returns true + the new entity's pointer if the spawn call completed
-    without crashing, or false + an error message (e.g. "no native record of
-    this creature in the room, and no verified fallback data for it")
-    otherwise. For a fallback spawn whose asset load hasn't finished yet, also
-    returns a third value (true) so callers can tell "still loading, call me
-    again" apart from a hard refusal -- see spawn_enemy_async below, which
-    handles that automatically instead of making you poll by hand.
+    without crashing, or false + an error message (e.g. "no offline fallback
+    data for this creature") otherwise. If this creature isn't already
+    loaded into a slot this session and its asset load hasn't finished yet,
+    also returns a third value (true) so callers can tell "still loading,
+    call me again" apart from a hard refusal -- see spawn_enemy_async below,
+    which handles that automatically instead of making you poll by hand.
 
     IMPORTANT (2026-08-02, session 20): this call USED to block for up to 10
     real seconds on a creature's first-ever load this session (a Sleep-based
@@ -880,12 +886,23 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
         y = y or pos["Y"]
         z = z or pos["Z"]
     end
+    -- charId=0 is never a real value here (record+0x4c==0 is Sora's own party
+    -- slot -- see l_spawn_enemy's comment) so it doubles as "no offline data
+    -- for this model", matching this call's own convention of 0 meaning
+    -- "unconfigured" for its other optional trailing args.
+    local charId, weight, template = 0, 0, nil
+    local known = kh1_creature_data[model_path]
+    if known then
+        charId = known.charId
+        weight = known.weight
+        template = known.template
+    end
     return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount,
         fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, fnc_resolve_resource_handle,
         speciesResourceTable, model_path, motion_path, x, y, z,
         g_WorldNumber, g_AreaNumber, g_SetNumber,
         fnc_async_load_job_callback, fnc_velocity_blend_util, fnc_iterate_live_entities,
-        fnc_party_ability_index_resolve_call)
+        fnc_party_ability_index_resolve_call, charId, weight, template)
 end
 
 -- Pending spawn_enemy_async requests, keyed by an opaque incrementing id --

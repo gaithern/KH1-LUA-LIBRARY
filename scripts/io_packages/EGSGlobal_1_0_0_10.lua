@@ -335,11 +335,63 @@ fnc_resolve_resource_handle = 0x38B0B0
 -- the fallback path. Not independently live-verified on EGS (found via
 -- Steam-side live debugging plus a static decompile match here).
 speciesResourceTable = 0xD2B880
--- TODO (2026-07-21): EGS twins of fnc_load_gimmick_assets (Steam 0x285EE0),
--- loadedSpeciesPtrTable (Steam 0x2869E18), and fnc_mint_resource_handle
--- (Steam 0x38AD90) not yet located -- spawn_enemy's fallback-template path
--- (a creature with zero native presence in the room) will cleanly refuse on
--- EGS until these are added (Steam-only investigation so far).
+-- Session 21 (2026-08-03): the remaining spawn_enemy addresses below, found
+-- via Ghidra cross-binary fuzzy match + decompile comparison against the
+-- Steam originals -- all matched at instruction-for-instruction identical
+-- structure (only nested call targets/DAT_ addresses differ, as expected
+-- across builds). None of these are independently live-verified on EGS yet
+-- (found via static analysis only, no EGS game session run against them) --
+-- see the heartless field-spawn investigation memory for the methodology.
+--
+-- fnc_load_gimmick_assets (Steam 0x285EE0): fuzzy match score 0.657,
+-- decompile-identical (species-slot state reset, mint from
+-- speciesResourceTable, queue job with fnc_async_load_job_callback below).
+fnc_load_gimmick_assets = 0x283D60
+-- loadedSpeciesPtrTable (Steam 0x2869E18): not matched directly (it's data,
+-- not a function) -- derived from fnc_load_gimmick_assets's own decompile,
+-- which references it as "-0x45 from loadedSpeciesPtrTable" on both builds
+-- (0x2869E18 - 0x45 = 0x2869DD3 on Steam, matching DAT_142869dd3 in that
+-- decompile; the same offset from the EGS decompile's DAT_14286a7d3 gives
+-- this value).
+loadedSpeciesPtrTable = 0x286A818
+-- fnc_mint_resource_handle (Steam 0x38AD90): already named in Ghidra's EGS
+-- database from an earlier investigation thread (not previously copied into
+-- this file). Independently reappears, correctly, inside
+-- fnc_load_gimmick_assets's own EGS decompile above.
+fnc_mint_resource_handle = 0x38B080
+-- fnc_async_load_job_callback (Steam 0x286420): not independently fuzzy-
+-- matched -- read directly out of fnc_load_gimmick_assets's own decompile
+-- (the callback argument to the job-queue call), on both builds.
+fnc_async_load_job_callback = 0x2842A0
+-- fnc_velocity_blend_util (Steam 0x2B5E50): fuzzy match score 0.571 (a
+-- small, generic per-frame utility -- low score expected), decompile-
+-- identical (same +0x374/+0x2000/+0x44/+0x40 field offsets; only the one
+-- nested sub-call target differs, as expected).
+fnc_velocity_blend_util = 0x2B3CB0
+-- fnc_party_ability_index_resolve_call (Steam 0x1D62F2): the containing
+-- function (Steam FUN_1401d62e0) fuzzy-matched to EGS FUN_1401d4180 at
+-- score 1.0, decompile-identical. Disassembly of both is instruction-for-
+-- instruction identical (same offsets from function start), so the target
+-- CALL is at the same +0x12 offset on EGS -- this is that CALL's own
+-- address, matching InstallPartyAbilityIndexGuardHook's existing hookAddr+9
+-- resumeAddr math unchanged (lands exactly on EGS's own "add rsp,0x20").
+-- This disassembly also independently reconfirms fnc_resolve_resource_handle
+-- above (the CALL's own target, 0x38B0B0) -- previously found via a
+-- different method and flagged as not yet independently verified; two
+-- independent derivations now agree.
+fnc_party_ability_index_resolve_call = 0x1D4192
+-- fnc_iterate_live_entities (Steam 0x291B20): optional (spawn_enemy
+-- degrades to a less precise heuristic without it) -- fuzzy match score 1.0,
+-- decompile-identical (same 96-slot pool bounds check shape, just a
+-- different DAT_ base address, as expected).
+fnc_iterate_live_entities = 0x28F990
+-- TODO: g_WorldNumber/g_AreaNumber/g_SetNumber (Steam 0x233FE84/0x233FE8C/
+-- 0x233FE90) still not located on EGS -- optional (InstallJobRecordGuardHook
+-- falls back to its older table-bounds heuristic without them). A direct
+-- xref search on the Steam addresses found nothing (likely accessed via a
+-- computed/struct-relative address Ghidra doesn't track as a static xref);
+-- would need a different approach (e.g. live debugging on EGS, or tracing
+-- the actual room-load routine by decompile rather than xref search).
 
 -- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
 -- pickup popup directly, independent of any actual pickup; matched from Steam

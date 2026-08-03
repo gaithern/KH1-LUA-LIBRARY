@@ -22,6 +22,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/json.lua
+- name: scripts/io_packages/kh1_creature_data.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/kh1_creature_data.lua
 - name: scripts/io_packages/kh1_lua_library.lua
   method: copy
   source:
