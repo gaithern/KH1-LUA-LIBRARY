@@ -26,6 +26,8 @@ local kh1_native = require("kh1_native")
 -- ########### --
 
 local function GetKHSCII(INPUT)
+    --[[Converts text to KHSCII, the game's proprietary
+    text encoding.]]
     local _charTable = {
         [' '] =  0x01,
         ['\n'] =  0x02,
@@ -138,6 +140,7 @@ local function GetKHSCII(INPUT)
 end
 
 local function byte_to_bits(byte)
+    -- Converts 1 byte to array of 8 bits
     local bits = {}
     for i = 0, 7 do
         bits[i + 1] = (byte >> i) & 1  -- LSB first
@@ -146,6 +149,7 @@ local function byte_to_bits(byte)
 end
 
 local function bits_to_byte(bits)
+    -- Converts array of 8 bits to byte
     assert(#bits == 8, "bits_to_byte expects exactly 8 bits")
     local byte = 0
     for i = 1, 8 do
@@ -155,16 +159,19 @@ local function bits_to_byte(bits)
 end
 
 local function ReadBits(address, absolute)
+    -- Returns array of bits in byte at memory address
     if absolute == nil then absolute = false end
     return byte_to_bits(ReadByte(address, absolute))
 end
 
 local function ReadBit(address, bit_num, absolute)
+    -- Reads bit from a byte at memory address
     if absolute == nil then absolute = false end
     return byte_to_bits(ReadByte(address, absolute))[bit_num]
 end
 
 local function WriteBit(address, bit_num, value, absolute)
+    -- Writes bit to a byte at memory address
     if absolute == nil then absolute = false end
     local bits = ReadBits(address, absolute)
     bits[bit_num] = (value ~= 0) and 1 or 0
@@ -172,6 +179,7 @@ local function WriteBit(address, bit_num, value, absolute)
 end
 
 local function contains(tbl, val)
+    -- Returns true if val exists in tbl
     for _, v in ipairs(tbl) do
         if v == val then
             return true
@@ -181,6 +189,7 @@ local function contains(tbl, val)
 end
 
 local function get_index(tbl, val)
+    -- Gets the idx of val in passed tbl if present
     for k, v in ipairs(tbl) do
         if v == val then
             return k
@@ -190,6 +199,7 @@ local function get_index(tbl, val)
 end
 
 local function merge_tables(t1, t2)
+    -- Merges two lua tables into one
     for _, value in ipairs(t2) do
         table.insert(t1, value)
     end
@@ -200,26 +210,32 @@ end
 -- # Getters # --
 -- ########### --
 local function get_world()
+    -- Get current world
     return ReadByte(world)
 end
 
 local function get_room()
+    -- Get current room
     return ReadByte(room)
 end
 
 local function get_gummi_select()
+    -- Get current gummi selection
     return ReadByte(gummiSelect)
 end
 
 local function get_animation_speed()
+    -- Gets Sora's current animation speed
     return ReadFloat(GetPointer(soraHUD - 0xA94) + 0x284, true)
 end
 
 local function get_current_animation()
+    -- Gets Sora's current animation
     return ReadByte(ReadLong(soraPointer)+0x164, true)
 end
 
 local function get_stats_page(entity)
+    -- Gets an entity's/actor's refrenced stat page
     if entity == 0 then
         return 0
     end
@@ -234,6 +250,7 @@ local function get_stats_page(entity)
 end
 
 local function get_ground_combo_length_limit()
+    -- Get currently set ground combo length limit
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page == 0 then
         return 0
@@ -242,6 +259,7 @@ local function get_ground_combo_length_limit()
 end
 
 local function get_air_combo_length_limit()
+    -- Get currently set air combo length limit
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page == 0 then
         return 0
@@ -250,18 +268,22 @@ local function get_air_combo_length_limit()
 end
 
 local function get_animation_time()
+    -- Get how long Sora has been in an animation
     return ReadFloat(ReadLong(soraPointer)+0x16C, true)
 end
 
 local function get_stock()
+    -- Gets full stock as an array
     return ReadArray(inventory, 255)
 end
 
 local function get_stock_at_index(index)
+    -- Gets the stock qty at item idx
     return ReadByte(inventory + index - 1)
 end
 
 local function get_sora_abilities()
+    -- Get all Sora abiltiies acquired
     local abilities = {}
     local i = 0
     while ReadByte(soraCurAbilities + i) ~= 0 and i <= 48 do
@@ -275,6 +297,7 @@ local function get_sora_abilities()
 end
 
 local function get_shared_abilities()
+    -- Get all shared abilities acquired
     local shared_abilities = {}
     local i = 0
     while ReadByte(sharedAbilities + i) ~= 0 and i <= 8 do
@@ -288,6 +311,7 @@ local function get_shared_abilities()
 end
 
 local function get_equipped_sora_abilities()
+    -- Get the currently equipped Sora abilities
     local abilities = {}
     local i = 0
     while ReadByte(soraCurAbilities + i) ~= 0 and i <= 48 do
@@ -303,6 +327,7 @@ local function get_equipped_sora_abilities()
 end
 
 local function get_equipped_shared_abilities()
+    -- Get the currently equipped shared abilities
     local shared_abilities = {}
     local i = 0
     while ReadByte(sharedAbilities + i) ~= 0 and i <= 48 do
@@ -318,18 +343,22 @@ local function get_equipped_shared_abilities()
 end
 
 local function get_soras_accessory_slots()
+    -- Get Sora's max accessory slots
     return ReadByte(maxHP + 0x16)
 end
 
 local function get_soras_equipped_accessories()
+    -- Get Sora's currently equipped accessories
     return ReadArray(maxHP + 0x17, get_soras_accessory_slots())
 end
 
 local function get_inputs()
+    -- Get current inputs on input device
     return ReadArray(inputAddress, 4)
 end
 
 local function get_spell_effectiveness(spell)
+    -- Returns Sora's current spell effectiveness
     local memory_location = nil
         if spell == "Fire"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x00)
     elseif spell == "Fira"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x01)
@@ -360,6 +389,7 @@ local function get_spell_effectiveness(spell)
 end
 
 local function get_current_hits()
+    -- Returns Sora's current combo hits
     return ReadByte(currentHits)
 end
 
@@ -374,6 +404,7 @@ local function get_sora_pos()
 end
 
 local function get_gummi_qty_at_index(index)
+    -- Gets Gummi item qty at a passed idx
     return ReadByte(gummiInventory + index - 1)
 end
 
@@ -381,10 +412,12 @@ end
 -- # Setters # --
 -- ########### --
 local function set_animation_speed(animation_speed)
+    -- Overwrites Sora's current animation speed
     WriteFloat(GetPointer(soraHUD - 0xA94) + 0x284, animation_speed, true)
 end
 
 local function set_ground_combo_length_limit(ground_combo_length_limit)
+    -- Overwrites Sora's current ground combo length
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page ~= 0 then
         WriteByte(stats_page + 0xD4, ground_combo_length_limit, true)
@@ -392,6 +425,7 @@ local function set_ground_combo_length_limit(ground_combo_length_limit)
 end
 
 local function set_air_combo_length_limit(air_combo_length_limit)
+    -- Overwrites Sora's current air combo length
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page ~= 0 then
         WriteByte(stats_page + 0xD5, air_combo_length_limit, true)
@@ -399,14 +433,17 @@ local function set_air_combo_length_limit(air_combo_length_limit)
 end
 
 local function set_stock_at_index(index, qty)
+    -- Sets stock qty for a particular item
     WriteByte(inventory + index - 1, math.min(qty, 99))
 end
 
 local function set_sora_walk_speed(walk_speed)
+    -- Set Sora's walk speed
     WriteFloat(zantHack - 0x2862, walk_speed)
 end
 
 local function set_sora_run_speed(run_speed)
+    -- Sets Sora's run speed
     WriteFloat(zantHack - 0x285B, run_speed)
 end
 
@@ -421,9 +458,9 @@ local function set_spell_effectiveness(spell, value)
     elseif spell == "Thunder"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x06 * 0x70)
     elseif spell == "Thundara" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x07 * 0x70)
     elseif spell == "Thundaga" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x08 * 0x70)
-    elseif spell == "Cure"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x09 * 0x70)
-    elseif spell == "Cura"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0A * 0x70)
-    elseif spell == "Curaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0B * 0x70)
+    elseif spell == "Cure"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x09 * 0x70) - 0x34
+    elseif spell == "Cura"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0A * 0x70) - 0x34
+    elseif spell == "Curaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0B * 0x70) - 0x34
     elseif spell == "Gravity"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0C * 0x70)
     elseif spell == "Gravira"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0D * 0x70)
     elseif spell == "Graviga"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0E * 0x70)
@@ -439,6 +476,13 @@ local function set_spell_effectiveness(spell, value)
 end
 
 local function set_spell_cost(spell, value)
+    --[[ Sets a spells costs.  Defines what valid costs are below.
+     15 = 1/2 CP
+     30 =   1 CP
+    100 =   1 MP
+    200 =   2 MP
+    300 =   3 MP
+    Costs outside this range behave in unexepected ways.]]
     local possible_magic_costs = {15,30,100,200,300}
     if possible_magic_costs[value] then
         local memory_location = nil
@@ -470,14 +514,17 @@ local function set_spell_cost(spell, value)
 end    
 
 local function set_attack_animation_data(index, animation_data)
+    -- Overwrites attack animation data
     WriteArray(anims + (index * 20), animation_data)
 end
 
 local function set_command_data(index, command_data)
+    -- Overwrites command data
     WriteArray(ReadLong(commandMenuPointer) + 16 * (index - 1), command_data, true)
 end
 
 local function set_gummi_qty_at_index(index, qty)
+    -- Writes to Gummi Inventory
     WriteByte(gummiInventory + index - 1, math.min(qty, 99))
 end
 
@@ -550,6 +597,7 @@ local function enable_ability(ability)
 end    
 
 local function force_scan(on)
+-- Credits to KSX, ASM target that forces scan on
     if on then
         WriteArray(zantHack - 0x227C, {0x90,0x90,0x90,0x90,0x90,0x90})
     else
@@ -558,6 +606,7 @@ local function force_scan(on)
 end
 
 local function force_combo_master(on)
+-- Credits to KSX, ASM target that forces combo master on
     if on then
         WriteByte(zantHack + 0x6FB, 0x71)
         WriteByte(zantHack + 0x6FB + 0x18, 0x82)
@@ -568,6 +617,8 @@ local function force_combo_master(on)
 end
 
 local function allow_summon_anywhere(on)
+    --[[ Credits to KSX, ASM target that allows summons 
+    to be used outside of combat.]]
     if on then
         WriteByte(summonanywhere1, 0x72)
         WriteByte(summonanywhere2, 0x72)
@@ -580,6 +631,7 @@ local function allow_summon_anywhere(on)
 end
 
 local function allow_midair_dodge_roll_guard(on)
+    -- Credits to KSX, ASM target that allows dodging/blocking in mid air.
     if on then
         WriteByte(zantHack + 0xC08, 0x82)
     else
@@ -588,6 +640,8 @@ local function allow_midair_dodge_roll_guard(on)
 end
 
 local function allow_air_items(on)
+    --[[ Credits to KSX, ASM target that allows using items in mid air.
+    Currently messes with spells in mid air too.]]
     if on then
         WriteByte(airitems1, 0x73)
         WriteByte(airitems2, 0x73)
@@ -598,23 +652,25 @@ local function allow_air_items(on)
 end
 
 local function multiply_summon_time(mult)
+    -- Credits to KSX, multiplies the summon time factor.
     local vanilla_value = 3000
     local new_value = math.floor(vanilla_value * mult)
     WriteInt(summonTime, new_value)
 end
 
 local function partyActorRVA(z)
+    --[[ Helper function for getting RVA values for Sora, Donald,
+    or Goofy entity/actor pointers]]
     if z == 1 then return soraPointer end
     if z == 2 then return donaldPointer end
     return goofyPointer
 end
 
--- Per-z rotating position (0-4) into that z's body-text scratch pool -- see
--- show_prompt's docstring. Free-running mod 5, matching the real engine's
--- own 5-deep per-party-slot queue depth.
 local promptBodyRingPos = {0, 0, 0}
 
 local function ClampKHSCII(khscii, maxBytes)
+    --[[ Helper function which clamps KHSCII data to not be too long
+    for level up prompts]]
     if #khscii <= maxBytes then
         return khscii
     end
@@ -627,6 +683,10 @@ local function ClampKHSCII(khscii, maxBytes)
 end
 
 local function show_prompt(input_title, input_party, duration, colour)
+    --[[ Credits to Topaz.  Show custom text in the level up box.
+    This has been slightly rewritten to use actual exe functions
+    in order to use the in game box queue, to have more prompts
+    on screen than 1.]]
     if colour == nil then
         colour = 0
     end
@@ -640,9 +700,6 @@ local function show_prompt(input_title, input_party, duration, colour)
             if actor_ptr == 0 or ReadInt(actor_ptr + 0x130, true) == 0 then
                 allOk = false
             else
-                -- Title: one fixed per-z scratch address (see docstring).
-                -- Body: rotate through 5 per-z sub-slots so near-simultaneous
-                -- same-z calls get distinguishable text pointers.
                 local _titleAddress = textMemory + 0x20 * (z - 1)
                 local ringPos = promptBodyRingPos[z]
                 promptBodyRingPos[z] = (ringPos + 1) % 5
@@ -663,11 +720,6 @@ local function show_prompt(input_title, input_party, duration, colour)
                 if not ok then
                     allOk = false
                 else
-                    -- Find which of the 3 party-slot x 5-deep queue entries
-                    -- this call just used by matching the text pointer just
-                    -- passed in (see fnc_enqueue_levelup_prompt's Ghidra
-                    -- plate comment for the ring-buffer layout), then
-                    -- override its title/color pointers.
                     local found = nil
                     for slot = 0, 2 do
                         for q = 0, 4 do
@@ -733,10 +785,13 @@ local function is_pressed(button_array, only)
 end
 
 local function is_in_gummi_garage()
+    --[[ Need to fix, actually returns if in Gummi ship,
+    not just Gummi garage]]
     return ReadInt(inGummi) > 0
 end
 
 local function grant_shared_ability(shared_ability_value)
+    -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
     if current_shared_abilities_qty < 8 then
         WriteByte(sharedAbilities + current_shared_abilities_qty, shared_ability_value + 128)
@@ -744,6 +799,7 @@ local function grant_shared_ability(shared_ability_value)
 end
 
 local function grant_sora_ability(ability_value)
+    -- Grants Sora an ability
     local current_sora_abilities_qty = #get_sora_abilities()
     if current_sora_abilities_qty < 48 then
         WriteByte(soraCurAbilities + current_sora_abilities_qty, ability_value + 128)
@@ -751,30 +807,7 @@ local function grant_sora_ability(ability_value)
 end
 
 local function spawn_prize(item_id)
-    --[[Spawns a physical item pickup near Sora via kh1_native.call_function.
-    Unlike the rest of this library this calls real game code rather than
-    just reading/writing memory, so it needs fnc_spawn_prize (see
-    SteamGlobal_1_0_0_2.lua / EGSGlobal_1_0_0_10.lua) and kh1_native.dll to be
-    present.
-
-    fnc_spawn_prize's second argument is a pointer to a packed {x,y,z} world
-    position float vector (confirmed from the real EVDL caller,
-    fnc_22A_scatter_map_gimmick_prizes, which builds one on its own stack) --
-    NOT an entity/parent pointer. kh1_native.write_floats builds that vector
-    on the fly since Lua can't take the address of a local value itself.
-
-    Deliberately does NOT run the claim/display sequence (fnc_update_widget_queue,
-    EVDL opcodes 0x170/0x16F) real prize-scatter events chain after this: that
-    pair's "value" argument is actually the pop-in animation's total duration
-    (matched against a countdown elsewhere), not an item id, so feeding it
-    item_id there corrupts the icon's scale animation -- confirmed live: the
-    spawned icon visibly grows without bound, faster for lower item ids. The
-    physical pickup from fnc_spawn_prize alone is real and collectible without
-    it; only the (broken) HUD notification icon is skipped.
-
-    Returns true if the spawn call completed without crashing; the physical
-    pickup may still fail to appear for reasons unrelated to the call itself
-    (e.g. no valid spawn point nearby).]]
+    --Uses the in game function to spawn a map prize
     local pos = get_sora_pos()
     local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
     local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
@@ -782,25 +815,9 @@ local function spawn_prize(item_id)
 end
 
 local function show_custom_item_popup(text)
-    --[[Shows the map-prize pickup popup (the small text window that
-    normally names the item you got) with arbitrary custom text instead of
-    a real item name -- no spawn_prize or actual pickup needed.
-
-    Installs two kh1_native in-process hooks on first use (both idempotent):
-    one on fnc_draw_item_popup_entry that redirects the displayed text to a
-    custom buffer while a flag is set, and one on fnc_item_popup_tick (the
-    always-ticking queue consumer) that watches the popup's lifecycle state
-    and clears that flag the moment the popup actually finishes displaying
-    (not on the first frame -- the box renders across many frames, so
-    clearing any earlier would revert to the real item name mid-display).
-    Then writes `text` as the KHSCII buffer and triggers the popup via
-    fnc_show_item_message(1, 1) (item id 1 just picks which icon/graphic
-    shows; the text is what's overridden).
-
-    Self-cleaning: nothing is left "stuck" for a later, unrelated real
-    popup to pick up by accident, and no separate clear call is needed.
-
-    Returns true if the enqueue call completed without crashing.]]
+    --[[ Uses the in game function to force a map prize pickup box.
+    Injects bytes to read from injected memory for text, so we
+    can have custom text.]]
     kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
     kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
     kh1_native.set_custom_popup_text(GetKHSCII(text))
@@ -808,205 +825,39 @@ local function show_custom_item_popup(text)
 end
 
 local function play_se2(se_id, param_2)
-    --[[Plays a sound effect via kh1_native.call_function on fnc_play_se2 (see
-    SteamGlobal_1_0_0_2.lua / EGSGlobal_1_0_0_10.lua). Wraps the same native
-    call the game itself uses for EVDL opcode 0x161 (play_se2), the
-    cutscene-skip-prompt chime, and one other hardcoded call site -- all
-    confirmed live call sites pass a real SE id plus a second integer whose
-    exact meaning (priority/channel?) isn't fully understood; real call sites
-    observed use param_2=5, but param_2=0 is also confirmed fine (see below).
-
-    CAUTION: se_id is NOT a free-form integer. Live-tested 2026-07-12 --
-    calling with an arbitrary/unregistered se_id (1) crashed the game
-    outright (likely a null/garbage sound-bank lookup downstream). Known-good
-    pairs confirmed live and audible in the field: (31, 0) -- carried over
-    from an older code-cave-injection implementation in the sibling
-    KH1-LUA-LIBRARY-DEV repo (scripts/1fmASMDriver.lua +
-    play_sound_effect/assemblyPlaySE2), reproduced here through this
-    function's kh1_native.call_function path. Per that same prior work, the
-    valid se_id range for this bank is roughly decimal 1-76 with param_2=0.
-    (0x3eb0, 5) also ran the full call chain without error/crash but
-    produced no audible sound in the field -- that id is the
-    cutscene-skip-prompt chime and is likely only resident during that
-    specific context. Only pass se_id values already known to be valid,
-    real KH1 SE ids.
-
-    Returns true if the call completed without crashing.]]
+    -- Plays a sound effect using the in game function.
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
 end
 
-local function apply_status_effect_to_sora(type_index, persistent)
-    --[[Investigative/debug tool, NOT confirmed safe for normal gameplay use.
+-- ######################## --
+-- # Advanced: Text Boxes # --
+-- ######################## --
 
-    Calls fnc_apply_actor_status_effect(sora_actor_ptr, type_flags) directly
-    against Sora's own actor (GetPointer(soraPointer)) via
-    kh1_native.call_function. This is the exact native call the .bd AI
-    scripting language's verb t0 0x4b (AttachStatusEffect?) goes through --
-    confirmed by decompiling the chain in Ghidra (fnc_bd_verb_attach_status_effect
-    @ 0x1402ba410 -> fnc_apply_actor_status_effect @ 0x1402ae160 ->
-    fnc_status_effect_activate_by_type @ 0x1401e0100). type_index is looked
-    up in the ACTOR's own status-effect table (actor_ptr+0x68) - it is NOT
-    confirmed to be a universal/game-wide id, so a given type_index may mean
-    something completely different (or nothing at all) depending on which
-    actor it's applied to.
-
-    Added 2026-07-20 while investigating Sephiroth's Heartless Angel attack:
-    his ex_3000_02.bd behavior block calls this chain 11 times in a row
-    against its target with type_index 34 through 44 (raw values 2082-2092,
-    all with the persistent bit set), immediately before a MakeAttack call.
-    This function exists to test type_index values 0-51ish live against
-    Sora and observe what actually happens (HP/MP/other) - see the debug
-    overlay's "Apply Status Effect (Sora)" action.
-
-    persistent (bool, default true) sets bit 0x800 (infinite duration),
-    matching every real .bd call site surveyed so far (all had it set).
-
-    Returns true if the call completed without crashing -- NOT a confirmation
-    that the effect index is meaningful or safe. Untested type indices could
-    plausibly corrupt actor state; this is diagnostic tooling, not a stable
-    API.]]
-    local flags = type_index & 0x7FF
-    if persistent == nil or persistent then flags = flags | 0x800 end
-    local sora_actor = GetPointer(soraPointer)
-    return kh1_native.call_function(fnc_apply_actor_status_effect, sora_actor, flags)
-end
-
--- Keyed by window_id; each entry is {deadline=os.clock() value or nil,
--- open_world=byte, open_room=byte}. Always populated on a successful open
--- (regardless of duration_seconds) so update_text_boxes can auto-close on a
--- room/world transition even for boxes with no timer.
+-- Table for tracking open boxes
 local open_text_boxes = {}
 
 local function set_text_box_style(window_id, style)
-    --[[Sets the visual style of a text box window's TEMPLATE (Set_window_type,
-    EVDL opcode 5) via kh1_native.call_evdl_syscall -- no window needs to be
-    open yet, this configures what a later open_text_box() call for the same
-    window_id will look like (matching how real scripts always call
-    Set_window_type/Set_window_size/etc. before Open_window). Normally called
-    for you by open_text_box's own style parameter -- call this directly only
-    if you want to configure a window_id's template without opening it yet.
-
-    style is a raw integer 0-8 (9 total; confirmed live in-game, 2026-07-12 --
-    values outside this range read past the end of the engine's own lookup
-    table and produce undefined/glitchy rendering, confirmed by testing
-    style 9). Visual catalogue, same test text at each:
-      0 - no box at all; plain white outlined text floating over the scene
-          (subtitle-style).
-      1 - black semi-transparent box, purple/pink border, boxy corners.
-      2 - the classic peach/orange rounded box (KH1's default look).
-      3 - peach/orange, same family as 2 but a different corner/side treatment.
-      4 - peach/orange, again a different corner/side treatment from 2 and 3.
-      5 - peach/orange with jagged/spiky "comic burst" corners.
-      6 - peach/orange with beveled (angle-cut) corners.
-      7 - visually identical to 6.
-      8 - visually identical to 6/7.
-    This deliberately doesn't expose named constants since 6/7/8 don't look
-    distinguishable despite being different values -- pass the raw integer.
-    window_id defaults to 1, matching open_text_box's default.
-
-    Returns true if the syscall completed without crashing.]]
+    -- Controls the style of text box.
     window_id = window_id or 1
     return kh1_native.call_evdl_syscall(fnc_005_set_window_type, {window_id, style})
 end
 
 local function set_text_box_position(window_id, x, y)
-    --[[Sets the position of a text box window's TEMPLATE (Set_window_position,
-    EVDL opcode 3) via kh1_native.call_evdl_syscall. Normally called for you
-    by open_text_box's own x/y parameters -- call this directly only if you
-    want to configure a window_id's template without opening it yet (this
-    does NOT move an already-open window).
-
-    x/y are raw integers cast to float by the engine (not a bit-reinterpret --
-    the EVDL stack only holds int32s). Not screen pixels -- an internal
-    layout unit not yet characterized live. window_id defaults to 1.
-
-    Returns true if the syscall completed without crashing.]]
+    -- Controls text box position on screen.
     window_id = window_id or 1
     return kh1_native.call_evdl_syscall(fnc_003_set_window_position, {window_id, x, y})
 end
 
 local function set_text_box_size(window_id, width, height)
-    --[[Sets the size of a text box window's TEMPLATE (Set_window_size, EVDL
-    opcode 4) via kh1_native.call_evdl_syscall. Normally called for you by
-    open_text_box's own width/height parameters -- call this directly only
-    if you want to configure a window_id's template without opening it yet.
-
-    width/height are raw integers cast to float by the engine. Real scripts
-    were observed (grepped across the KH1-RANDOMIZER asm corpus) using small
-    values like width=10, height=2-3 -- an internal layout unit, not screen
-    pixels, not yet characterized live. window_id defaults to 1.
-
-    Returns true if the syscall completed without crashing.]]
+    -- Controls box width/height.
     window_id = window_id or 1
     return kh1_native.call_evdl_syscall(fnc_004_set_window_size, {window_id, width, height})
 end
 
 local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
-    --[[Opens a real EVDL dialogue/text window (the same kind used for NPC
-    talk prompts and chest item-get messages) showing arbitrary Lua-supplied
-    text, without needing an actual EVDL script to trigger it.
-
-    window_id selects both which of the 4 concurrent window "slots" gets used
-    and which previously-configured template (position/size/type) the box
-    inherits. Defaults to 1, which is the id most on-foot dialogue/prompt
-    windows use.
-
-    style/x/y/width/height are all optional and, if given, are applied to
-    window_id's template via set_text_box_style/set_text_box_position/
-    set_text_box_size BEFORE opening (matching how real EVDL scripts always
-    call Set_window_type/Set_window_position/Set_window_size before
-    Open_window). x and y must be given together (or not at all); same for
-    width and height -- each pair maps to a single underlying syscall that
-    can't set just one half. Omitting all of these leaves window_id's
-    template exactly as it was last configured (by a real script, or a
-    previous call here).
-
-    Calls the real fnc_0B1_open_window_no_close and fnc_001_display_message
-    EVDL syscall handlers via kh1_native.call_evdl_syscall, which builds a
-    throwaway scriptCtx and feeds them arguments the same way the real EVDL
-    interpreter would (these handlers read off a script-VM stack, not
-    registers -- see SteamGlobal_1_0_0_2.lua's fnc_0B1/001/002 comments).
-    Open_window_no_close (opcode 0xB1) is used instead of the plain
-    Open_window (opcode 0): fnc_000_open_window's own close-when-queue-empty
-    callback chain auto-closes the window the instant its one queued message
-    finishes displaying, with no wait for a real player confirm press --
-    confirmed live via Cheat Engine breakpoint tracing, the window was
-    closing within the same frame it finished typing out, regardless of
-    input. fnc_0B1_open_window_no_close's callback chain instead leaves the
-    window open (idle, ready) once its queue empties, so it stays up
-    indefinitely until close_text_box() is called.
-
-    Message id 0 is always pushed for Display_message; the real per-script
-    string table lookup that id would normally trigger is discarded because
-    two hooks (install_textbox_hook + install_textbox_anim_hook) redirect the
-    resolved text pointer to a custom KHSCII buffer instead. Two hooks are
-    needed because a freshly-opened window is never immediately "idle/ready"
-    in the same frame as fnc_0B1_open_window_no_close -- fnc_001_display_message
-    just queues the message and returns early, and the actual display happens
-    a few frames later via fnc_display_message_on_window_opened_no_close's own
-    independent lookup (confirmed live: hooking only the first site left the
-    window showing its real, unrelated leftover text every time). Both hooks
-    self-clear the moment either one actually fires, so this deliberately
-    does NOT call clear_textbox_text() itself. Message-count bookkeeping
-    still happens for real inside fnc_001_display_message.
-
-    duration_seconds is optional. There's no native engine field for
-    "auto-close this window after N seconds" on this window system (unlike
-    e.g. show_prompt's Level-Up-style boxes, which do have a real duration
-    field written straight into the box struct) -- fnc_0B1_open_window_no_close
-    leaves the box open indefinitely once shown, full stop. If given, this is
-    purely a Lua-side timer (os.clock()-based, the same pattern used
-    elsewhere in this ecosystem for connect timeouts). Regardless of
-    duration_seconds, the box also auto-closes the moment get_world()/
-    get_room() changes from what they were at open time (a room/world
-    transition almost certainly means whatever this box was about no longer
-    applies, and a stale window left open across a map load looks broken).
-    update_text_boxes() must be called every frame from your own script's
-    _OnFrame to actually drive either of these -- kh1_lua_library has no
-    persistent per-frame hook of its own. Omit duration_seconds (or pass
-    nil/0) to only auto-close on room/world transition, not on a timer.
-
-    Returns true if both syscalls completed without crashing.]]
+    --[[ Opens text box.  Normally text boxes uses a reference to
+    predefined text, so we have to inject ASM and text memory in order
+    to use custom text.]]
     window_id = window_id or 1
     if style ~= nil then
         set_text_box_style(window_id, style)
@@ -1032,46 +883,20 @@ local function open_text_box(text, window_id, duration_seconds, style, x, y, wid
 end
 
 local function close_text_box(window_id)
-    --[[Closes a text box opened via open_text_box (or a real in-game one)
-    using the same window_id. Calls the real fnc_002_close_window EVDL
-    syscall handler via kh1_native.call_evdl_syscall -- see open_text_box's
-    comment for how that works. Not required if the player is expected to
-    dismiss the box themselves; provided for programmatic control.
-
-    Cancels any pending duration_seconds/room-transition tracking for this
-    window_id, so update_text_boxes() won't also try to close it again later.
-
-    Returns true if the syscall completed without crashing.]]
+    -- Closes text box
     window_id = window_id or 1
     open_text_boxes[window_id] = nil
     kh1_native.clear_pending_text_box()
     return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
 end
 
--- Runs once, every time this module is loaded/required -- including after
--- an F1 script reload, which tears down and re-requires every Lua module
--- (losing any Lua-side state like pending_text_box_closes above) without
--- ever giving a text box opened before the reload a chance to close itself.
--- kh1_native.dll's own pending-window-id/close-RVA tracking survives the
--- reload (see its "PENDING TEXT BOX TRACKING" comment -- the DLL pins
--- itself in memory across reloads), so this recovers and closes whatever
--- open_text_box last opened instead of leaving it stranded on screen
--- forever. Deliberately calls kh1_native.close_pending_text_box() directly
--- (not close_text_box(), which needs fnc_002_close_window) -- on a fast F1
--- reload this module-load code can run before the consuming script's
--- require("VersionCheck") has re-populated that global this cycle,
--- confirmed live by an earlier version of this crashing the syscall with
--- rva=0x0; the native side already has its own copy of that RVA from when
--- the box was opened.
+--[[ If the script is refreshed, clean up any
+open boxes]]
 kh1_native.close_pending_text_box()
 
 local function update_text_boxes()
-    --[[Closes any text boxes opened via open_text_box() once their
-    duration_seconds timer elapses (if one was given) or the player has
-    changed world/room since it was opened (always checked, regardless of
-    duration_seconds). Call this every frame from your own script's
-    _OnFrame (harmless/no-op if no text boxes are currently tracked) -- see
-    open_text_box's comment for why this can't happen automatically.]]
+--[[ Handles the timing mechanism for open text
+boxes.]]
     local now = os.clock()
     local current_world = get_world()
     local current_room = get_room()
@@ -1085,35 +910,19 @@ local function update_text_boxes()
 end
 
 local function sora_koed()
+    -- Returns if Sora's current HP is 0
     return ReadByte(maxHP - 0x1) == 0
 end
 
 local function ko_sora()
-    --[[Instantly triggers the real full in-game KO sequence (death
-    animation + input lock + Game Over menu) by calling
-    fnc_trigger_ko_event_script(0xC8) via kh1_native.call_function -- see
-    SteamGlobal_1_0_0_2.lua for the full writeup. This is a normal fastcall
-    function (one integer arg, no scriptCtx), NOT an EVDL syscall handler --
-    it cold-starts EVDL event script 0xC8 (Sora's real KO script) and enters
-    actual cutscene mode, which is what naturally locks player input and
-    plays the KO animation; the script itself eventually brings up the same
-    Game Over menu as fnc_116_game_over.
-
-    Live-verified via Cheat Engine on 2026-07-20 by breakpointing the real
-    death-processing code path during an actual in-game KO and reading the
-    exact function/argument the game itself calls.
-
-    Replaces two earlier, less complete versions of this: (1) a raw
-    fnc_116_game_over syscall call, which only opened the Game Over menu and
-    left Sora still actionable underneath it, and before that (2) a manual
-    HP-zero/stateFlag/deathCheck-NOP memory hack that left a dangling,
-    never-consumed revertCode flag.]]
+    -- Triggers the in game functions to KO Sora.
     if not sora_koed() then
         kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
     end
 end
 
 local function heartless_angel_sora()
+    -- Sets Sora HP to 1 and MP to 0
     if not sora_koed() then
         local stats_page = get_stats_page(ReadLong(soraPointer))
         if stats_page ~= 0 then
@@ -1185,7 +994,6 @@ return {
     spawn_prize = spawn_prize,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
-    apply_status_effect_to_sora = apply_status_effect_to_sora,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,

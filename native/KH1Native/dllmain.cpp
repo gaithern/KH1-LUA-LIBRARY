@@ -6,8 +6,11 @@
 #include <vector>
 
 // --- DEBUG LOGGING ---
+
+// Buffer to hold the directory of the KH1Native DLL.
 static char g_dllDir[MAX_PATH] = "";
 
+// Calculates the log file path, opens it, and writes to it.
 static void LogDebug(const char* msg) {
     if (!g_dllDir[0]) return;
     char path[MAX_PATH];
@@ -22,10 +25,9 @@ static void LogDebug(const char* msg) {
 }
 
 // --- LUA FUNCTION POINTERS ---
-// Resolved against whichever already-loaded module in the host process exports
-// the Lua C API (no Lua headers needed) -- see FindLuaModule(). Same technique
-// as KH1Overlay's dllmain.cpp in the randomizer repo; duplicated here rather
-// than shared because this module is intentionally independent of it.
+
+// Predefines arguments and return types of lua module
+// functions before their addresses are found/registered
 typedef int          (__cdecl* t_lua_gettop)(void* L);
 typedef long long    (__cdecl* t_lua_tointegerx)(void* L, int idx, int* isnum);
 typedef double       (__cdecl* t_lua_tonumberx)(void* L, int idx, int* isnum);
@@ -38,6 +40,7 @@ typedef unsigned long long (__cdecl* t_lua_rawlen)(void* L, int idx);
 typedef int          (__cdecl* t_lua_rawgeti)(void* L, int idx, long long n);
 typedef void         (__cdecl* t_lua_settop)(void* L, int idx);
 
+// Define each definition's function pointer as null for now
 static t_lua_gettop       p_lua_gettop       = nullptr;
 static t_lua_tointegerx   p_lua_tointegerx   = nullptr;
 static t_lua_tonumberx    p_lua_tonumberx    = nullptr;
@@ -50,16 +53,16 @@ static t_lua_rawlen       p_lua_rawlen       = nullptr;
 static t_lua_rawgeti      p_lua_rawgeti      = nullptr;
 static t_lua_settop       p_lua_settop       = nullptr;
 
+// Structure to hold functions we want to expose
+// to lua to use.
 struct luaL_Reg { const char* name; void* func; };
 
 // --- CALL BRIDGE ---
-// Windows x64 has a single calling convention (first four integer/pointer args
-// in RCX,RDX,R8,R9, remainder on the stack, 32-byte shadow space). Casting a
-// raw address to a fixed-arity function pointer type of the right shape and
-// calling it normally produces exactly that ABI -- no inline asm needed (x64
-// MSVC doesn't support __asm anyway). Only integer/pointer args are supported;
-// float/double args go in XMM registers under this ABI and are not marshaled
-// here.
+
+// Need to define the functions as call bridges
+// to handle different argument counts that can come
+// from lua.  6 args is arbitrary, can be increased if
+// needed.
 typedef unsigned long long(__fastcall* Func0)();
 typedef unsigned long long(__fastcall* Func1)(unsigned long long);
 typedef unsigned long long(__fastcall* Func2)(unsigned long long, unsigned long long);
@@ -70,15 +73,9 @@ typedef unsigned long long(__fastcall* Func6)(unsigned long long, unsigned long 
 
 static const int MAX_CALL_ARGS = 6;
 
-// Kept separate from l_call_function so the __try block doesn't have to share
-// a stack frame with any C++ object that has a destructor (MSVC forbids that).
-//
-// __except(EXCEPTION_EXECUTE_HANDLER) turns a hardware fault (e.g. an access
-// violation from a bad address or a wrong argument) into a normal false
-// return instead of taking down the whole game process -- this is the only
-// safety net a generic "call anything" bridge can offer. It does not protect
-// against a call that "succeeds" but corrupts game state because the address,
-// argument count, or argument types were wrong for that function.
+// Handles safely calling the exe function,
+// wrapped in try/except for hardware fault
+// capturing.
 static bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount, unsigned long long& outResult) {
     __try {
         switch (argCount) {
@@ -98,21 +95,10 @@ static bool SafeCall(unsigned long long address, const unsigned long long* args,
 
 // --- LUA-CALLABLE FUNCTIONS ---
 
-// call_function(rva, arg1, arg2, ...) -> ok(boolean), result(integer) | errorMessage(string)
-//
-// `rva` is an offset from the main module's current runtime base (the same
-// convention this library's existing ReadByte/WriteByte-style addresses use),
-// not an absolute address -- this keeps call sites stable across an
-// ASLR-relocated base. Up to 6 integer/pointer arguments are supported and
-// are passed through to the target function unchanged (they are NOT treated
-// as RVAs -- e.g. an already-dereferenced pointer from ReadLong() should be
-// passed as-is).
-//
-// This executes arbitrary code in the game process. SafeCall guards against a
-// hard crash, but a wrong address/argument can still corrupt game state even
-// when the call itself doesn't fault. Prefer wrapping a specific, tested call
-// sequence in a named Lua function (see kh1_lua_library.lua) rather than
-// calling this directly from gameplay-facing code.
+// First function exposed to lua.
+// This simply takes an RVA and a list of
+// arguments (if applicable) and calls the
+// function at base + RVA with those arguments.
 extern "C" int l_call_function(void* L) {
     int nargs = p_lua_gettop(L);
     if (nargs < 1) {
@@ -150,26 +136,17 @@ extern "C" int l_call_function(void* L) {
     return 2;
 }
 
-// get_module_base() -> integer
-// The main module's current runtime base address, for scripts that need to
-// reason about/log absolute addresses rather than just supplying an RVA to
-// call_function.
+// Helper function to expose the base
+// to lua if needed.
 extern "C" int l_get_module_base(void* L) {
     p_lua_pushinteger(L, (long long)(unsigned long long)GetModuleHandleA(nullptr));
     return 1;
 }
 
-// write_floats(f1, f2, ...) -> address
-//
-// Lua has no way to take the address of a local value, but some game
-// functions expect a pointer to a small packed struct/vector (e.g. an {x,y,z}
-// position) rather than a plain integer/pointer argument. This writes up to
-// 16 Lua numbers as packed 32-bit floats into a static scratch buffer and
-// returns its address, for use as an argument to call_function.
-//
-// The buffer is a single static instance, overwritten by every call and only
-// valid until the next write_floats call -- pass the returned address into
-// call_function immediately, don't hold onto it.
+// Certain functions need to pass floats
+// (usually position data).  This function
+// converts the passed floats into a type
+// the game expects.
 static const int MAX_SCRATCH_FLOATS = 16;
 static float g_scratchFloats[MAX_SCRATCH_FLOATS];
 
@@ -184,25 +161,15 @@ extern "C" int l_write_floats(void* L) {
 }
 
 // --- EVDL SYSCALL BRIDGE ---
-// call_evdl_syscall(rva, {arg1, arg2, ...}) -> ok(boolean), result(integer) | errorMessage(string)
-//
-// Some EVDL opcode handlers (fnc_000_open_window, fnc_001_display_message,
-// fnc_002_close_window) don't use the normal x64 calling convention -- they
-// are script-VM opcode handlers that read their arguments off a scriptCtx's
-// m_scriptData.m_stack array (scriptCtx: m_stackIdx at offset 404,
-// m_scriptData/m_stack starting at offset 408) rather than registers, the
-// same way the real EVDL bytecode interpreter feeds them when a script
-// executes a SYSCALL instruction. This builds a throwaway zeroed scriptCtx,
-// writes the given integers into m_stack in push order (arg1 at m_stack[0],
-// last arg at the top / m_stackIdx), and calls the handler with a pointer to
-// it in RCX -- exactly the shape a real script's SYSCALL would set up. Only
-// the scriptCtx fields these three handlers actually read (m_stackIdx,
-// m_stack[0..N]) are touched; other fields (m_pTgtEntity, m_nextCmd) are left
-// zeroed, which is a safe default outside a couple of documented
-// room-specific position nudges in fnc_000_open_window (Halloween Town's
-// tea-cup ride) that this doesn't reproduce. Verified live via Cheat Engine
-// (chest-open text prompt) + static disassembly, 2026-07-12 -- see
-// SteamGlobal_1_0_0_2.lua's fnc_000/001/002 comments.
+
+// Certain functions aren't just calls to
+// standalone functions.  Some are specific
+// to an EVDL context, and require a scriptCtx.
+// That includes mainly a stack.  This function
+// mocks up a stack to call such functions rather
+// than messing with injecting directly into
+// the actually running scriptCtx (dangerous)
+
 static const unsigned long long MAX_SYSCALL_STACK = 32;
 static unsigned char g_scratchScriptCtx[4512] = {};
 
@@ -242,23 +209,30 @@ extern "C" int l_call_evdl_syscall(void* L) {
 }
 
 // --- POPUP TEXT HOOK ---
-// Persistent, in-process equivalent of the Cheat Engine prototype that
-// proved this works (see kh1-widget-prize-system-findings memory / project
-// history): patches fnc_draw_item_popup_entry right after it resolves the
-// real item name into RDI, redirecting RDI to g_customTextBuffer instead
-// whenever g_customTextActive is set. No Cheat Engine involved -- this DLL
-// does its own nearby-memory allocation and (unlike CE's external
-// pause_process) suspends every other thread in this process itself while
-// patching the live instruction stream, then resumes them.
+
+// Below is the custom work we have to do
+// to handle injecting custom text into 
+// the prize text pop up.
+
+// Buffer to hold custom prize text
 static unsigned char g_customTextBuffer[512] = {};
+
+// Need to set this as volatile to ensure
+// every read of that flag actually goes
+// to real memory rather than a cached/stale
+// value. The injected game code itself can
+// touch this flag, something this codes ctx
+// would have no visibility into.
 static volatile unsigned char g_customTextActive = 0;
+
+// Flag to handle whether the custom byte
+// code has been injected or not.
 static bool g_popupHookInstalled = false;
 
-// Windows only relocates a VirtualAlloc'd region to the exact address you
-// ask for (or fails) -- it never silently moves it elsewhere -- so probing
-// outward from the target in fixed steps is a standard, reliable way to land
-// a code cave within jmp/call rel32 range (matches the technique CE's own
-// "preferred address" allocation uses under the hood).
+// Function that tries to find executable
+// near the target, since jmp/call instructions
+// can only reference other addresses within
+// a certain memory range
 static void* AllocateNear(void* target, size_t size) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -279,10 +253,10 @@ static void* AllocateNear(void* target, size_t size) {
     return nullptr;
 }
 
-// Suspends every thread in this process except the caller, so patching a
-// live instruction stream can't race a torn fetch on another thread -- the
-// same principle as always pause_process()-ing before a Cheat Engine patch,
-// just done from inside the process instead of from an external debugger.
+// Pauses every thread in the process except
+// the calling one so we can hook bytes
+// without another thread executing the code
+// mid patch.
 static std::vector<HANDLE> SuspendOtherThreads() {
     std::vector<HANDLE> handles;
     DWORD selfTid = GetCurrentThreadId();
@@ -310,6 +284,8 @@ static std::vector<HANDLE> SuspendOtherThreads() {
     return handles;
 }
 
+// Opposite of above, resumes those threads
+// after the hook is installed.
 static void ResumeThreads(std::vector<HANDLE>& handles) {
     for (HANDLE h : handles) {
         ResumeThread(h);
@@ -319,53 +295,26 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
 }
 
 // --- TEXT BOX HOOK ---
-// Redirects a message-string pointer resolved from g_pEVStringDataPtr (a
-// table scoped to whichever EVDL script is currently loaded -- not globally
-// addressable arbitrary text) to an arbitrary Lua-supplied KHSCII buffer.
-//
-// Two independent hook sites feed the same window, and BOTH are needed:
-//  1. Inside fnc_001_display_message itself -- but this only actually
-//     displays anything when the window is already state==4 (idle/ready),
-//     which a window freshly opened in the same call never is; otherwise it
-//     just queues the message and returns early.
-//  2. Inside fnc_display_message_on_window_opened -- the one-shot callback
-//     that fires on whatever LATER frame the window's open animation
-//     actually finishes, which is what displays the queued message in the
-//     normal (fresh-window) case. Confirmed live via Cheat Engine breakpoint
-//     tracing after the first hook alone was found to leave real text
-//     showing every time -- fnc_001_display_message was taking its
-//     early-return path on every call, and this second callback (with its
-//     own independent g_pEVStringDataPtr resolution) was what actually ran.
-//
-// Both hook stubs self-clear g_textBoxActive the moment they actually
-// consume it (rather than requiring a separate completion hook or a
-// same-call clear_textbox_text(), which would race the deferred site #2 --
-// the display can happen several frames after open_text_box's Lua call
-// already returned). Whichever site fires first "wins"; the other then sees
-// the flag already cleared and behaves normally.
+
+// Buffer to hold our custom text
 static unsigned char g_textBoxBuffer[512] = {};
+
+// Need to set this as volatile to ensure
+// every read of that flag actually goes
+// to real memory rather than a cached/stale
+// value. The injected game code itself can
+// touch this flag, something this codes ctx
+// would have no visibility into.
 static volatile unsigned char g_textBoxActive = 0;
+
+// Flags
 static bool g_textBoxHookInstalled = false;
 static bool g_textBoxAnimHookInstalled = false;
 
-// Site #1. Original bytes at hookAddr are expected to be exactly an 8-byte
-// "mov rdx, qword ptr [r11+r10*8+disp32]" (REX.WRB 8B /r SIB disp32) -- the
-// instruction that resolves g_pEVStringDataPtr[message_id] into RDX right
-// before it's handed to the low-level "set window message" call. Verified
-// via live Cheat Engine (chest-open text prompt) + static disassembly on
-// both Steam and EGS builds -- see the plate comment on fnc_001_display_message.
-//
-// Stub layout (all in the allocated cave):
-//   <original 8 bytes, replayed verbatim -- RDX gets the real pointer>
-//   push rax
-//   mov rax, &g_textBoxActive
-//   cmp byte ptr [rax],1
-//   jne skipOverride
-//   mov byte ptr [rax],0   ; self-clear (one-shot)
-//   mov rdx, &g_textBoxBuffer
-//   skipOverride:
-//   pop rax
-//   jmp resumeAddr
+// Handles the instruction hook
+// to point to our custom text
+// for the duration of the box's
+// life.
 static bool InstallTextBoxHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
     if (g_textBoxHookInstalled) return true;
 
@@ -444,8 +393,8 @@ static bool InstallTextBoxHook(unsigned long long hookAddr, unsigned long long r
     return true;
 }
 
-// install_textbox_hook(hookRva, resumeRva) -> ok(boolean)
-// Idempotent -- safe to call every time before using set_textbox_text.
+// Lua-callable wrapper for the hook above,
+// takes the addresses as RVAs off the base.
 extern "C" int l_install_textbox_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -455,30 +404,9 @@ extern "C" int l_install_textbox_hook(void* L) {
     return 1;
 }
 
-// Site #2, inside fnc_display_message_on_window_opened. Original bytes at
-// hookAddr are expected to be exactly a 9-byte
-// "mov rdx, qword ptr [r12+rdx*8]; call fnc_leaf_display_message" window
-// (4-byte MOV + 5-byte CALL rel32) -- steals part of the following
-// instruction the same way InstallPopupTextHook does, since the MOV alone is
-// too short to host a 5-byte jmp patch. Verified via live Cheat Engine +
-// static disassembly on both Steam and EGS builds -- see the plate comment
-// on fnc_display_message_on_window_opened.
-//
-// Stub layout (all in the allocated cave):
-//   push rax
-//   mov rax, &g_textBoxActive
-//   cmp byte ptr [rax],1
-//   jne useOriginal
-//   mov byte ptr [rax],0   ; self-clear (one-shot)
-//   mov rdx, &g_textBoxBuffer
-//   pop rax
-//   jmp continueCall
-//   useOriginal:
-//   pop rax
-//   <original 4 bytes, replayed verbatim -- mov rdx,[r12+rdx*8]>
-//   continueCall:
-//   call callTargetAddr
-//   jmp resumeAddr
+// Same idea as InstallTextBoxHook, but for the
+// call site that plays the per-character text
+// box animation.
 static bool InstallTextBoxAnimHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
     if (g_textBoxAnimHookInstalled) return true;
 
@@ -572,8 +500,7 @@ static bool InstallTextBoxAnimHook(unsigned long long hookAddr, unsigned long lo
     return true;
 }
 
-// install_textbox_anim_hook(hookRva, resumeRva, callTargetRva) -> ok(boolean)
-// Idempotent -- safe to call every time before using set_textbox_text.
+// Lua-callable wrapper for the hook above.
 extern "C" int l_install_textbox_anim_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -584,14 +511,8 @@ extern "C" int l_install_textbox_anim_hook(void* L) {
     return 1;
 }
 
-// set_textbox_text(byteTable) -> (none)
-// byteTable is a Lua array of KHSCII byte values (e.g. from GetKHSCII()).
-// Takes effect on whichever of the two hook sites above actually displays
-// the next queued message first (self-clearing, one-shot) -- do NOT call
-// clear_textbox_text() right after firing the syscalls, since the real
-// display is usually deferred to a later frame (see the comment above
-// InstallTextBoxHook). Has no effect unless both install_textbox_hook() and
-// install_textbox_anim_hook() already succeeded.
+// Copies the lua string (as a byte array) into
+// our buffer and flags the text box as active.
 extern "C" int l_set_textbox_text(void* L) {
     unsigned long long len = p_lua_rawlen(L, 1);
     const unsigned long long maxLen = sizeof(g_textBoxBuffer) - 1;
@@ -606,56 +527,38 @@ extern "C" int l_set_textbox_text(void* L) {
     return 0;
 }
 
-// clear_textbox_text() -> (none)
-// Fallback/safety-net only (e.g. if the window never actually opened) --
-// normal use relies on the hooks' own self-clearing.
+// Turns off the text box override flag.
 extern "C" int l_clear_textbox_text(void* L) {
     g_textBoxActive = 0;
     return 0;
 }
 
 // --- PENDING TEXT BOX TRACKING ---
-// A script reload (F1 in the OpenKH Lua host) tears down and re-requires
-// every Lua module -- including kh1_lua_library -- but this DLL pins itself
-// in memory across that (see DllMain's LoadLibraryA self-reference below),
-// so a plain static survives the reload even though any Lua-side state
-// (e.g. a module-local table) does not. open_text_box records the window_id
-// AND the fnc_002_close_window RVA it used here; kh1_lua_library calls
-// close_pending_text_box() at module-load time (so it runs on every
-// require, including post-reload) to close it if still set.
-//
-// The close RVA is stored (not just the window_id) specifically so this
-// doesn't depend on any Lua global like fnc_002_close_window already being
-// populated -- confirmed live that it isn't: on a fast F1 reload,
-// kh1_lua_library's module-load code can run before the consuming script's
-// require("VersionCheck") has re-populated that global this cycle, and an
-// earlier version of this that looked fnc_002_close_window up fresh at
-// cleanup time crashed the syscall with rva=0x0. Storing the already-known
-// RVA from when the box was opened sidesteps that ordering entirely.
-// -1 means "none pending".
+
+// Keeps track of the most recently opened text
+// box window so we can close it on demand from
+// lua without the caller needing to track ids.
 static volatile long g_pendingTextBoxWindowId = -1;
 static volatile unsigned long long g_pendingTextBoxCloseRva = 0;
 
-// set_pending_text_box(windowId, closeRva) -> (none)
+// Records the window id and close function RVA
+// for the currently open text box.
 extern "C" int l_set_pending_text_box(void* L) {
     g_pendingTextBoxWindowId = (long)p_lua_tointegerx(L, 1, nullptr);
     g_pendingTextBoxCloseRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
     return 0;
 }
 
-// clear_pending_text_box() -> (none)
+// Clears the tracked window without closing it.
 extern "C" int l_clear_pending_text_box(void* L) {
     g_pendingTextBoxWindowId = -1;
     g_pendingTextBoxCloseRva = 0;
     return 0;
 }
 
-// close_pending_text_box() -> ok(boolean)
-// Closes whatever text box open_text_box last opened (if any), using the
-// window_id and close-syscall RVA stored at open time -- see the comment
-// above for why it doesn't just look fnc_002_close_window up fresh. Builds
-// its own throwaway scriptCtx the same way call_evdl_syscall does (a single
-// stack arg: window_id). Returns false (no-op) if nothing is pending.
+// Calls the game's close function for the
+// tracked text box, mocking up a scriptCtx
+// the same way call_evdl_syscall does.
 extern "C" int l_close_pending_text_box(void* L) {
     if (g_pendingTextBoxWindowId < 0 || g_pendingTextBoxCloseRva == 0) {
         p_lua_pushboolean(L, 0);
@@ -688,40 +591,9 @@ extern "C" int l_close_pending_text_box(void* L) {
     return 1;
 }
 
-// Builds and installs the hook stub. hookAddr/resumeAddr/callTargetAddr are
-// absolute addresses (base + RVA), resolved by the caller from the
-// version-correct SteamGlobal/EGSGlobal address tables -- this function
-// itself has no version-specific knowledge at all.
-//
-// Original bytes at hookAddr are expected to be exactly:
-//   mov rdi,rax   (3 bytes: 48 8B F8 or 48 89 C7)
-//   call rel32    (5 bytes: E8 xx xx xx xx)
-// i.e. fnc_draw_item_popup_entry stashing the resolved item-name pointer
-// into RDI right before calling fnc_queue_item_popup_text. Verified via
-// live Cheat Engine testing on both Steam and EGS builds before this was
-// written -- see native/KH1Native and the project memory for the writeup.
-//
-// Stub layout (all in the allocated cave):
-//   push rax
-//   mov rax, &g_customTextActive
-//   cmp byte ptr [rax],1
-//   jne useOriginal
-//   mov rdi, &g_customTextBuffer
-//   pop rax
-//   jmp continueCall
-//   useOriginal:
-//   pop rax
-//   mov rdi,rax
-//   continueCall:
-//   call callTargetAddr
-//   jmp resumeAddr
-//
-// Note this hook fires every frame the popup box is drawn (many frames per
-// display, ~30-70 @60fps across its hold+fade cycle) -- it must NOT clear
-// g_customTextActive itself (an earlier version did, on first fire, which
-// made the custom text revert to the real item name after a single frame).
-// The flag is cleared by InstallPopupCompletionHook below instead, which
-// detects the popup's actual finish.
+// Hooks the call that sets up the prize popup's
+// text pointer, swapping in our custom buffer
+// whenever the active flag is set.
 static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
     if (g_popupHookInstalled) return true;
 
@@ -814,8 +686,7 @@ static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long
     return true;
 }
 
-// install_popup_text_hook(hookRva, resumeRva, callTargetRva) -> ok(boolean)
-// Idempotent -- safe to call every time before using set_custom_popup_text.
+// Lua-callable wrapper for the hook above.
 extern "C" int l_install_popup_text_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -827,43 +698,21 @@ extern "C" int l_install_popup_text_hook(void* L) {
 }
 
 // --- POPUP COMPLETION HOOK ---
-// Detects when the item-popup box has actually finished displaying, so
-// g_customTextActive can be cleared at the right moment instead of guessing
-// a frame count or clearing too early. fnc_item_popup_tick is an
-// always-ticking per-frame consumer (runs every frame regardless of whether
-// a popup is visible) that drives a small lifecycle state machine at
-// g_item_popup_state: 0=idle, 1=just-dequeued, 2=holding, 3=start-fade,
-// 4=fading-out, 5=force-cancel. It transitions back to 0 exactly once, on
-// the frame right after the last visible frame -- fnc_draw_item_popup_entry
-// itself is not called at all once state hits 0, so this can't be detected
-// from inside that hook; it has to be sampled from somewhere that always
-// runs, which is why this is a second, independent, passive hook.
+
+// Below is the work needed to know when the
+// prize popup has actually finished displaying,
+// so we can clear our custom text flag once
+// its lifecycle is done.
+
+// Remembers the popup's state from the last
+// tick so we can detect the transition back
+// to 0 (closed).
 static uint32_t g_prevPopupState = 0;
 static bool g_popupCompletionHookInstalled = false;
 
-// Original bytes at fnc_item_popup_tick's entry, identical on both builds:
-//   sub rsp,0x28   (48 83 EC 28)
-//   xor edx,edx    (33 D2)
-// verified via live read_memory on both Steam and EGS before this was
-// written -- see project memory / Ghidra plate comments on fnc_item_popup_tick.
-//
-// Stub layout (all in the allocated cave):
-//   push rax / push r10 / push r11
-//   mov r10, &g_item_popup_state ; mov eax, dword ptr [r10]   (current)
-//   mov r11, &g_prevPopupState   ; mov r10d, dword ptr [r11]  (previous)
-//   cmp r10d,0
-//   je skipClear                 ; previous already idle -> no transition
-//   cmp eax,0
-//   jne skipClear                ; not finished yet
-//   mov r10, &g_customTextActive
-//   mov byte ptr [r10],0         ; transition detected: clear one-shot flag
-//   skipClear:
-//   mov r10, &g_prevPopupState
-//   mov dword ptr [r10],eax
-//   pop r11 / pop r10 / pop rax
-//   sub rsp,0x28                 ; replay original bytes
-//   xor edx,edx
-//   jmp resumeAddr
+// Hooks the popup's tick function so we can
+// watch its state and clear the custom text
+// flag once the popup closes.
 static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned long long resumeAddr, unsigned long long stateAddr) {
     if (g_popupCompletionHookInstalled) return true;
 
@@ -962,8 +811,7 @@ static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned lon
     return true;
 }
 
-// install_popup_completion_hook(tickRva, resumeRva, stateRva) -> ok(boolean)
-// Idempotent -- safe to call every time before using set_custom_popup_text.
+// Lua-callable wrapper for the hook above.
 extern "C" int l_install_popup_completion_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long tickRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -974,11 +822,8 @@ extern "C" int l_install_popup_completion_hook(void* L) {
     return 1;
 }
 
-// set_custom_popup_text(byteTable) -> (none)
-// byteTable is a Lua array of KHSCII byte values (e.g. from GetKHSCII()).
-// Takes effect on the next fnc_enqueue_item_popup-driven popup, real or
-// triggered via show_item_popup -- until clear_custom_popup_text() is
-// called. Has no effect unless install_popup_text_hook() already succeeded.
+// Copies the lua string (as a byte array) into
+// our buffer and flags the popup text as active.
 extern "C" int l_set_custom_popup_text(void* L) {
     unsigned long long len = p_lua_rawlen(L, 1);
     const unsigned long long maxLen = sizeof(g_customTextBuffer) - 1;
@@ -993,13 +838,14 @@ extern "C" int l_set_custom_popup_text(void* L) {
     return 0;
 }
 
-// clear_custom_popup_text() -> (none)
-// Reverts fnc_draw_item_popup_entry to showing real item names again.
+// Turns off the custom popup text flag.
 extern "C" int l_clear_custom_popup_text(void* L) {
     g_customTextActive = 0;
     return 0;
 }
 
+// Table of every function we expose to lua,
+// registered all at once via luaL_setfuncs.
 static const luaL_Reg kh1_native_lib[] = {
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
@@ -1019,15 +865,16 @@ static const luaL_Reg kh1_native_lib[] = {
     {nullptr, nullptr}
 };
 
-// Every Lua C API export this module needs to bridge into the host's Lua
-// state. A candidate module only counts if ALL of these resolve from it --
-// see ModuleExportsAllRequired().
+// Exports we need to find on whichever module
+// turns out to be the real lua54 module.
 static const char* const kRequiredLuaExports[] = {
     "lua_gettop", "lua_tointegerx", "lua_tonumberx", "lua_pushinteger",
     "lua_pushboolean", "lua_pushstring", "luaL_setfuncs", "lua_createtable",
     "lua_rawlen", "lua_rawgeti", "lua_settop",
 };
 
+// Checks whether a given module exports every
+// lua function we need.
 static bool ModuleExportsAllRequired(HMODULE mod) {
     if (!mod) return false;
     for (const char* name : kRequiredLuaExports) {
@@ -1036,16 +883,10 @@ static bool ModuleExportsAllRequired(HMODULE mod) {
     return true;
 }
 
-// Last-resort fallback in case the bundled lua54.dll (see FindLuaModule)
-// somehow isn't loaded: scan every module in the process, requiring ALL
-// required symbols to resolve from the SAME module before accepting it (a
-// module that only partially matches can't win just by enumerating first).
-// This can still land on lua-apclientpp.dll's embedded Lua (the Archipelago
-// Lua binding, shipped by KH1-RANDOMIZER, which statically embeds its own
-// separate copy of Lua 5.4 and -- as a side effect of its MinGW build not
-// hiding symbol visibility -- exports the exact same names) if that's the
-// only thing loaded exporting them. That's an acceptable last resort, not
-// the intended path.
+// Fallback: walks every loaded module in the
+// process looking for one that exports the
+// lua API, in case lua54.dll isn't the name
+// actually used.
 static HMODULE FindLuaModuleByProcessScan() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return nullptr;
@@ -1068,14 +909,9 @@ static HMODULE FindLuaModuleByProcessScan() {
     return found;
 }
 
-// The current LuaBackend build statically embeds Lua 5.4 as private,
-// unexported code -- confirmed live (its export table has exactly 2 entries,
-// neither of them any Lua function) -- so there is no external door into it
-// by any technique, static or dynamic. Rather than depend on whatever LuaBackend
-// build a given player happens to have, this mod bundles its own known-good
-// lua54.dll directly (see dll/lua54.dll, loaded automatically by Panacea
-// before any script runs -- see mod.yml), and looks for that specific,
-// guaranteed-present module by name.
+// Tries the expected module name first, then
+// falls back to scanning the process if that
+// fails.
 static HMODULE FindLuaModule() {
     HMODULE bundled = GetModuleHandleA("lua54.dll");
     if (ModuleExportsAllRequired(bundled)) {
@@ -1087,6 +923,9 @@ static HMODULE FindLuaModule() {
     return FindLuaModuleByProcessScan();
 }
 
+// Entry point lua calls when it requires this
+// module. Resolves the real lua function
+// pointers, then registers our functions.
 extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     LogDebug("luaopen_kh1_native called");
 
@@ -1108,10 +947,6 @@ extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     if (!p_lua_gettop || !p_lua_tointegerx || !p_lua_tonumberx || !p_lua_pushinteger || !p_lua_pushboolean ||
         !p_lua_pushstring || !p_luaL_setfuncs || !p_lua_createtable ||
         !p_lua_rawlen || !p_lua_rawgeti || !p_lua_settop) {
-        // Couldn't find a loaded module exporting the Lua C API -- bail out
-        // without touching any of them. Returning 0 (no pushed values) makes
-        // require() hand back `true` rather than crashing on a null function
-        // pointer call.
         LogDebug("luaopen_kh1_native: failed to resolve Lua API exports, aborting safely");
         return 0;
     }
@@ -1121,26 +956,15 @@ extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     return 1;
 }
 
+// Standard dll entry point. On attach, figures
+// out our own directory (for logging) and loads
+// ourselves again by full path so we stay pinned
+// in memory rather than getting unloaded.
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         GetModuleFileNameA(hModule, g_dllDir, MAX_PATH);
         char* last = strrchr(g_dllDir, '\\');
         if (last) *(last + 1) = '\0';
-
-        // Pin ourselves in memory with an extra reference we never release.
-        // LuaBackend's script-refresh feature appears to FreeLibrary() native
-        // modules it required as part of giving scripts a clean reload -- the
-        // popup hooks above install trampolines (VirtualAlloc'd code caves,
-        // outside this DLL) that read/write this DLL's own static globals
-        // (g_customTextActive, g_customTextBuffer, g_prevPopupState) every
-        // time the game calls into the hooked functions. If this DLL got
-        // unloaded while a hook is still installed, that memory becomes
-        // unmapped out from under a trampoline the game keeps calling into --
-        // an instant crash. Holding an extra reference means an external
-        // FreeLibrary() call just decrements our refcount instead of actually
-        // unloading us, so installed hooks stay valid for the rest of the
-        // game session (matches KH1Overlay's dllmain.cpp, which documents the
-        // same FreeLibrary risk for its own persistent thread).
         char selfPath[MAX_PATH];
         GetModuleFileNameA(hModule, selfPath, MAX_PATH);
         LoadLibraryA(selfPath);
