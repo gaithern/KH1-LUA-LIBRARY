@@ -913,7 +913,19 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
     a request and returns immediately; call update_spawn_enemy() every frame
     from your own script's _OnFrame (harmless/no-op if nothing is pending) to
     actually drive it, the same convention open_text_box/update_text_boxes
-    uses.]]
+    uses.
+
+    Ignored outright (never queued) if a cutscene is already playing --
+    callers that want it to happen once the cutscene ends should re-request
+    it themselves rather than have this silently wait out an unknown-length
+    cutscene.]]
+
+    if ReadInt(inCutscene) ~= 0 then
+        if callback then
+            callback(false, "spawn_enemy: ignored, player is in a cutscene")
+        end
+        return
+    end
 
     local id = next_spawn_request_id
     next_spawn_request_id = next_spawn_request_id + 1
@@ -934,8 +946,14 @@ local function update_spawn_enemy()
         local ok, result, stillLoading = spawn_enemy_attempt(req.model_path, req.motion_path, req.x, req.y, req.z)
         if stillLoading then
             if stillLoading == "cutscene" then
-                -- Blocked on a cutscene
-                req.deadline = os.clock() + 10.0
+                -- A cutscene started after this request was already queued
+                -- (spawn_enemy's own upfront check only catches one already
+                -- playing at request time) -- drop it rather than wait out
+                -- an unknown-length cutscene.
+                pending_spawn_requests[id] = nil
+                if req.callback then
+                    req.callback(false, "spawn_enemy: ignored, player entered a cutscene while this request was pending")
+                end
             elseif os.clock() >= req.deadline then
                 pending_spawn_requests[id] = nil
                 if req.callback then
