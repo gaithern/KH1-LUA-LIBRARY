@@ -192,6 +192,20 @@ static const int LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR = -0x44;
 static const int LOADED_SPECIES_MODEL_NAME_SIZE = 0x20;
 static const int SPECIES_SLOT_COUNT = 256; // species/slot index is a uint8_t (record+0x55) -- the full addressable range
 
+// Live-confirmed 2026-08-04: cold-spawning (never loaded natively this
+// session) a non-native creature in this specific room reliably crashes the
+// game inside undocumented engine skeleton/animation-blend code
+// (KH1FM.exe RVA 0x3900FC) that this DLL never calls directly -- there's no
+// call site of ours to wrap in SafeCall/SEH to catch it. Root cause not
+// found (see KH1-LUA-LIBRARY memory: project_spawn_enemy_cold_spawn_crash_
+// containment.md -- two attempted fixes both turned out ineffective on
+// closer live testing). Native creatures already loaded by the room itself
+// (e.g. Soldier here) are unaffected and never hit this check, since they
+// never take the needsLoad path below.
+static const int32_t COLD_SPAWN_CRASH_WORLD = 3;
+static const int32_t COLD_SPAWN_CRASH_AREA = 2;
+static const int32_t COLD_SPAWN_CRASH_SET = 2;
+
 // species (record+0x55) is a per-room-local slot index, not a stable
 // creature ID -- creatures are identified by model/motion filename instead.
 // Char-id/weight/template data comes from kh1_creature_data.lua, looked up
@@ -540,6 +554,24 @@ extern "C" int l_spawn_enemy(void* L) {
             return 2;
         }
         needsLoad = true;
+        // See COLD_SPAWN_CRASH_WORLD's own comment -- refuse rather than
+        // risk the crash this specific room causes for any freshly-loaded
+        // (never native to it, never loaded elsewhere this session yet)
+        // creature.
+        if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
+            int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
+            int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
+            int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
+            if (curWorld == COLD_SPAWN_CRASH_WORLD && curArea == COLD_SPAWN_CRASH_AREA &&
+                curSet == COLD_SPAWN_CRASH_SET) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "spawn_enemy: refusing cold spawn of %s -- this room (world=%d area=%d set=%d) is known to crash on freshly-loaded creatures", modelPath, curWorld, curArea, curSet);
+                LogDebug(msg);
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: this room is known to crash when spawning a creature that hasn't been loaded here before -- refusing");
+                return 2;
+            }
+        }
     } else {
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
