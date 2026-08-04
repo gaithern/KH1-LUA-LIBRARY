@@ -304,96 +304,22 @@ UK_Word = 0x2E1AC60
 fnc_spawn_prize = 0x2BFF00
 fnc_update_widget_queue = 0x2AB8E0
 
--- spawn_enemy (kh1_native.spawn_enemy target -- low-level entity constructor,
--- splices a synthetic record into the room's live placement table then calls
--- this directly -- see
--- KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md)
 fnc_spawn_world_gimmick_entity = 0x290D60
--- current room's live placement-table pointer/count (DAT_14296b630/
--- DAT_14296b628 in Ghidra)
 placementTablePtr = 0x296B630
 placementTableCount = 0x296B628
--- Room-identity globals (g_WorldNumber/g_AreaNumber/g_SetNumber in Ghidra) --
--- read (never written) by the room-load routine FUN_140287c60 as that load's
--- own configuration, and extensively cross-referenced elsewhere (113/108/56
--- xrefs) as the game's own canonical "which room am I in" state. Used by
--- spawn_enemy's InstallJobRecordGuardHook fix to detect a genuine room
--- transition, distinct from placementTablePtr itself -- which spawn_enemy's
--- own refusal paths mutate (roll back) for unrelated reasons, making it an
--- unreliable staleness signal on its own. EGS twins not yet located.
 g_WorldNumber = 0x233FE84
 g_AreaNumber = 0x233FE8C
 g_SetNumber = 0x233FE90
--- Entry points for the two in-process hooks spawn_enemy installs (once,
--- idempotently) before any fallback-template spawn -- both are load-bearing
--- fixes for real, live-confirmed crashes on this path, not optional
--- diagnostics; see l_spawn_enemy's comment and the heartless field-spawn
--- investigation memory/doc, session 19. Each is a genuine function entry
--- (kh1_native.dll computes entry+5 as the resume address itself). EGS
--- twins not yet located -- a fallback spawn refuses cleanly on a build
--- where these are unconfigured rather than proceed unprotected.
 fnc_async_load_job_callback = 0x286420
 fnc_velocity_blend_util = 0x2B5E50
--- Iterates the 96-slot live entity pool (DAT_142d372a0..DAT_142d5349f):
--- pass 0 to get the first live entity, pass the previous result to get the
--- next, 0 means done. Decompiled and confirmed pure/read-only (FUN_140291b20).
--- Used by spawn_enemy (session 20) to avoid handing out a species number
--- some live entity's own entity+0x134 handle already references -- see
--- kh1_native.dll's MarkSpeciesInUseByLiveEntities. Optional: a fallback
--- spawn still works without it (degrades to session 19's start-at-20
--- heuristic alone), just without this extra collision check. EGS twin not
--- yet located.
 fnc_iterate_live_entities = 0x291B20
--- The `call fnc_resolve_resource_handle` instruction (NOT the function's own
--- entry) inside FUN_1401d62e0, a tiny shared array-index helper. Hooked by
--- spawn_enemy (session 20) to fix a real, live-confirmed crash: an unrelated
--- per-party ability-data rebuild routine calls this helper, which then reads
--- `resolved_ptr[index*4+0x10]` with no bounds check -- confirmed live twice,
--- byte-identical fault, after our own fallback spawn's fresh species-blob
--- write happened to alias the memory a completely different subsystem's
--- cached handle pointed into. See InstallPartyAbilityIndexGuardHook's
--- comment in kh1_native.dll for the full mechanism and why hooking here (not
--- FUN_1401d62e0's entry) was necessary. EGS twin not yet located.
 fnc_party_ability_index_resolve_call = 0x1D62F2
--- Triggers an async load of a species' model/animation/AI data (FUN_140285ee0
--- in Ghidra) -- the same function real EVDL room scripts use (fnc_0B5_load_model
--- calls it identically: type_id, completion callback). Needed for spawn_enemy
--- to work on a species with zero native presence in the current room, since
--- the constructor's own self-heal only resolves a handle into already-loaded
--- data, it never triggers a load itself. EGS twin not yet located.
 fnc_load_gimmick_assets = 0x285EE0
--- Per-species "loaded resource pointer" table (DAT_142869e18 in Ghidra),
--- 0x50-byte stride per species index -- polled after fnc_load_gimmick_assets
--- to detect when the async load has actually finished, and scanned by
--- spawn_enemy to find an already-loaded or free local slot for a creature
--- with zero native presence in the room. EGS twin not yet located.
 loadedSpeciesPtrTable = 0x2869E18
--- Mints a fresh, this-session-valid handle for an arbitrary pointer
--- (FUN_14038ad90 in Ghidra) -- used to register spawn_enemy's own static
--- model/motion filename strings instead of ever reusing a captured template's
--- stale handle number for those fields. EGS twin not yet located.
 fnc_mint_resource_handle = 0x38AD90
--- Resolves an encoded resource handle (as found in a placement record's
--- model/motion filename fields) back to the real pointer/string it was
--- minted from -- counterpart to fnc_mint_resource_handle. Lets spawn_enemy
--- identify a creature already native to the room by its real filename
--- instead of a guessed species number. Confirmed live 2026-07-22 via Cheat
--- Engine against real Alleyway placement records.
 fnc_resolve_resource_handle = 0x38ADC0
--- Per-species resource-blob table (DAT_140d2ada0 in Ghidra), 0x40000/256KB
--- stride per species/slot index -- read by fnc_spawn_world_gimmick_entity's
--- kind==3 setup path (FUN_140288460 -> FUN_140287e40) and parsed as a small
--- section-offset table. Confirmed live 2026-07-22 that the fresh-load
--- fallback path never populates this table for a genuinely new slot,
--- crashing the constructor on the resulting garbage (even for Soldier,
--- whose fallback path was otherwise considered solid since session 5) --
--- see KH1-EVDL-TOOLS's investigation doc, "Session 9". l_spawn_enemy now
--- primes a freshly claimed slot's entry here from a captured copy of that
--- creature's own native entry before ever calling the constructor.
 speciesResourceTable = 0xD2ADA0
 
--- show_item_popup (kh1_native.call_function target -- enqueues the map-prize
--- pickup popup directly, independent of any actual pickup)
 fnc_show_item_message = 0x273410
 fnc_item_popup_text_hook = 0x27358C
 fnc_item_popup_text_resume = 0x273594
