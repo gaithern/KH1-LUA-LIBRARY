@@ -873,8 +873,13 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
     kh1_native.spawn_enemy. x/y/z all default to Sora's own live position
     (get_sora_pos()) when omitted -- pass explicit coordinates only if you
     want it somewhere other than on top of Sora. Can return stillLoading if
-    the asset isn't ready yet -- callers should go through spawn_enemy
-    instead of calling this directly.]]
+    the asset isn't ready yet, or if a cutscene is currently playing --
+    callers should go through spawn_enemy instead of calling this directly.]]
+
+    -- Don't spawn mid-cutscene
+    if ReadInt(inCutscene) ~= 0 then
+        return false, "in cutscene", "cutscene"
+    end
 
     if x == nil or y == nil or z == nil then
         local pos = get_sora_pos()
@@ -928,7 +933,10 @@ local function update_spawn_enemy()
     for id, req in pairs(pending_spawn_requests) do
         local ok, result, stillLoading = spawn_enemy_attempt(req.model_path, req.motion_path, req.x, req.y, req.z)
         if stillLoading then
-            if os.clock() >= req.deadline then
+            if stillLoading == "cutscene" then
+                -- Blocked on a cutscene
+                req.deadline = os.clock() + 10.0
+            elseif os.clock() >= req.deadline then
                 pending_spawn_requests[id] = nil
                 if req.callback then
                     req.callback(false, "spawn_enemy: timed out waiting for asset load")
