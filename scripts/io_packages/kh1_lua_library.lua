@@ -900,7 +900,9 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         speciesResourceTable, model_path, motion_path, x, y, z,
         g_WorldNumber, g_AreaNumber, g_SetNumber,
         fnc_async_load_job_callback, fnc_velocity_blend_util, fnc_iterate_live_entities,
-        fnc_party_ability_index_resolve_call, charId, weight, template)
+        fnc_party_ability_index_resolve_call, charId, weight, template,
+        fnc_skeleton_handle_deref_hook, fnc_skeleton_blend_call_hook,
+        fnc_keyframe_list_entry_hook)
 end
 
 -- Pending spawn_enemy requests

@@ -319,6 +319,28 @@ loadedSpeciesPtrTable = 0x2869E18
 fnc_mint_resource_handle = 0x38AD90
 fnc_resolve_resource_handle = 0x38ADC0
 speciesResourceTable = 0xD2ADA0
+-- CALL-to-fnc_resolve_resource_handle inside the engine's own skeleton/bone
+-- animation-blend code (see InstallSkeletonHandleGuardHook's comment in
+-- dllmain.cpp) -- confirmed live 2026-08-04 via two real crash repros
+-- (Darkball, Search Ghost). Steam-only for now: EGS's equivalent function
+-- wasn't found (fuzzy-match against the EGS Ghidra project came back empty)
+-- -- spawn_enemy degrades gracefully (no guard, same crash risk as before)
+-- on any build where this isn't set, so leaving it unset on EGS is safe,
+-- just unprotected.
+fnc_skeleton_handle_deref_hook = 0x3900F7
+-- Entry of the whole per-entity animation/skeleton-blend update function
+-- (see InstallSkeletonBlendCallGuardHook's comment in dllmain.cpp) --
+-- confirmed live 2026-08-04 via a THIRD crash repro (Bouncywild) at a
+-- different instruction inside the same call tree, after the hook above
+-- fixed the first one. Steam-only, same reasoning as the address above.
+fnc_skeleton_blend_call_hook = 0x391C70
+-- CALL-to-fnc_resolve_resource_handle inside the keyframe/blend-list
+-- lookup helper (see InstallKeyframeListEntryGuardHook's comment in
+-- dllmain.cpp) -- this was the FIRST crash site found this session,
+-- confirmed live TWICE (small-garbage handle, then later a literal NULL
+-- handle), in a different call tree from the two hooks above. Steam-only,
+-- same reasoning as the addresses above.
+fnc_keyframe_list_entry_hook = 0x3946BF
 
 fnc_show_item_message = 0x273410
 fnc_item_popup_text_hook = 0x27358C

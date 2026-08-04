@@ -78,7 +78,17 @@ static const int MAX_CALL_ARGS = 6;
 // Handles safely calling the exe function,
 // wrapped in try/except for hardware fault
 // capturing.
+//
+// On a caught exception, logs the real fault address/code (diagnostic only
+// -- doesn't change the false-on-exception contract). Root-causing a crash
+// inside a large, undocumented function (e.g. fnc_spawn_world_gimmick_
+// entity's ~150-field constructor) is far more tractable with the actual
+// faulting RVA than with just "it threw somewhere" -- added 2026-08-04
+// while investigating a room-specific spawn_enemy crash (see KH1-LUA-
+// LIBRARY memory: project_spawn_enemy_cold_spawn_crash_containment.md).
 static bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount, unsigned long long& outResult) {
+    DWORD exceptionCode = 0;
+    ULONG_PTR exceptionAddr = 0;
     __try {
         switch (argCount) {
         case 0: outResult = ((Func0)address)(); break;
@@ -90,7 +100,16 @@ static bool SafeCall(unsigned long long address, const unsigned long long* args,
         default: outResult = ((Func6)address)(args[0], args[1], args[2], args[3], args[4], args[5]); break;
         }
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (
+        exceptionCode = GetExceptionCode(),
+        exceptionAddr = (ULONG_PTR)((EXCEPTION_POINTERS*)GetExceptionInformation())->ExceptionRecord->ExceptionAddress,
+        EXCEPTION_EXECUTE_HANDLER) {
+        unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "SafeCall: exception 0x%08X at KH1FM.exe RVA=0x%llX (calling target RVA=0x%llX)",
+            (unsigned)exceptionCode, (unsigned long long)exceptionAddr - base, address - base);
+        LogDebug(msg);
         return false;
     }
 }
@@ -192,16 +211,20 @@ static const int LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR = -0x44;
 static const int LOADED_SPECIES_MODEL_NAME_SIZE = 0x20;
 static const int SPECIES_SLOT_COUNT = 256; // species/slot index is a uint8_t (record+0x55) -- the full addressable range
 
-// Live-confirmed 2026-08-04: cold-spawning (never loaded natively this
-// session) a non-native creature in this specific room reliably crashes the
-// game inside undocumented engine skeleton/animation-blend code
-// (KH1FM.exe RVA 0x3900FC) that this DLL never calls directly -- there's no
-// call site of ours to wrap in SafeCall/SEH to catch it. Root cause not
-// found (see KH1-LUA-LIBRARY memory: project_spawn_enemy_cold_spawn_crash_
-// containment.md -- two attempted fixes both turned out ineffective on
-// closer live testing). Native creatures already loaded by the room itself
-// (e.g. Soldier here) are unaffected and never hit this check, since they
-// never take the needsLoad path below.
+// Live-confirmed 2026-08-04: constructing any creature NOT native to this
+// specific room reliably crashes (or, since guard hooks were added, at
+// least throws deep inside the constructor/engine code) -- this affects
+// both a genuinely cold/fresh load AND reusing an already-fully-loaded
+// species from elsewhere this session (same handles, same data, still
+// crashes), so the check below is applied to every species-resolution
+// path, not just needsLoad. Multiple root-cause theories (incomplete
+// async asset load, missing resource-handle minting) were investigated
+// and ruled out or left unconfirmed -- see KH1-LUA-LIBRARY memory:
+// project_spawn_enemy_cold_spawn_crash_containment.md for the full
+// history. Native creatures already loaded by the room itself (e.g.
+// Soldier here) are unaffected -- they're found via RoomHasNativeSpecies
+// well before construction and never reach spawn_enemy's fallback path
+// at all.
 static const int32_t COLD_SPAWN_CRASH_WORLD = 3;
 static const int32_t COLD_SPAWN_CRASH_AREA = 2;
 static const int32_t COLD_SPAWN_CRASH_SET = 2;
@@ -397,6 +420,12 @@ static bool InstallJobRecordGuardHook(unsigned long long hookAddr, unsigned long
 static bool InstallVelocityBlendGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 static bool InstallPartyAbilityIndexGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
                                                 unsigned long long resolveHandleFnAddr);
+static bool InstallSkeletonHandleGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                             unsigned long long resolveHandleFnAddr);
+static bool InstallSkeletonBlendCallGuardHook(unsigned long long hookAddr);
+static bool InstallKeyframeListEntryGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                                unsigned long long notFoundAddr,
+                                                unsigned long long resolveHandleFnAddr);
 
 extern "C" int l_spawn_enemy(void* L) {
     unsigned long long spawnFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -438,6 +467,23 @@ extern "C" int l_spawn_enemy(void* L) {
     long long luaWeight = (long long)p_lua_tointegerx(L, 22, nullptr);
     size_t luaTemplateLen = 0;
     const char* luaTemplateRecord = p_lua_tolstring(L, 23, &luaTemplateLen);
+    // Entry point of the CALL-to-fnc_resolve_resource_handle instruction
+    // inside the engine's skeleton/bone animation-blend code (see
+    // InstallSkeletonHandleGuardHook's own comment). Optional and NOT
+    // required like the other three guard hooks above -- unlike those,
+    // this one guards a crash in code this DLL doesn't call at all, so
+    // there's nothing to "refuse" if it's unconfigured for this game
+    // build (e.g. not yet found for EGS) -- just proceed without it,
+    // same crash risk as before this hook existed.
+    unsigned long long skeletonHandleHookFnRva = (unsigned long long)p_lua_tointegerx(L, 24, nullptr);
+    // Entry point of the whole per-entity animation/skeleton-blend update
+    // function (see InstallSkeletonBlendCallGuardHook's own comment).
+    // Optional, same reasoning as skeletonHandleHookFnRva above.
+    unsigned long long skeletonBlendCallHookFnRva = (unsigned long long)p_lua_tointegerx(L, 25, nullptr);
+    // CALL-to-fnc_resolve_resource_handle inside the keyframe/blend-list
+    // lookup helper (see InstallKeyframeListEntryGuardHook's own comment).
+    // Optional, same reasoning as the two hook RVAs above.
+    unsigned long long keyframeListEntryHookFnRva = (unsigned long long)p_lua_tointegerx(L, 26, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -505,6 +551,25 @@ extern "C" int l_spawn_enemy(void* L) {
         p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend/party-ability-index guard hooks -- refusing rather than risk the crash they fix");
         return 2;
     }
+    // Optional fourth guard hook -- see its own comment for why this one
+    // doesn't refuse the spawn if unconfigured/failed to install, unlike
+    // the three required ones above.
+    if (skeletonHandleHookFnRva != 0 && resolveHandleFnRva != 0) {
+        if (!InstallSkeletonHandleGuardHook(base + skeletonHandleHookFnRva, base + skeletonHandleHookFnRva + 8, base + resolveHandleFnRva)) {
+            LogDebug("spawn_enemy: InstallSkeletonHandleGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (skeletonBlendCallHookFnRva != 0) {
+        if (!InstallSkeletonBlendCallGuardHook(base + skeletonBlendCallHookFnRva)) {
+            LogDebug("spawn_enemy: InstallSkeletonBlendCallGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (keyframeListEntryHookFnRva != 0 && resolveHandleFnRva != 0) {
+        if (!InstallKeyframeListEntryGuardHook(base + keyframeListEntryHookFnRva, base + keyframeListEntryHookFnRva + 13,
+                                                 base + keyframeListEntryHookFnRva + 0x2b, base + resolveHandleFnRva)) {
+            LogDebug("spawn_enemy: InstallKeyframeListEntryGuardHook failed to install -- proceeding without it");
+        }
+    }
     if (mintHandleFnRva == 0) {
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
@@ -554,28 +619,32 @@ extern "C" int l_spawn_enemy(void* L) {
             return 2;
         }
         needsLoad = true;
-        // See COLD_SPAWN_CRASH_WORLD's own comment -- refuse rather than
-        // risk the crash this specific room causes for any freshly-loaded
-        // (never native to it, never loaded elsewhere this session yet)
-        // creature.
-        if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
-            int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
-            int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
-            int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
-            if (curWorld == COLD_SPAWN_CRASH_WORLD && curArea == COLD_SPAWN_CRASH_AREA &&
-                curSet == COLD_SPAWN_CRASH_SET) {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "spawn_enemy: refusing cold spawn of %s -- this room (world=%d area=%d set=%d) is known to crash on freshly-loaded creatures", modelPath, curWorld, curArea, curSet);
-                LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: this room is known to crash when spawning a creature that hasn't been loaded here before -- refusing");
-                return 2;
-            }
-        }
     } else {
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
         return 2;
+    }
+    // See COLD_SPAWN_CRASH_WORLD's own comment -- refuse rather than risk
+    // the crash this specific room causes when constructing any creature
+    // that isn't native to it. Deliberately checked here, AFTER all three
+    // species-resolution branches above and regardless of needsLoad --
+    // live-confirmed 2026-08-04 that reusing an ALREADY fully-loaded
+    // species (needsLoad=false, via the FindLoadedSlotByFilename reuse
+    // path) can also crash the constructor in this room, so this can't be
+    // gated on needsLoad alone the way the first version of this guard was.
+    if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
+        int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
+        int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
+        int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
+        if (curWorld == COLD_SPAWN_CRASH_WORLD && curArea == COLD_SPAWN_CRASH_AREA &&
+            curSet == COLD_SPAWN_CRASH_SET) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "spawn_enemy: refusing spawn of %s -- this room (world=%d area=%d set=%d) is known to crash constructing non-native creatures", modelPath, curWorld, curArea, curSet);
+            LogDebug(msg);
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: this room is known to crash when spawning a creature that isn't native to it -- refusing");
+            return 2;
+        }
     }
     // Defense in depth: re-check the slot right before touching anything,
     // in case its state changed since the scan above.
@@ -1723,6 +1792,375 @@ static bool InstallPartyAbilityIndexGuardHook(unsigned long long hookAddr, unsig
 
     g_partyAbilityIndexGuardHookInstalled = true;
     LogDebug("InstallPartyAbilityIndexGuardHook: installed successfully");
+    return true;
+}
+
+// --- SKELETON HANDLE DEREF GUARD HOOK ---
+// Fix for a real, live-repro'd crash (confirmed 2026-08-04 via minidump
+// register/exception analysis, twice, with two different creatures --
+// Darkball and Search Ghost, both crashing at the identical instruction) in
+// the engine's own per-frame skeleton/bone animation-blend code, which this
+// DLL never calls directly -- there's no call site of ours to wrap in
+// SafeCall/SEH here. The vulnerable pattern is the same shared idiom
+// PartyAbilityIndexGuard above already fixes at a different call site:
+//   rax = *param1; rcx = *rax; ecx = *(rcx+8);
+//   rax = fnc_resolve_resource_handle(ecx);
+//   ebx = *(uint32_t*)(rax + 0x20);   // <-- the fault: no validity check
+// Both confirmed crashes read a never-minted handle (bit 31, the "real
+// handle" marker every fnc_mint_resource_handle result carries, unset --
+// i.e. raw uninitialized memory, not a stale-but-valid handle) that
+// resolves to an unmapped address. Root cause (why this specific
+// resource never gets minted for a creature loaded cold in certain rooms)
+// is still unknown -- see KH1-LUA-LIBRARY memory:
+// project_spawn_enemy_cold_spawn_crash_containment.md. This hook doesn't
+// fix that; it makes the resulting bad read safe instead of fatal, exactly
+// like the other three guard hooks in this file already do for their own
+// known-risky reads.
+// --- KEYFRAME LIST ENTRY GUARD HOOK ---
+// Fixes the very FIRST crash site found this session (2026-08-04, before
+// any of the other guard hooks below existed): a keyframe/blend-list
+// lookup helper (FUN_140394690 in Ghidra) resolves a handle and
+// immediately checks *(int32_t*)resolvedPtr against -1 (its own
+// list-terminator sentinel) to know whether to keep scanning -- if the
+// handle was never minted for this creature, the resolved pointer is
+// invalid and this read faults. Confirmed live TWICE: once early this
+// session (small-garbage handle) and once again after several of the
+// other guard hooks were already installed (this time a literal NULL
+// handle) -- this specific site is in a different call tree from the
+// SkeletonHandleGuard/SkeletonBlendCallGuard hooks below and was never
+// covered by them. See KH1-LUA-LIBRARY memory:
+// project_spawn_enemy_cold_spawn_crash_containment.md.
+static bool g_keyframeListEntryGuardHookInstalled = false;
+static volatile uint64_t g_keyframeListEntryGuardSkipCount = 0;
+
+// Returns the real dword value if readable, or -1 (the original code's own
+// "end of list" sentinel) if not -- callers already handle -1 correctly.
+static int32_t CheckKeyframeListEntrySafe(uint64_t ptr) {
+    __try {
+        return *(int32_t*)(uintptr_t)ptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "KeyframeListEntryGuard: ptr=0x%llX unreadable, treating as end-of-list sentinel (skipsSoFar=%llu)",
+            (unsigned long long)ptr, (unsigned long long)g_keyframeListEntryGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_keyframeListEntryGuardSkipCount;
+        return -1;
+    }
+}
+
+// Hooks at the CALL to fnc_resolve_resource_handle (5 bytes) through the
+// JZ that follows the original CMP (13 bytes total: call + "mov rdi,rax"
+// [rdi is read later in the real function] + "cmp dword ptr [rax],-1" +
+// jz) -- only the leading 5 bytes actually get patched (an E9 jmp), same
+// as InstallPartyAbilityIndexGuardHook's own 9-byte case -- the remaining
+// original bytes are simply jumped over, never executed, and don't need
+// to be overwritten.
+static bool InstallKeyframeListEntryGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                                unsigned long long notFoundAddr,
+                                                unsigned long long resolveHandleFnAddr) {
+    if (g_keyframeListEntryGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[13] = {
+        0xE8, 0xFC, 0x66, 0xFF, 0xFF,       // call fnc_resolve_resource_handle
+        0x48, 0x8B, 0xF8,                   // mov rdi, rax
+        0x83, 0x38, 0xFF,                   // cmp dword ptr [rax], -1
+        0x74, 0x1E                          // jz +0x1e
+    };
+    if (memcmp(hookPtr, expected, 13) != 0) {
+        LogDebug("InstallKeyframeListEntryGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallKeyframeListEntryGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[96] = {};
+    size_t off = 0;
+    uint64_t checkFnAddr = (uint64_t)(uintptr_t)&CheckKeyframeListEntrySafe;
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, resolveHandleFnAddr
+    memcpy(stub + off, &resolveHandleFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (rax <- resolved pointer, same effect as the original call)
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC7; // mov rdi, rax  (replicate "mov rdi,rax" from the original)
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC1; // mov rcx, rax  (arg1 = pointer to safety-check)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, checkFnAddr
+    memcpy(stub + off, &checkFnAddr, 8); off += 8;
+
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (eax <- safe dword or -1 sentinel)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0x83; stub[off++] = 0xF8; stub[off++] = 0xFF; // cmp eax, -1
+
+    stub[off++] = 0x0F; stub[off++] = 0x84; // jz rel32 (patched below) -> notFoundAddr
+    size_t jzOperand = off; off += 4;
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jzRel = (int32_t)((int64_t)notFoundAddr - (int64_t)(caveBase + jzOperand + 4));
+    memcpy(stub + jzOperand, &jzRel, 4);
+
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_keyframeListEntryGuardHookInstalled = true;
+    LogDebug("InstallKeyframeListEntryGuardHook: installed successfully");
+    return true;
+}
+
+static bool g_skeletonHandleGuardHookInstalled = false;
+static volatile uint64_t g_skeletonHandleGuardSkipCount = 0;
+
+// Returns the real dword value if [resolvedPtr+0x20] is readable, or 0 if
+// not -- 0 is the same "nothing here" value a genuinely empty/never-set
+// slot would already read as, so callers already handle it.
+static uint32_t CheckSkeletonHandleDerefSafe(uint64_t resolvedPtr) {
+    __try {
+        return *(uint32_t*)(uintptr_t)(resolvedPtr + 0x20);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "SkeletonHandleGuard: resolvedPtr=0x%llX+0x20 unreadable, returning 0 (skipsSoFar=%llu)",
+            (unsigned long long)resolvedPtr, (unsigned long long)g_skeletonHandleGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_skeletonHandleGuardSkipCount;
+        return 0;
+    }
+}
+
+// Hooks at the CALL to fnc_resolve_resource_handle (5 bytes) plus the
+// 3-byte "MOV EBX, dword ptr [RAX+0x20]" faulting read right after it (8
+// bytes total) -- same technique as InstallPartyAbilityIndexGuardHook: the
+// stub replicates the resolve call (absolute, since it's relocated to a
+// code cave) then feeds its result into the safety-checked read.
+static bool InstallSkeletonHandleGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                             unsigned long long resolveHandleFnAddr) {
+    if (g_skeletonHandleGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[5] = { 0xE8, 0xC4, 0xAC, 0xFF, 0xFF };
+    if (memcmp(hookPtr, expected, 5) != 0) {
+        LogDebug("InstallSkeletonHandleGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallSkeletonHandleGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[64] = {};
+    size_t off = 0;
+    uint64_t checkFnAddr = (uint64_t)(uintptr_t)&CheckSkeletonHandleDerefSafe;
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, resolveHandleFnAddr
+    memcpy(stub + off, &resolveHandleFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (rax <- resolved pointer, same effect as the original call)
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC1; // mov rcx, rax  (arg1 = resolved pointer)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, checkFnAddr
+    memcpy(stub + off, &checkFnAddr, 8); off += 8;
+
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (eax <- safe result)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0x89; stub[off++] = 0xC3; // mov ebx, eax  (replicates "MOV EBX, dword ptr [RAX+0x20]")
+
+    stub[off++] = 0xE9; // jmp rel32 -> resumeAddr (past both replaced instructions)
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_skeletonHandleGuardHookInstalled = true;
+    LogDebug("InstallSkeletonHandleGuardHook: installed successfully");
+    return true;
+}
+
+// --- SKELETON BLEND CALL GUARD HOOK ---
+// SkeletonHandleGuard above fixes ONE specific unsafe read; live testing
+// then found a SECOND, different unsafe read (an out-of-bounds array
+// index, not a bad handle) elsewhere in the same huge per-entity
+// animation/skeleton-blend update function -- confirmed via 3 separate
+// live crash repros at 2 different instructions inside its call tree
+// (Darkball, Search Ghost, Bouncywild). That function is large and dense
+// enough that patching individual unsafe reads doesn't scale -- there's
+// no way to be confident we've found the last one.
+//
+// This hooks the ENTRY of the whole per-entity update function instead
+// (called once per active entity per frame from 15+ different call
+// sites -- hooking its own entry covers all of them from one place,
+// same as how the other guard hooks in this file hook a shared callee's
+// entry rather than every caller). Every call to it now goes through a
+// __try/__except wrapper, so ANY crash anywhere in its call tree --
+// including ones not yet found -- gets caught, and that one entity's
+// animation update is skipped for that frame instead of taking the whole
+// process down.
+//
+// Structurally different from the other guard hooks above: those replace
+// 1-2 risky instructions with a safe equivalent and continue inline in
+// the SAME function. This one can't do that -- SEH protection only
+// applies within an actual compiled __try block's stack frame, so simply
+// jumping into/out of the middle of unprotected machine code doesn't
+// retroactively protect it. Instead this builds TWO trampolines:
+//   1. A "replay" cave that replays the original 5 bytes then resumes the
+//      real function body at hookAddr+5 -- this is what gets CALLED (as a
+//      real subroutine, preserving a normal return address) from inside
+//      the __try block below, so the real function's full execution
+//      (including everything it calls) happens within SEH's protection.
+//   2. A "redirect" cave that the patched entry jumps to, which long-jumps
+//      (tail-call, no extra stack frame) into the compiled C++ wrapper
+//      below -- this DLL is very likely outside +/-2GB of the game
+//      module, so a direct 5-byte rel32 jmp can't reach it.
+static bool g_skeletonBlendCallGuardHookInstalled = false;
+static volatile uint64_t g_skeletonBlendCallGuardSkipCount = 0;
+
+typedef void (*SkeletonBlendOriginalFn)(int64_t, uint64_t*, float, int64_t);
+static SkeletonBlendOriginalFn g_skeletonBlendOriginalTrampoline = nullptr;
+
+// Tail-jumped into from the redirect cave with the exact register state
+// (RCX/RDX/XMM2/R9) the real function's 15+ callers set up -- same
+// signature as the real function, so the compiler-generated prologue sees
+// a normal call-entry stack (return address already on top from whichever
+// real caller invoked us).
+static void CallSkeletonBlendSafe(int64_t param_1, uint64_t* param_2, float param_3, int64_t param_4) {
+    __try {
+        g_skeletonBlendOriginalTrampoline(param_1, param_2, param_3, param_4);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "SkeletonBlendCallGuard: exception during per-entity animation update, skipping this entity this frame (skipsSoFar=%llu)",
+            (unsigned long long)g_skeletonBlendCallGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_skeletonBlendCallGuardSkipCount;
+    }
+}
+
+static bool InstallSkeletonBlendCallGuardHook(unsigned long long hookAddr) {
+    if (g_skeletonBlendCallGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[5] = { 0x4C, 0x8B, 0xDC, 0x53, 0x56 }; // mov r11,rsp; push rbx; push rsi
+    if (memcmp(hookPtr, expected, 5) != 0) {
+        LogDebug("InstallSkeletonBlendCallGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* replayCave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!replayCave) {
+        LogDebug("InstallSkeletonBlendCallGuardHook: failed to allocate replay code cave");
+        return false;
+    }
+    {
+        unsigned char stub[16] = {};
+        size_t off = 0;
+        memcpy(stub + off, expected, 5); off += 5; // replay original 5 bytes
+        stub[off++] = 0xE9; // jmp rel32 -> hookAddr+5 (rest of the real function body)
+        size_t jmpOperand = off; off += 4;
+        size_t stubLen = off;
+        uintptr_t caveBase = (uintptr_t)replayCave;
+        int32_t jmpRel = (int32_t)((int64_t)(hookAddr + 5) - (int64_t)(caveBase + jmpOperand + 4));
+        memcpy(stub + jmpOperand, &jmpRel, 4);
+        memcpy(replayCave, stub, stubLen);
+        FlushInstructionCache(GetCurrentProcess(), replayCave, stubLen);
+    }
+    g_skeletonBlendOriginalTrampoline = (SkeletonBlendOriginalFn)(uintptr_t)replayCave;
+
+    void* redirectCave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!redirectCave) {
+        LogDebug("InstallSkeletonBlendCallGuardHook: failed to allocate redirect code cave");
+        return false;
+    }
+    {
+        unsigned char stub[16] = {};
+        size_t off = 0;
+        uint64_t wrapperAddr = (uint64_t)(uintptr_t)&CallSkeletonBlendSafe;
+        stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, wrapperAddr
+        memcpy(stub + off, &wrapperAddr, 8); off += 8;
+        stub[off++] = 0xFF; stub[off++] = 0xE0; // jmp rax
+        size_t stubLen = off;
+        memcpy(redirectCave, stub, stubLen);
+        FlushInstructionCache(GetCurrentProcess(), redirectCave, stubLen);
+    }
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)(uintptr_t)redirectCave - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+
+    ResumeThreads(threads);
+
+    g_skeletonBlendCallGuardHookInstalled = true;
+    LogDebug("InstallSkeletonBlendCallGuardHook: installed successfully");
     return true;
 }
 
