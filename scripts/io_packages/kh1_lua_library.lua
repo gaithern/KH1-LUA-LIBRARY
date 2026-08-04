@@ -26,6 +26,8 @@ local kh1_native = require("kh1_native")
 -- ########### --
 
 local function GetKHSCII(INPUT)
+    --[[Converts text to KHSCII, the game's proprietary
+    text encoding.]]
     local _charTable = {
         [' '] =  0x01,
         ['\n'] =  0x02,
@@ -138,6 +140,7 @@ local function GetKHSCII(INPUT)
 end
 
 local function byte_to_bits(byte)
+    -- Converts 1 byte to array of 8 bits
     local bits = {}
     for i = 0, 7 do
         bits[i + 1] = (byte >> i) & 1  -- LSB first
@@ -146,6 +149,7 @@ local function byte_to_bits(byte)
 end
 
 local function bits_to_byte(bits)
+    -- Converts array of 8 bits to byte
     assert(#bits == 8, "bits_to_byte expects exactly 8 bits")
     local byte = 0
     for i = 1, 8 do
@@ -155,16 +159,19 @@ local function bits_to_byte(bits)
 end
 
 local function ReadBits(address, absolute)
+    -- Returns array of bits in byte at memory address
     if absolute == nil then absolute = false end
     return byte_to_bits(ReadByte(address, absolute))
 end
 
 local function ReadBit(address, bit_num, absolute)
+    -- Reads bit from a byte at memory address
     if absolute == nil then absolute = false end
     return byte_to_bits(ReadByte(address, absolute))[bit_num]
 end
 
 local function WriteBit(address, bit_num, value, absolute)
+    -- Writes bit to a byte at memory address
     if absolute == nil then absolute = false end
     local bits = ReadBits(address, absolute)
     bits[bit_num] = (value ~= 0) and 1 or 0
@@ -172,6 +179,7 @@ local function WriteBit(address, bit_num, value, absolute)
 end
 
 local function contains(tbl, val)
+    -- Returns true if val exists in tbl
     for _, v in ipairs(tbl) do
         if v == val then
             return true
@@ -181,6 +189,7 @@ local function contains(tbl, val)
 end
 
 local function get_index(tbl, val)
+    -- Gets the idx of val in passed tbl if present
     for k, v in ipairs(tbl) do
         if v == val then
             return k
@@ -190,6 +199,7 @@ local function get_index(tbl, val)
 end
 
 local function merge_tables(t1, t2)
+    -- Merges two lua tables into one
     for _, value in ipairs(t2) do
         table.insert(t1, value)
     end
@@ -200,26 +210,32 @@ end
 -- # Getters # --
 -- ########### --
 local function get_world()
+    -- Get current world
     return ReadByte(world)
 end
 
 local function get_room()
+    -- Get current room
     return ReadByte(room)
 end
 
 local function get_gummi_select()
+    -- Get current gummi selection
     return ReadByte(gummiSelect)
 end
 
 local function get_animation_speed()
+    -- Gets Sora's current animation speed
     return ReadFloat(GetPointer(soraHUD - 0xA94) + 0x284, true)
 end
 
 local function get_current_animation()
+    -- Gets Sora's current animation
     return ReadByte(ReadLong(soraPointer)+0x164, true)
 end
 
 local function get_stats_page(entity)
+    -- Gets an entity's/actor's refrenced stat page
     if entity == 0 then
         return 0
     end
@@ -234,6 +250,7 @@ local function get_stats_page(entity)
 end
 
 local function get_ground_combo_length_limit()
+    -- Get currently set ground combo length limit
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page == 0 then
         return 0
@@ -242,6 +259,7 @@ local function get_ground_combo_length_limit()
 end
 
 local function get_air_combo_length_limit()
+    -- Get currently set air combo length limit
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page == 0 then
         return 0
@@ -250,18 +268,22 @@ local function get_air_combo_length_limit()
 end
 
 local function get_animation_time()
+    -- Get how long Sora has been in an animation
     return ReadFloat(ReadLong(soraPointer)+0x16C, true)
 end
 
 local function get_stock()
+    -- Gets full stock as an array
     return ReadArray(inventory, 255)
 end
 
 local function get_stock_at_index(index)
+    -- Gets the stock qty at item idx
     return ReadByte(inventory + index - 1)
 end
 
 local function get_sora_abilities()
+    -- Get all Sora abiltiies acquired
     local abilities = {}
     local i = 0
     while ReadByte(soraCurAbilities + i) ~= 0 and i <= 48 do
@@ -275,6 +297,7 @@ local function get_sora_abilities()
 end
 
 local function get_shared_abilities()
+    -- Get all shared abilities acquired
     local shared_abilities = {}
     local i = 0
     while ReadByte(sharedAbilities + i) ~= 0 and i <= 8 do
@@ -288,6 +311,7 @@ local function get_shared_abilities()
 end
 
 local function get_equipped_sora_abilities()
+    -- Get the currently equipped Sora abilities
     local abilities = {}
     local i = 0
     while ReadByte(soraCurAbilities + i) ~= 0 and i <= 48 do
@@ -303,6 +327,7 @@ local function get_equipped_sora_abilities()
 end
 
 local function get_equipped_shared_abilities()
+    -- Get the currently equipped shared abilities
     local shared_abilities = {}
     local i = 0
     while ReadByte(sharedAbilities + i) ~= 0 and i <= 48 do
@@ -318,18 +343,22 @@ local function get_equipped_shared_abilities()
 end
 
 local function get_soras_accessory_slots()
+    -- Get Sora's max accessory slots
     return ReadByte(maxHP + 0x16)
 end
 
 local function get_soras_equipped_accessories()
+    -- Get Sora's currently equipped accessories
     return ReadArray(maxHP + 0x17, get_soras_accessory_slots())
 end
 
 local function get_inputs()
+    -- Get current inputs on input device
     return ReadArray(inputAddress, 4)
 end
 
 local function get_spell_effectiveness(spell)
+    -- Returns Sora's current spell effectiveness
     local memory_location = nil
         if spell == "Fire"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x00)
     elseif spell == "Fira"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x70 * 0x01)
@@ -360,6 +389,7 @@ local function get_spell_effectiveness(spell)
 end
 
 local function get_current_hits()
+    -- Returns Sora's current combo hits
     return ReadByte(currentHits)
 end
 
@@ -374,6 +404,7 @@ local function get_sora_pos()
 end
 
 local function get_gummi_qty_at_index(index)
+    -- Gets Gummi item qty at a passed idx
     return ReadByte(gummiInventory + index - 1)
 end
 
@@ -381,10 +412,12 @@ end
 -- # Setters # --
 -- ########### --
 local function set_animation_speed(animation_speed)
+    -- Overwrites Sora's current animation speed
     WriteFloat(GetPointer(soraHUD - 0xA94) + 0x284, animation_speed, true)
 end
 
 local function set_ground_combo_length_limit(ground_combo_length_limit)
+    -- Overwrites Sora's current ground combo length
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page ~= 0 then
         WriteByte(stats_page + 0xD4, ground_combo_length_limit, true)
@@ -392,6 +425,7 @@ local function set_ground_combo_length_limit(ground_combo_length_limit)
 end
 
 local function set_air_combo_length_limit(air_combo_length_limit)
+    -- Overwrites Sora's current air combo length
     local stats_page = get_stats_page(ReadLong(soraPointer))
     if stats_page ~= 0 then
         WriteByte(stats_page + 0xD5, air_combo_length_limit, true)
@@ -399,14 +433,17 @@ local function set_air_combo_length_limit(air_combo_length_limit)
 end
 
 local function set_stock_at_index(index, qty)
+    -- Sets stock qty for a particular item
     WriteByte(inventory + index - 1, math.min(qty, 99))
 end
 
 local function set_sora_walk_speed(walk_speed)
+    -- Set Sora's walk speed
     WriteFloat(zantHack - 0x2862, walk_speed)
 end
 
 local function set_sora_run_speed(run_speed)
+    -- Sets Sora's run speed
     WriteFloat(zantHack - 0x285B, run_speed)
 end
 
@@ -421,9 +458,9 @@ local function set_spell_effectiveness(spell, value)
     elseif spell == "Thunder"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x06 * 0x70)
     elseif spell == "Thundara" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x07 * 0x70)
     elseif spell == "Thundaga" then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x08 * 0x70)
-    elseif spell == "Cure"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x09 * 0x70)
-    elseif spell == "Cura"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0A * 0x70)
-    elseif spell == "Curaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0B * 0x70)
+    elseif spell == "Cure"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x09 * 0x70) - 0x34
+    elseif spell == "Cura"     then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0A * 0x70) - 0x34
+    elseif spell == "Curaga"   then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0B * 0x70) - 0x34
     elseif spell == "Gravity"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0C * 0x70)
     elseif spell == "Gravira"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0D * 0x70)
     elseif spell == "Graviga"  then memory_location = jumpHeights - 0xAC + 0x5F70 + (0x0E * 0x70)
@@ -439,6 +476,13 @@ local function set_spell_effectiveness(spell, value)
 end
 
 local function set_spell_cost(spell, value)
+    --[[ Sets a spells costs.  Defines what valid costs are below.
+     15 = 1/2 CP
+     30 =   1 CP
+    100 =   1 MP
+    200 =   2 MP
+    300 =   3 MP
+    Costs outside this range behave in unexepected ways.]]
     local possible_magic_costs = {15,30,100,200,300}
     if possible_magic_costs[value] then
         local memory_location = nil
@@ -470,14 +514,17 @@ local function set_spell_cost(spell, value)
 end    
 
 local function set_attack_animation_data(index, animation_data)
+    -- Overwrites attack animation data
     WriteArray(anims + (index * 20), animation_data)
 end
 
 local function set_command_data(index, command_data)
+    -- Overwrites command data
     WriteArray(ReadLong(commandMenuPointer) + 16 * (index - 1), command_data, true)
 end
 
 local function set_gummi_qty_at_index(index, qty)
+    -- Writes to Gummi Inventory
     WriteByte(gummiInventory + index - 1, math.min(qty, 99))
 end
 
@@ -550,6 +597,7 @@ local function enable_ability(ability)
 end    
 
 local function force_scan(on)
+-- Credits to KSX, ASM target that forces scan on
     if on then
         WriteArray(zantHack - 0x227C, {0x90,0x90,0x90,0x90,0x90,0x90})
     else
@@ -558,6 +606,7 @@ local function force_scan(on)
 end
 
 local function force_combo_master(on)
+-- Credits to KSX, ASM target that forces combo master on
     if on then
         WriteByte(zantHack + 0x6FB, 0x71)
         WriteByte(zantHack + 0x6FB + 0x18, 0x82)
@@ -568,6 +617,8 @@ local function force_combo_master(on)
 end
 
 local function allow_summon_anywhere(on)
+    --[[ Credits to KSX, ASM target that allows summons 
+    to be used outside of combat.]]
     if on then
         WriteByte(summonanywhere1, 0x72)
         WriteByte(summonanywhere2, 0x72)
@@ -580,6 +631,7 @@ local function allow_summon_anywhere(on)
 end
 
 local function allow_midair_dodge_roll_guard(on)
+    -- Credits to KSX, ASM target that allows dodging/blocking in mid air.
     if on then
         WriteByte(zantHack + 0xC08, 0x82)
     else
@@ -588,6 +640,8 @@ local function allow_midair_dodge_roll_guard(on)
 end
 
 local function allow_air_items(on)
+    --[[ Credits to KSX, ASM target that allows using items in mid air.
+    Currently messes with spells in mid air too.]]
     if on then
         WriteByte(airitems1, 0x73)
         WriteByte(airitems2, 0x73)
@@ -598,12 +652,15 @@ local function allow_air_items(on)
 end
 
 local function multiply_summon_time(mult)
+    -- Credits to KSX, multiplies the summon time factor.
     local vanilla_value = 3000
     local new_value = math.floor(vanilla_value * mult)
     WriteInt(summonTime, new_value)
 end
 
 local function partyActorRVA(z)
+    --[[ Helper function for getting RVA values for Sora, Donald,
+    or Goofy entity/actor pointers]]
     if z == 1 then return soraPointer end
     if z == 2 then return donaldPointer end
     return goofyPointer
@@ -612,6 +669,8 @@ end
 local promptBodyRingPos = {0, 0, 0}
 
 local function ClampKHSCII(khscii, maxBytes)
+    --[[ Helper function which clamps KHSCII data to not be too long
+    for level up prompts]]
     if #khscii <= maxBytes then
         return khscii
     end
@@ -624,6 +683,10 @@ local function ClampKHSCII(khscii, maxBytes)
 end
 
 local function show_prompt(input_title, input_party, duration, colour)
+    --[[ Credits to Topaz.  Show custom text in the level up box.
+    This has been slightly rewritten to use actual exe functions
+    in order to use the in game box queue, to have more prompts
+    on screen than 1.]]
     if colour == nil then
         colour = 0
     end
@@ -722,10 +785,13 @@ local function is_pressed(button_array, only)
 end
 
 local function is_in_gummi_garage()
+    --[[ Need to fix, actually returns if in Gummi ship,
+    not just Gummi garage]]
     return ReadInt(inGummi) > 0
 end
 
 local function grant_shared_ability(shared_ability_value)
+    -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
     if current_shared_abilities_qty < 8 then
         WriteByte(sharedAbilities + current_shared_abilities_qty, shared_ability_value + 128)
@@ -733,6 +799,7 @@ local function grant_shared_ability(shared_ability_value)
 end
 
 local function grant_sora_ability(ability_value)
+    -- Grants Sora an ability
     local current_sora_abilities_qty = #get_sora_abilities()
     if current_sora_abilities_qty < 48 then
         WriteByte(soraCurAbilities + current_sora_abilities_qty, ability_value + 128)
@@ -740,6 +807,7 @@ local function grant_sora_ability(ability_value)
 end
 
 local function spawn_prize(item_id)
+    --Uses the in game function to spawn a map prize
     local pos = get_sora_pos()
     local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
     local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
@@ -747,6 +815,9 @@ local function spawn_prize(item_id)
 end
 
 local function show_custom_item_popup(text)
+    --[[ Uses the in game function to force a map prize pickup box.
+    Injects bytes to read from injected memory for text, so we
+    can have custom text.]]
     kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
     kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
     kh1_native.set_custom_popup_text(GetKHSCII(text))
@@ -754,34 +825,39 @@ local function show_custom_item_popup(text)
 end
 
 local function play_se2(se_id, param_2)
+    -- Plays a sound effect using the in game function.
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
 end
 
-local function apply_status_effect_to_sora(type_index, persistent)
-    local flags = type_index & 0x7FF
-    if persistent == nil or persistent then flags = flags | 0x800 end
-    local sora_actor = GetPointer(soraPointer)
-    return kh1_native.call_function(fnc_apply_actor_status_effect, sora_actor, flags)
-end
+-- ######################## --
+-- # Advanced: Text Boxes # --
+-- ######################## --
 
+-- Table for tracking open boxes
 local open_text_boxes = {}
 
 local function set_text_box_style(window_id, style)
+    -- Controls the style of text box.
     window_id = window_id or 1
     return kh1_native.call_evdl_syscall(fnc_005_set_window_type, {window_id, style})
 end
 
 local function set_text_box_position(window_id, x, y)
+    -- Controls text box position on screen.
     window_id = window_id or 1
     return kh1_native.call_evdl_syscall(fnc_003_set_window_position, {window_id, x, y})
 end
 
 local function set_text_box_size(window_id, width, height)
+    -- Controls box width/height.
     window_id = window_id or 1
     return kh1_native.call_evdl_syscall(fnc_004_set_window_size, {window_id, width, height})
 end
 
 local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
+    --[[ Opens text box.  Normally text boxes uses a reference to
+    predefined text, so we have to inject ASM and text memory in order
+    to use custom text.]]
     window_id = window_id or 1
     if style ~= nil then
         set_text_box_style(window_id, style)
@@ -807,15 +883,20 @@ local function open_text_box(text, window_id, duration_seconds, style, x, y, wid
 end
 
 local function close_text_box(window_id)
+    -- Closes text box
     window_id = window_id or 1
     open_text_boxes[window_id] = nil
     kh1_native.clear_pending_text_box()
     return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
 end
 
+--[[ If the script is refreshed, clean up any
+open boxes]]
 kh1_native.close_pending_text_box()
 
 local function update_text_boxes()
+--[[ Handles the timing mechanism for open text
+boxes.]]
     local now = os.clock()
     local current_world = get_world()
     local current_room = get_room()
@@ -829,16 +910,19 @@ local function update_text_boxes()
 end
 
 local function sora_koed()
+    -- Returns if Sora's current HP is 0
     return ReadByte(maxHP - 0x1) == 0
 end
 
 local function ko_sora()
+    -- Triggers the in game functions to KO Sora.
     if not sora_koed() then
         kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
     end
 end
 
 local function heartless_angel_sora()
+    -- Sets Sora HP to 1 and MP to 0
     if not sora_koed() then
         local stats_page = get_stats_page(ReadLong(soraPointer))
         if stats_page ~= 0 then
@@ -910,7 +994,6 @@ return {
     spawn_prize = spawn_prize,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
-    apply_status_effect_to_sora = apply_status_effect_to_sora,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,

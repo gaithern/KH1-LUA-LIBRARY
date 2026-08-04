@@ -6,8 +6,11 @@
 #include <vector>
 
 // --- DEBUG LOGGING ---
+
+// Buffer to hold the directory of the KH1Native DLL.
 static char g_dllDir[MAX_PATH] = "";
 
+// Calculates the log file path, opens it, and writes to it.
 static void LogDebug(const char* msg) {
     if (!g_dllDir[0]) return;
     char path[MAX_PATH];
@@ -22,6 +25,9 @@ static void LogDebug(const char* msg) {
 }
 
 // --- LUA FUNCTION POINTERS ---
+
+// Predefines arguments and return types of lua module
+// functions before their addresses are found/registered
 typedef int          (__cdecl* t_lua_gettop)(void* L);
 typedef long long    (__cdecl* t_lua_tointegerx)(void* L, int idx, int* isnum);
 typedef double       (__cdecl* t_lua_tonumberx)(void* L, int idx, int* isnum);
@@ -34,6 +40,7 @@ typedef unsigned long long (__cdecl* t_lua_rawlen)(void* L, int idx);
 typedef int          (__cdecl* t_lua_rawgeti)(void* L, int idx, long long n);
 typedef void         (__cdecl* t_lua_settop)(void* L, int idx);
 
+// Define each definition's function pointer as null for now
 static t_lua_gettop       p_lua_gettop       = nullptr;
 static t_lua_tointegerx   p_lua_tointegerx   = nullptr;
 static t_lua_tonumberx    p_lua_tonumberx    = nullptr;
@@ -46,9 +53,16 @@ static t_lua_rawlen       p_lua_rawlen       = nullptr;
 static t_lua_rawgeti      p_lua_rawgeti      = nullptr;
 static t_lua_settop       p_lua_settop       = nullptr;
 
+// Structure to hold functions we want to expose
+// to lua to use.
 struct luaL_Reg { const char* name; void* func; };
 
 // --- CALL BRIDGE ---
+
+// Need to define the functions as call bridges
+// to handle different argument counts that can come
+// from lua.  6 args is arbitrary, can be increased if
+// needed.
 typedef unsigned long long(__fastcall* Func0)();
 typedef unsigned long long(__fastcall* Func1)(unsigned long long);
 typedef unsigned long long(__fastcall* Func2)(unsigned long long, unsigned long long);
@@ -59,6 +73,9 @@ typedef unsigned long long(__fastcall* Func6)(unsigned long long, unsigned long 
 
 static const int MAX_CALL_ARGS = 6;
 
+// Handles safely calling the exe function,
+// wrapped in try/except for hardware fault
+// capturing.
 static bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount, unsigned long long& outResult) {
     __try {
         switch (argCount) {
@@ -77,6 +94,11 @@ static bool SafeCall(unsigned long long address, const unsigned long long* args,
 }
 
 // --- LUA-CALLABLE FUNCTIONS ---
+
+// First function exposed to lua.
+// This simply takes an RVA and a list of
+// arguments (if applicable) and calls the
+// function at base + RVA with those arguments.
 extern "C" int l_call_function(void* L) {
     int nargs = p_lua_gettop(L);
     if (nargs < 1) {
@@ -114,11 +136,17 @@ extern "C" int l_call_function(void* L) {
     return 2;
 }
 
+// Helper function to expose the base
+// to lua if needed.
 extern "C" int l_get_module_base(void* L) {
     p_lua_pushinteger(L, (long long)(unsigned long long)GetModuleHandleA(nullptr));
     return 1;
 }
 
+// Certain functions need to pass floats
+// (usually position data).  This function
+// converts the passed floats into a type
+// the game expects.
 static const int MAX_SCRATCH_FLOATS = 16;
 static float g_scratchFloats[MAX_SCRATCH_FLOATS];
 
@@ -133,6 +161,15 @@ extern "C" int l_write_floats(void* L) {
 }
 
 // --- EVDL SYSCALL BRIDGE ---
+
+// Certain functions aren't just calls to
+// standalone functions.  Some are specific
+// to an EVDL context, and require a scriptCtx.
+// That includes mainly a stack.  This function
+// mocks up a stack to call such functions rather
+// than messing with injecting directly into
+// the actually running scriptCtx (dangerous)
+
 static const unsigned long long MAX_SYSCALL_STACK = 32;
 static unsigned char g_scratchScriptCtx[4512] = {};
 
@@ -172,10 +209,30 @@ extern "C" int l_call_evdl_syscall(void* L) {
 }
 
 // --- POPUP TEXT HOOK ---
+
+// Below is the custom work we have to do
+// to handle injecting custom text into 
+// the prize text pop up.
+
+// Buffer to hold custom prize text
 static unsigned char g_customTextBuffer[512] = {};
+
+// Need to set this as volatile to ensure
+// every read of that flag actually goes
+// to real memory rather than a cached/stale
+// value. The injected game code itself can
+// touch this flag, something this codes ctx
+// would have no visibility into.
 static volatile unsigned char g_customTextActive = 0;
+
+// Flag to handle whether the custom byte
+// code has been injected or not.
 static bool g_popupHookInstalled = false;
 
+// Function that tries to find executable
+// near the target, since jmp/call instructions
+// can only reference other addresses within
+// a certain memory range
 static void* AllocateNear(void* target, size_t size) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -196,6 +253,10 @@ static void* AllocateNear(void* target, size_t size) {
     return nullptr;
 }
 
+// Pauses every thread in the process except
+// the calling one so we can hook bytes
+// without another thread executing the code
+// mid patch.
 static std::vector<HANDLE> SuspendOtherThreads() {
     std::vector<HANDLE> handles;
     DWORD selfTid = GetCurrentThreadId();
@@ -223,6 +284,8 @@ static std::vector<HANDLE> SuspendOtherThreads() {
     return handles;
 }
 
+// Opposite of above, resumes those threads
+// after the hook is installed.
 static void ResumeThreads(std::vector<HANDLE>& handles) {
     for (HANDLE h : handles) {
         ResumeThread(h);
@@ -232,11 +295,26 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
 }
 
 // --- TEXT BOX HOOK ---
+
+// Buffer to hold our custom text
 static unsigned char g_textBoxBuffer[512] = {};
+
+// Need to set this as volatile to ensure
+// every read of that flag actually goes
+// to real memory rather than a cached/stale
+// value. The injected game code itself can
+// touch this flag, something this codes ctx
+// would have no visibility into.
 static volatile unsigned char g_textBoxActive = 0;
+
+// Flags
 static bool g_textBoxHookInstalled = false;
 static bool g_textBoxAnimHookInstalled = false;
 
+// Handles the instruction hook
+// to point to our custom text
+// for the duration of the box's
+// life.
 static bool InstallTextBoxHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
     if (g_textBoxHookInstalled) return true;
 
@@ -315,6 +393,8 @@ static bool InstallTextBoxHook(unsigned long long hookAddr, unsigned long long r
     return true;
 }
 
+// Lua-callable wrapper for the hook above,
+// takes the addresses as RVAs off the base.
 extern "C" int l_install_textbox_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -324,6 +404,9 @@ extern "C" int l_install_textbox_hook(void* L) {
     return 1;
 }
 
+// Same idea as InstallTextBoxHook, but for the
+// call site that plays the per-character text
+// box animation.
 static bool InstallTextBoxAnimHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
     if (g_textBoxAnimHookInstalled) return true;
 
@@ -417,6 +500,7 @@ static bool InstallTextBoxAnimHook(unsigned long long hookAddr, unsigned long lo
     return true;
 }
 
+// Lua-callable wrapper for the hook above.
 extern "C" int l_install_textbox_anim_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -427,6 +511,8 @@ extern "C" int l_install_textbox_anim_hook(void* L) {
     return 1;
 }
 
+// Copies the lua string (as a byte array) into
+// our buffer and flags the text box as active.
 extern "C" int l_set_textbox_text(void* L) {
     unsigned long long len = p_lua_rawlen(L, 1);
     const unsigned long long maxLen = sizeof(g_textBoxBuffer) - 1;
@@ -441,27 +527,38 @@ extern "C" int l_set_textbox_text(void* L) {
     return 0;
 }
 
+// Turns off the text box override flag.
 extern "C" int l_clear_textbox_text(void* L) {
     g_textBoxActive = 0;
     return 0;
 }
 
 // --- PENDING TEXT BOX TRACKING ---
+
+// Keeps track of the most recently opened text
+// box window so we can close it on demand from
+// lua without the caller needing to track ids.
 static volatile long g_pendingTextBoxWindowId = -1;
 static volatile unsigned long long g_pendingTextBoxCloseRva = 0;
 
+// Records the window id and close function RVA
+// for the currently open text box.
 extern "C" int l_set_pending_text_box(void* L) {
     g_pendingTextBoxWindowId = (long)p_lua_tointegerx(L, 1, nullptr);
     g_pendingTextBoxCloseRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
     return 0;
 }
 
+// Clears the tracked window without closing it.
 extern "C" int l_clear_pending_text_box(void* L) {
     g_pendingTextBoxWindowId = -1;
     g_pendingTextBoxCloseRva = 0;
     return 0;
 }
 
+// Calls the game's close function for the
+// tracked text box, mocking up a scriptCtx
+// the same way call_evdl_syscall does.
 extern "C" int l_close_pending_text_box(void* L) {
     if (g_pendingTextBoxWindowId < 0 || g_pendingTextBoxCloseRva == 0) {
         p_lua_pushboolean(L, 0);
@@ -494,6 +591,9 @@ extern "C" int l_close_pending_text_box(void* L) {
     return 1;
 }
 
+// Hooks the call that sets up the prize popup's
+// text pointer, swapping in our custom buffer
+// whenever the active flag is set.
 static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
     if (g_popupHookInstalled) return true;
 
@@ -586,6 +686,7 @@ static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long
     return true;
 }
 
+// Lua-callable wrapper for the hook above.
 extern "C" int l_install_popup_text_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -597,9 +698,21 @@ extern "C" int l_install_popup_text_hook(void* L) {
 }
 
 // --- POPUP COMPLETION HOOK ---
+
+// Below is the work needed to know when the
+// prize popup has actually finished displaying,
+// so we can clear our custom text flag once
+// its lifecycle is done.
+
+// Remembers the popup's state from the last
+// tick so we can detect the transition back
+// to 0 (closed).
 static uint32_t g_prevPopupState = 0;
 static bool g_popupCompletionHookInstalled = false;
 
+// Hooks the popup's tick function so we can
+// watch its state and clear the custom text
+// flag once the popup closes.
 static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned long long resumeAddr, unsigned long long stateAddr) {
     if (g_popupCompletionHookInstalled) return true;
 
@@ -698,6 +811,7 @@ static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned lon
     return true;
 }
 
+// Lua-callable wrapper for the hook above.
 extern "C" int l_install_popup_completion_hook(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
     unsigned long long tickRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -708,6 +822,8 @@ extern "C" int l_install_popup_completion_hook(void* L) {
     return 1;
 }
 
+// Copies the lua string (as a byte array) into
+// our buffer and flags the popup text as active.
 extern "C" int l_set_custom_popup_text(void* L) {
     unsigned long long len = p_lua_rawlen(L, 1);
     const unsigned long long maxLen = sizeof(g_customTextBuffer) - 1;
@@ -722,11 +838,14 @@ extern "C" int l_set_custom_popup_text(void* L) {
     return 0;
 }
 
+// Turns off the custom popup text flag.
 extern "C" int l_clear_custom_popup_text(void* L) {
     g_customTextActive = 0;
     return 0;
 }
 
+// Table of every function we expose to lua,
+// registered all at once via luaL_setfuncs.
 static const luaL_Reg kh1_native_lib[] = {
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
@@ -746,12 +865,16 @@ static const luaL_Reg kh1_native_lib[] = {
     {nullptr, nullptr}
 };
 
+// Exports we need to find on whichever module
+// turns out to be the real lua54 module.
 static const char* const kRequiredLuaExports[] = {
     "lua_gettop", "lua_tointegerx", "lua_tonumberx", "lua_pushinteger",
     "lua_pushboolean", "lua_pushstring", "luaL_setfuncs", "lua_createtable",
     "lua_rawlen", "lua_rawgeti", "lua_settop",
 };
 
+// Checks whether a given module exports every
+// lua function we need.
 static bool ModuleExportsAllRequired(HMODULE mod) {
     if (!mod) return false;
     for (const char* name : kRequiredLuaExports) {
@@ -760,6 +883,10 @@ static bool ModuleExportsAllRequired(HMODULE mod) {
     return true;
 }
 
+// Fallback: walks every loaded module in the
+// process looking for one that exports the
+// lua API, in case lua54.dll isn't the name
+// actually used.
 static HMODULE FindLuaModuleByProcessScan() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return nullptr;
@@ -782,6 +909,9 @@ static HMODULE FindLuaModuleByProcessScan() {
     return found;
 }
 
+// Tries the expected module name first, then
+// falls back to scanning the process if that
+// fails.
 static HMODULE FindLuaModule() {
     HMODULE bundled = GetModuleHandleA("lua54.dll");
     if (ModuleExportsAllRequired(bundled)) {
@@ -793,6 +923,9 @@ static HMODULE FindLuaModule() {
     return FindLuaModuleByProcessScan();
 }
 
+// Entry point lua calls when it requires this
+// module. Resolves the real lua function
+// pointers, then registers our functions.
 extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     LogDebug("luaopen_kh1_native called");
 
@@ -823,6 +956,10 @@ extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     return 1;
 }
 
+// Standard dll entry point. On attach, figures
+// out our own directory (for logging) and loads
+// ourselves again by full path so we stay pinned
+// in memory rather than getting unloaded.
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         GetModuleFileNameA(hModule, g_dllDir, MAX_PATH);
