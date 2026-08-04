@@ -867,11 +867,14 @@ end
 -- # Advanced: Enemy Spawns # --
 -- ########################## --
 
-local function spawn_enemy(model_path, motion_path, x, y, z)
-    --[[Spawns a Heartless (or other placement-table-driven entity) at an
-    arbitrary world position via kh1_native.spawn_enemy. x/y/z all default to
-    Sora's own live position (get_sora_pos()) when omitted -- pass explicit
-    coordinates only if you want it somewhere other than on top of Sora.]]
+local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
+    --[[Single-attempt primitive behind spawn_enemy. Spawns a Heartless (or
+    other placement-table-driven entity) at an arbitrary world position via
+    kh1_native.spawn_enemy. x/y/z all default to Sora's own live position
+    (get_sora_pos()) when omitted -- pass explicit coordinates only if you
+    want it somewhere other than on top of Sora. Can return stillLoading if
+    the asset isn't ready yet -- callers should go through spawn_enemy
+    instead of calling this directly.]]
 
     if x == nil or y == nil or z == nil then
         local pos = get_sora_pos()
@@ -895,16 +898,17 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
         fnc_party_ability_index_resolve_call, charId, weight, template)
 end
 
--- Pending spawn_enemy_async requests
+-- Pending spawn_enemy requests
 local pending_spawn_requests = {}
 local next_spawn_request_id = 1
 
-local function spawn_enemy_async(model_path, motion_path, x, y, z, callback)
-    --[[Non-blocking version of spawn_enemy, for the fallback-spawn case
-    where the asset load hasn't finished yet. Queues a request and returns
-    immediately; call update_spawn_enemy_async() every frame from your own
-    script's _OnFrame (harmless/no-op if nothing is pending) to actually
-    drive it, the same convention open_text_box/update_text_boxes uses.]]
+local function spawn_enemy(model_path, motion_path, x, y, z, callback)
+    --[[Spawns a Heartless (or other placement-table-driven entity), handling
+    the fallback-spawn case where the asset load hasn't finished yet. Queues
+    a request and returns immediately; call update_spawn_enemy() every frame
+    from your own script's _OnFrame (harmless/no-op if nothing is pending) to
+    actually drive it, the same convention open_text_box/update_text_boxes
+    uses.]]
 
     local id = next_spawn_request_id
     next_spawn_request_id = next_spawn_request_id + 1
@@ -917,17 +921,17 @@ local function spawn_enemy_async(model_path, motion_path, x, y, z, callback)
     }
 end
 
-local function update_spawn_enemy_async()
-    --[[Drives every pending spawn_enemy_async request one step forward.
-    Call this every frame from your own script's _OnFrame -- see
-    spawn_enemy_async's comment for why this can't happen automatically.]]
+local function update_spawn_enemy()
+    --[[Drives every pending spawn_enemy request one step forward. Call this
+    every frame from your own script's _OnFrame -- see spawn_enemy's comment
+    for why this can't happen automatically.]]
     for id, req in pairs(pending_spawn_requests) do
-        local ok, result, stillLoading = spawn_enemy(req.model_path, req.motion_path, req.x, req.y, req.z)
+        local ok, result, stillLoading = spawn_enemy_attempt(req.model_path, req.motion_path, req.x, req.y, req.z)
         if stillLoading then
             if os.clock() >= req.deadline then
                 pending_spawn_requests[id] = nil
                 if req.callback then
-                    req.callback(false, "spawn_enemy_async: timed out waiting for asset load")
+                    req.callback(false, "spawn_enemy: timed out waiting for asset load")
                 end
             end
             -- else: still within budget, leave it queued for next frame.
@@ -1079,8 +1083,7 @@ return {
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = spawn_enemy,
-    spawn_enemy_async = spawn_enemy_async,
-    update_spawn_enemy_async = update_spawn_enemy_async,
+    update_spawn_enemy = update_spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     open_text_box = open_text_box,
