@@ -823,106 +823,63 @@ local function spawn_prize(item_id)
     return spawned
 end
 
+local function show_custom_item_popup(text)
+    --[[ Uses the in game function to force a map prize pickup box.
+    Injects bytes to read from injected memory for text, so we
+    can have custom text.]]
+    kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
+    kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
+    kh1_native.set_custom_popup_text(GetKHSCII(text))
+    return kh1_native.call_function(fnc_show_item_message, 1, 1)
+end
+
+local function play_se2(se_id, param_2)
+    -- Plays a sound effect using the in game function.
+    return kh1_native.call_function(fnc_play_se2, se_id, param_2)
+end
+
+local function sora_koed()
+    -- Returns if Sora's current HP is 0
+    return ReadByte(maxHP - 0x1) == 0
+end
+
+local function ko_sora()
+    -- Triggers the in game functions to KO Sora.
+    if not sora_koed() then
+        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
+    end
+end
+
+local function heartless_angel_sora()
+    -- Sets Sora HP to 1 and MP to 0
+    if not sora_koed() then
+        local stats_page = get_stats_page(ReadLong(soraPointer))
+        if stats_page ~= 0 then
+            WriteByte(stats_page + 0x3C, 1, true)
+            WriteByte(stats_page + 0x44, 0, true)
+        end
+        WriteByte(maxHP - 0x1, 1)
+        WriteByte(maxHP - 0x1 + 2, 0)
+    end
+end
+
+-- ########################## --
+-- # Advanced: Enemy Spawns # --
+-- ########################## --
+
 local function spawn_enemy(model_path, motion_path, x, y, z)
     --[[Spawns a Heartless (or other placement-table-driven entity) at an
     arbitrary world position via kh1_native.spawn_enemy. x/y/z all default to
     Sora's own live position (get_sora_pos()) when omitted -- pass explicit
-    coordinates only if you want it somewhere other than on top of Sora.
+    coordinates only if you want it somewhere other than on top of Sora.]]
 
-    `model_path`/`motion_path` identify the creature by its real, stable
-    filename pair (e.g. "xa_ex_2010.mdls"/"xa_ex_2010.mset" for Soldier) --
-    NOT by a species/slot number. That numeric species byte was proven this
-    investigation to be a per-room-LOCAL index with no fixed meaning across
-    rooms (the same number is a different creature in a different room, e.g.
-    species=30 is a Shadow in Traverse Town 2nd District but something else
-    entirely in Alleyway) -- see
-    KH1-EVDL-TOOLS/docs/enemy_ai/heartless_field_spawn_investigation.md,
-    sessions 5-6, for the full history. l_spawn_enemy figures out which local
-    slot number (if any) already holds this creature, or claims a free one,
-    entirely on its own -- callers never see or choose a species number.
-
-    Unlike spawn_prize (which wraps a purpose-built fnc_spawn_prize taking an
-    explicit position pointer), Heartless have no such convenience wrapper --
-    this calls the lower-level fnc_spawn_world_gimmick_entity directly. That
-    function resolves its argument by exact-matching it against a record in
-    the current room's own live placement table, so this works by cloning a
-    template record, editing its id/species/slot/position, and appending it
-    -- see native/KH1Native/dllmain.cpp's l_spawn_enemy for the full
-    mechanism.
-
-    Every call looks the model up in kh1_creature_data.lua for its char-id,
-    weight, and a full template record -- data extracted offline from every
-    room's own .ard file (see generate_creature_data.py), covering every
-    creature in the game without ever needing to visit its native room live.
-    Requesting a model that isn't in that table returns an error rather than
-    guessing. (Session 21: this used to also special-case a creature already
-    placed in the current room, cloning its live record directly and/or
-    learning its data on the fly -- removed once the .ard table made both
-    redundant. See the heartless field-spawn investigation memory, "Session
-    21 continued", for why.) It also triggers the same asset-load call real
-    EVDL room scripts use (fnc_load_gimmick_assets) if this creature isn't
-    already loaded into a slot this session, and waits for it before
-    constructing, since the record's own self-heal only resolves handles
-    into already-loaded data -- it never triggers a load itself; see
-    l_spawn_enemy's comment for the full history of getting this right
-    without crashing.
-
-    CONFIRMED LIVE (2026-07-21, and repeatedly since): a spawned creature can
-    be locked onto, damaged, defeated, and attacks Sora back -- fully
-    functional, not just a rendered prop. This was unconditionally disabled
-    from session 9 through 18 while two independent, real crash mechanisms
-    on this path got root-caused and fixed (see l_spawn_enemy's comment for
-    exactly what/why); this function now installs both fixes itself,
-    idempotently, before attempting a spawn, so no separate setup call is
-    needed. On a build where any fix's target address isn't configured,
-    spawn_enemy refuses cleanly rather than proceed unprotected -- there is
-    currently no unaffected path on such a build. EGS's addresses were all
-    located via static Ghidra cross-binary matching in session 21
-    (2026-08-03) -- see EGSGlobal_1_0_0_10.lua -- but are NOT YET
-    independently live-verified on an actual EGS game session; treat EGS
-    spawn_enemy as untested, not confirmed working, until someone runs it
-    there. See the heartless field-spawn investigation memory/doc for the
-    full session-by-session history.
-
-    WHY THIS IS A NATIVE CALL AND NOT A PLAIN kh1_native.call_function: the
-    record-splicing (allocate a new table, copy the old one in, clone/edit a
-    record, repoint two live globals) is fiddly byte-level work that's safer
-    done once in C++ than from Lua. See l_spawn_enemy's comment for why a
-    Cheat-Engine-injected call to this same target function reliably crashed
-    the game during development, and why an in-process native call (this
-    function) is the fix.
-
-    Returns true + the new entity's pointer if the spawn call completed
-    without crashing, or false + an error message (e.g. "no offline fallback
-    data for this creature") otherwise. If this creature isn't already
-    loaded into a slot this session and its asset load hasn't finished yet,
-    also returns a third value (true) so callers can tell "still loading,
-    call me again" apart from a hard refusal -- see spawn_enemy_async below,
-    which handles that automatically instead of making you poll by hand.
-
-    IMPORTANT (2026-08-02, session 20): this call USED to block for up to 10
-    real seconds on a creature's first-ever load this session (a Sleep-based
-    poll in l_spawn_enemy), always needing a second call afterward. A live
-    trace proved that poll was actively self-defeating, not just slow: the
-    asset-load job is drained by the game's own per-frame loop, which runs on
-    this SAME thread -- blocking it in a Sleep loop doesn't wait for the load,
-    it PREVENTS the load from ever starting, since no frame can run while
-    Lua's call hasn't returned. l_spawn_enemy no longer blocks at all; a
-    still-loading fallback spawn now returns immediately (third return value
-    true) instead. If you call this directly for a fallback spawn, you are
-    responsible for calling again on a LATER real frame (not the same frame,
-    not in a tight loop) -- use spawn_enemy_async instead unless you have a
-    specific reason to poll by hand.]]
     if x == nil or y == nil or z == nil then
         local pos = get_sora_pos()
         x = x or pos["X"]
         y = y or pos["Y"]
         z = z or pos["Z"]
     end
-    -- charId=0 is never a real value here (record+0x4c==0 is Sora's own party
-    -- slot -- see l_spawn_enemy's comment) so it doubles as "no offline data
-    -- for this model", matching this call's own convention of 0 meaning
-    -- "unconfigured" for its other optional trailing args.
+
     local charId, weight, template = 0, 0, nil
     local known = kh1_creature_data[model_path]
     if known then
@@ -938,11 +895,7 @@ local function spawn_enemy(model_path, motion_path, x, y, z)
         fnc_party_ability_index_resolve_call, charId, weight, template)
 end
 
--- Pending spawn_enemy_async requests, keyed by an opaque incrementing id --
--- same shape/lifecycle idea as open_text_boxes above. kh1_lua_library has no
--- persistent per-frame hook of its own (see open_text_box's comment), so
--- these only make progress while the caller's own script drives
--- update_spawn_enemy_async() from its _OnFrame.
+-- Pending spawn_enemy_async requests
 local pending_spawn_requests = {}
 local next_spawn_request_id = 1
 
@@ -951,28 +904,8 @@ local function spawn_enemy_async(model_path, motion_path, x, y, z, callback)
     where the asset load hasn't finished yet. Queues a request and returns
     immediately; call update_spawn_enemy_async() every frame from your own
     script's _OnFrame (harmless/no-op if nothing is pending) to actually
-    drive it, the same convention open_text_box/update_text_boxes uses.
+    drive it, the same convention open_text_box/update_text_boxes uses.]]
 
-    `callback(ok, result_or_error)` fires once, on a later frame, with
-    exactly what spawn_enemy itself would have returned (true + entity
-    pointer, or false + error message) -- except a "still loading" result
-    is never handed to you: this function keeps retrying that case on your
-    behalf, one real spawn_enemy call per frame, until it resolves for real
-    or a ~10-second wall-clock budget (os.clock()-based, matching the
-    timeout l_spawn_enemy itself used to enforce internally before session
-    20's fix) runs out, at which point callback gets a clean false + "timed
-    out waiting for asset load".
-
-    Why this exists instead of just calling spawn_enemy in a loop: spawn_enemy
-    for a fallback spawn can only actually complete once the game's own
-    thread gets to run a real frame between attempts (see spawn_enemy's own
-    comment) -- calling it repeatedly within the same frame/tight loop would
-    reproduce the exact self-blocking bug this was built to fix instead of
-    avoiding it. Retrying from _OnFrame guarantees at least one real frame
-    elapses between attempts.
-
-    x/y/z default to Sora's own position, same as spawn_enemy. callback is
-    optional -- omit it if you don't need to know when/whether it finished.]]
     local id = next_spawn_request_id
     next_spawn_request_id = next_spawn_request_id + 1
     pending_spawn_requests[id] = {
@@ -1005,21 +938,6 @@ local function update_spawn_enemy_async()
             end
         end
     end
-end
-
-local function show_custom_item_popup(text)
-    --[[ Uses the in game function to force a map prize pickup box.
-    Injects bytes to read from injected memory for text, so we
-    can have custom text.]]
-    kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
-    kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
-    kh1_native.set_custom_popup_text(GetKHSCII(text))
-    return kh1_native.call_function(fnc_show_item_message, 1, 1)
-end
-
-local function play_se2(se_id, param_2)
-    -- Plays a sound effect using the in game function.
-    return kh1_native.call_function(fnc_play_se2, se_id, param_2)
 end
 
 -- ######################## --
@@ -1099,31 +1017,6 @@ boxes.]]
         if timed_out or transitioned then
             close_text_box(window_id)
         end
-    end
-end
-
-local function sora_koed()
-    -- Returns if Sora's current HP is 0
-    return ReadByte(maxHP - 0x1) == 0
-end
-
-local function ko_sora()
-    -- Triggers the in game functions to KO Sora.
-    if not sora_koed() then
-        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
-    end
-end
-
-local function heartless_angel_sora()
-    -- Sets Sora HP to 1 and MP to 0
-    if not sora_koed() then
-        local stats_page = get_stats_page(ReadLong(soraPointer))
-        if stats_page ~= 0 then
-            WriteByte(stats_page + 0x3C, 1, true)
-            WriteByte(stats_page + 0x44, 0, true)
-        end
-        WriteByte(maxHP - 0x1, 1)
-        WriteByte(maxHP - 0x1 + 2, 0)
     end
 end
 
