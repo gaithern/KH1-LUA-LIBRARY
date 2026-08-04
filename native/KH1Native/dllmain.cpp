@@ -207,6 +207,36 @@ static const int RESOURCE_BLOB_MAX_SPECIES = 0x40;
 // constructor, for an external CE hook to target. Not read in this DLL.
 static volatile uint32_t g_lastSpawnAttemptId = 0;
 
+// EXPERIMENTAL (2026-08-04): counts consecutive spawn_enemy polls that have
+// observed a given species' loadedPtrTable state==6 ("ready"). Live crash
+// analysis (minidump register/exception inspection) showed a creature
+// spawned cold (never loaded via the normal room-visit flow this session)
+// can crash inside the engine's own animation/skeleton-blend code shortly
+// after construction, dereferencing a handle that was never actually
+// minted (its bit 31 -- the mint marker every real handle carries -- is
+// unset). state==6 is this DLL's own "fully loaded" signal, but the async
+// job that drives that state transition (fnc_async_load_job_callback) also
+// does completion bookkeeping (a separate flags byte + an engine-side
+// completion callback) as part of the SAME per-frame step that flips the
+// state byte -- polling state==6 the instant it's first observed may race
+// that same-frame completion work. Requiring state==6 to hold for several
+// consecutive polls before constructing is a cheap way to test that theory
+// without having fully reverse-engineered the rest of that job's state
+// machine. If this doesn't fix the crash, revert it -- it's a probe, not a
+// confirmed fix.
+static const int SPECIES_READY_SETTLE_POLLS = 5;
+static const int SPECIES_READY_SETTLE_MAX = 256;
+static int g_speciesReadySettleCount[SPECIES_READY_SETTLE_MAX] = {};
+
+// Returns true once `species` has been observed ready for
+// SPECIES_READY_SETTLE_POLLS consecutive calls. Call only once
+// loadedPtrAddr/state have already confirmed state==6 this poll.
+static bool SpeciesReadySettled(int species) {
+    if (species < 0 || species >= SPECIES_READY_SETTLE_MAX) return true;
+    g_speciesReadySettleCount[species]++;
+    return g_speciesReadySettleCount[species] >= SPECIES_READY_SETTLE_POLLS;
+}
+
 // Placement-record pointer tagged right before it's handed to
 // fnc_load_gimmick_assets, so InstallJobRecordGuardHook can tell our own
 // queued job apart from unrelated callers.
@@ -580,6 +610,22 @@ extern "C" int l_spawn_enemy(void* L) {
     // force a fresh resolve.
     memset(newRec + 8, 0, 4);
 
+    // record+0x3c is ANOTHER resource-handle field, same session-relative
+    // bucket-table encoding as record+0x60/+0x64 (see the handle-minting
+    // block below) -- just not one this code already re-mints. Confirmed
+    // live 2026-08-04 via a real crash: spawning a creature whose offline
+    // template (kh1_creature_data.lua) carries a nonzero stale value here
+    // (Darkball, template byte 0x3c) crashed the game inside the engine's
+    // own keyframe/velocity-blend lookup (KH1FM.exe's
+    // fnc_resolve_resource_handle call site) when it resolved the stale
+    // handle against a bucket that was never allocated this session,
+    // landing on unmapped memory (EXCEPTION_ACCESS_VIOLATION, verified via
+    // minidump register/exception analysis). fnc_resolve_resource_handle(0)
+    // is documented and confirmed to return 0 cleanly, so -- exactly like
+    // record+8 above -- zeroing this forces a fresh resolve instead of
+    // reusing a foreign session's encoding.
+    memset(newRec + 0x3c, 0, 4);
+
     // The category/kind byte drives every kind-specific setup branch in the
     // constructor -- an out-of-band value renders but leaves the entity
     // non-interactable. Use the real category (3, character/actor) with
@@ -672,7 +718,7 @@ extern "C" int l_spawn_enemy(void* L) {
         // first callback writes the completion pointer but leaves state 0.
         volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
-        if (*loadedPtrAddr == 0 || *stateAddr != 6) {
+        if (*loadedPtrAddr == 0 || *stateAddr != 6 || !SpeciesReadySettled(species)) {
             char msg[160];
             snprintf(msg, sizeof(msg), "spawn_enemy: asset load for species=%d not ready yet (state=%u), refusing without blocking -- caller should retry next frame", species, (unsigned)*stateAddr);
             LogDebug(msg);
@@ -694,7 +740,7 @@ extern "C" int l_spawn_enemy(void* L) {
     if (!needsLoad) {
         volatile uint64_t* loadedPtrAddr = (volatile uint64_t*)(uintptr_t)(base + loadedPtrTableRva + (size_t)species * LOADED_SPECIES_STRIDE);
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
-        if (*loadedPtrAddr == 0 || *stateAddr != 6) {
+        if (*loadedPtrAddr == 0 || *stateAddr != 6 || !SpeciesReadySettled(species)) {
             char msg[160];
             snprintf(msg, sizeof(msg), "spawn_enemy: slot %d marked loaded but not fully ready yet (state=%u) -- refusing without blocking", species, (unsigned)*stateAddr);
             LogDebug(msg);
