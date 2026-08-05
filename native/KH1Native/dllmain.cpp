@@ -202,6 +202,83 @@ static const int PLACEMENT_POS_Z_OFFSET = 0x24;
 static const int PLACEMENT_MODEL_HANDLE_OFFSET = 0x60;
 static const int PLACEMENT_MOTION_HANDLE_OFFSET = 0x64;
 
+// Shared 96-slot global entity pool (stride 0x4B0/1200 bytes) -- the SAME
+// pool Sora, party members, doors/chests/markers, and every
+// fnc_spawn_world_gimmick_entity-constructed creature live in (confirmed
+// live 2026-08-04: Sora's own struct pointer, from soraPointer, landed
+// exactly on a pool slot boundary at index 4). Position is 3 floats at
+// +0x10/+0x14/+0x18 -- also confirmed live against Sora's own known
+// position and cross-checked against a CC-spawned Large Body's slot.
+// Occupied-flag at +0x374 bit 0 was already known from an earlier session
+// (see fnc_spawn_world_gimmick_entity's own plate comment).
+static const unsigned long long ENTITY_POOL_STRIDE = 0x4B0;
+static const int ENTITY_POOL_COUNT = 96;
+static const int ENTITY_OCCUPIED_FLAG_OFFSET = 0x374;
+static const int ENTITY_POS_X_OFFSET = 0x10;
+static const int ENTITY_POS_Y_OFFSET = 0x14;
+static const int ENTITY_POS_Z_OFFSET = 0x18;
+static const int ENTITY_KIND_OFFSET = 0x6;
+// Sora, party members, AND every fnc_spawn_world_gimmick_entity-constructed
+// creature (including a CC-spawned Large Body) all carry kind==3 -- doors/
+// chests/trigger markers/other room furniture use other kind values
+// (observed 2,4,5,9,10). Confirmed live 2026-08-04.
+static const uint8_t ENTITY_KIND_ACTOR = 3;
+static const float MIN_SPAWN_DISTANCE_FROM_SORA = 100.0f; // live-tuned 2026-08-04 (was 500, then 100)
+
+// A fresh spawn lands at (or very near) Sora's own position -- if another
+// ENEMY is already sitting close to Sora when that happens, the new
+// creature can end up overlapping it directly. Live-confirmed 2026-08-04 as
+// a likely trigger for the spawn_enemy crash investigation (see
+// project_spawn_enemy_cold_spawn_crash_containment.md) -- the crash risk is
+// specifically enemy-vs-enemy overlap, NOT enemy-vs-Sora (spawning
+// literally on top of Sora is fine -- the engine pushes him out of the
+// way, confirmed by repeated live testing all session).
+//
+// Refined 2026-08-04 from an earlier version that counted every occupied
+// pool slot -- that refused almost every spawn attempt, since doors/
+// chests/markers near Sora aren't a crash risk at all. Now: only counts
+// kind==3 entities (see ENTITY_KIND_ACTOR), and explicitly excludes Sora
+// and the active party (soraObjPtrRva/partyMember1PtrRva/
+// partyMember2PtrRva) since they're also kind==3 and would otherwise
+// always be "too close" just by following Sora around. All RVA params are
+// optional, same convention as the other guard RVAs -- 0/unset just skips
+// that exclusion (or the whole check, for entityPoolBaseRva/soraPointerRva).
+static bool AnyEnemyTooCloseToSora(unsigned long long base, unsigned long long entityPoolBaseRva,
+                                     unsigned long long soraPointerRva, unsigned long long soraObjPtrRva,
+                                     unsigned long long partyMember1PtrRva, unsigned long long partyMember2PtrRva,
+                                     float minDistance) {
+    if (entityPoolBaseRva == 0 || soraPointerRva == 0) return false;
+    unsigned long long soraEntityPtr = *(unsigned long long*)(uintptr_t)(base + soraPointerRva);
+    if (soraEntityPtr == 0) return false;
+    float soraX = *(float*)(uintptr_t)(soraEntityPtr + ENTITY_POS_X_OFFSET);
+    float soraY = *(float*)(uintptr_t)(soraEntityPtr + ENTITY_POS_Y_OFFSET);
+    float soraZ = *(float*)(uintptr_t)(soraEntityPtr + ENTITY_POS_Z_OFFSET);
+
+    unsigned long long excluded[3] = { soraEntityPtr, 0, 0 };
+    if (soraObjPtrRva != 0) excluded[0] = *(unsigned long long*)(uintptr_t)(base + soraObjPtrRva);
+    if (partyMember1PtrRva != 0) excluded[1] = *(unsigned long long*)(uintptr_t)(base + partyMember1PtrRva);
+    if (partyMember2PtrRva != 0) excluded[2] = *(unsigned long long*)(uintptr_t)(base + partyMember2PtrRva);
+
+    unsigned long long poolBase = base + entityPoolBaseRva;
+    float minDistSq = minDistance * minDistance;
+    for (int i = 0; i < ENTITY_POOL_COUNT; ++i) {
+        unsigned long long slot = poolBase + (unsigned long long)i * ENTITY_POOL_STRIDE;
+        if (slot == soraEntityPtr || slot == excluded[0] || slot == excluded[1] || slot == excluded[2]) continue;
+        uint32_t flags = *(volatile uint32_t*)(uintptr_t)(slot + ENTITY_OCCUPIED_FLAG_OFFSET);
+        if ((flags & 1) == 0) continue;
+        uint8_t kind = *(volatile uint8_t*)(uintptr_t)(slot + ENTITY_KIND_OFFSET);
+        if (kind != ENTITY_KIND_ACTOR) continue;
+        float x = *(float*)(uintptr_t)(slot + ENTITY_POS_X_OFFSET);
+        float y = *(float*)(uintptr_t)(slot + ENTITY_POS_Y_OFFSET);
+        float z = *(float*)(uintptr_t)(slot + ENTITY_POS_Z_OFFSET);
+        float dx = x - soraX, dy = y - soraY, dz = z - soraZ;
+        if ((dx * dx + dy * dy + dz * dz) < minDistSq) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Per-species asset-load state struct loadedSpeciesPtrTable points into.
 // State byte (+3) is 0 until a load starts, then climbs as it progresses.
 // Cached filename string (+4) tells reuse from collision for that slot.
@@ -210,24 +287,6 @@ static const int LOADED_SPECIES_STATE_OFFSET_FROM_PTR = -0x45;
 static const int LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR = -0x44;
 static const int LOADED_SPECIES_MODEL_NAME_SIZE = 0x20;
 static const int SPECIES_SLOT_COUNT = 256; // species/slot index is a uint8_t (record+0x55) -- the full addressable range
-
-// Live-confirmed 2026-08-04: constructing any creature NOT native to this
-// specific room reliably crashes (or, since guard hooks were added, at
-// least throws deep inside the constructor/engine code) -- this affects
-// both a genuinely cold/fresh load AND reusing an already-fully-loaded
-// species from elsewhere this session (same handles, same data, still
-// crashes), so the check below is applied to every species-resolution
-// path, not just needsLoad. Multiple root-cause theories (incomplete
-// async asset load, missing resource-handle minting) were investigated
-// and ruled out or left unconfirmed -- see KH1-LUA-LIBRARY memory:
-// project_spawn_enemy_cold_spawn_crash_containment.md for the full
-// history. Native creatures already loaded by the room itself (e.g.
-// Soldier here) are unaffected -- they're found via RoomHasNativeSpecies
-// well before construction and never reach spawn_enemy's fallback path
-// at all.
-static const int32_t COLD_SPAWN_CRASH_WORLD = 3;
-static const int32_t COLD_SPAWN_CRASH_AREA = 2;
-static const int32_t COLD_SPAWN_CRASH_SET = 2;
 
 // species (record+0x55) is a per-room-local slot index, not a stable
 // creature ID -- creatures are identified by model/motion filename instead.
@@ -287,6 +346,24 @@ static void RecordTriggeredLoad(const char* modelPath, uint8_t species) {
     strncpy_s(entry.modelPath, modelPath, _TRUNCATE);
     entry.species = species;
     g_triggeredLoadCount++;
+}
+
+// A species recorded here was already assigned to a specific creature by a
+// load WE triggered this session -- never hand it to a DIFFERENT creature,
+// even if the live engine's own state byte looks free or
+// MarkSpeciesInUseByLiveEntities couldn't resolve the occupying entity's
+// handle. That resolve failing is exactly the same failure mode as the
+// crashes this DLL guards against elsewhere (unminted resource handle), so
+// a live entity we ourselves spawned can go undetected by that live-scan
+// and silently free up its own slot for reuse -- confirmed 2026-08-04 as
+// the likely cause of "spawn while another CC-spawned creature is already
+// on screen" crashes. This is our own bookkeeping, so it doesn't depend on
+// the handle resolving correctly at all.
+static bool IsSpeciesTriggeredThisSession(uint8_t species) {
+    for (int i = 0; i < g_triggeredLoadCount; ++i) {
+        if (g_triggeredLoads[i].species == species) return true;
+    }
+    return false;
 }
 
 // model_path/motion_path from Lua are only valid for this call, but the
@@ -400,9 +477,16 @@ static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned lon
 // MarkSpeciesInUseByLiveEntities above is also consulted, and slots ~48-64
 // are avoided since they're hardcoded-reserved by unrelated engine
 // subsystems (menu/JP-sysfont, voice, event motion/effect).
+//
+// IsSpeciesTriggeredThisSession is also consulted (2026-08-04) --
+// MarkSpeciesInUseByLiveEntities can't be trusted alone, since it depends
+// on resolving each live entity's own resource handle, which is exactly
+// the kind of call that fails for the creatures this whole file is trying
+// to guard. Our own triggered-load bookkeeping doesn't have that problem.
 static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, uint8_t* outSpecies) {
     for (int s = 20; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
         if (speciesInUseByLiveEntity && speciesInUseByLiveEntity[s]) continue;
+        if (IsSpeciesTriggeredThisSession((uint8_t)s)) continue;
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
         if (*stateAddr == 0) {
             *outSpecies = (uint8_t)s;
@@ -484,6 +568,15 @@ extern "C" int l_spawn_enemy(void* L) {
     // lookup helper (see InstallKeyframeListEntryGuardHook's own comment).
     // Optional, same reasoning as the two hook RVAs above.
     unsigned long long keyframeListEntryHookFnRva = (unsigned long long)p_lua_tointegerx(L, 26, nullptr);
+    // Entity pool base + soraPointer + active-party pointers, for
+    // AnyEnemyTooCloseToSora (see its own comment). All optional -- 0/unset
+    // just skips the check (or that one exclusion), same convention as the
+    // hook RVAs above.
+    unsigned long long entityPoolBaseRva = (unsigned long long)p_lua_tointegerx(L, 27, nullptr);
+    unsigned long long soraPointerRva = (unsigned long long)p_lua_tointegerx(L, 28, nullptr);
+    unsigned long long soraObjPtrRva = (unsigned long long)p_lua_tointegerx(L, 29, nullptr);
+    unsigned long long partyMember1PtrRva = (unsigned long long)p_lua_tointegerx(L, 30, nullptr);
+    unsigned long long partyMember2PtrRva = (unsigned long long)p_lua_tointegerx(L, 31, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -508,6 +601,19 @@ extern "C" int l_spawn_enemy(void* L) {
     if (!oldTable || oldCount <= 0 || oldCount > 4096) {
         p_lua_pushboolean(L, 0);
         p_lua_pushstring(L, "spawn_enemy: placement table not valid right now (wrong room state?)");
+        return 2;
+    }
+
+    // See AnyEnemyTooCloseToSora's own comment -- a fresh spawn lands at
+    // Sora's own position, so if another ENEMY is already sitting there,
+    // refuse rather than risk two enemies overlapping directly (spawning
+    // on Sora himself is fine). Checked before any species resolution/load
+    // work, since nothing below matters if this refuses.
+    if (AnyEnemyTooCloseToSora(base, entityPoolBaseRva, soraPointerRva, soraObjPtrRva,
+                                 partyMember1PtrRva, partyMember2PtrRva, MIN_SPAWN_DISTANCE_FROM_SORA)) {
+        LogDebug("spawn_enemy: refusing -- another enemy is already too close to Sora's position");
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: another enemy is already too close to Sora -- refusing to avoid spawning on top of it");
         return 2;
     }
 
@@ -624,28 +730,12 @@ extern "C" int l_spawn_enemy(void* L) {
         p_lua_pushstring(L, "spawn_enemy: no free local slot available in this room this session (all 256 in use) -- refusing");
         return 2;
     }
-    // See COLD_SPAWN_CRASH_WORLD's own comment -- refuse rather than risk
-    // the crash this specific room causes when constructing any creature
-    // that isn't native to it. Deliberately checked here, AFTER all three
-    // species-resolution branches above and regardless of needsLoad --
-    // live-confirmed 2026-08-04 that reusing an ALREADY fully-loaded
-    // species (needsLoad=false, via the FindLoadedSlotByFilename reuse
-    // path) can also crash the constructor in this room, so this can't be
-    // gated on needsLoad alone the way the first version of this guard was.
-    if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
-        int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
-        int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
-        int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
-        if (curWorld == COLD_SPAWN_CRASH_WORLD && curArea == COLD_SPAWN_CRASH_AREA &&
-            curSet == COLD_SPAWN_CRASH_SET) {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "spawn_enemy: refusing spawn of %s -- this room (world=%d area=%d set=%d) is known to crash constructing non-native creatures", modelPath, curWorld, curArea, curSet);
-            LogDebug(msg);
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: this room is known to crash when spawning a creature that isn't native to it -- refusing");
-            return 2;
-        }
-    }
+    // Room-exclusion guard for World=3/Area=2/Set=2 intentionally REMOVED
+    // 2026-08-04 -- under active investigation now instead of being refused
+    // outright. See project_spawn_enemy_cold_spawn_crash_containment.md for
+    // the crash this room causes and what's already known about it; git
+    // history has the removed check if it needs to come back.
+    //
     // Defense in depth: re-check the slot right before touching anything,
     // in case its state changed since the scan above.
     if (needsLoad) {
@@ -2503,6 +2593,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
         char selfPath[MAX_PATH];
         GetModuleFileNameA(hModule, selfPath, MAX_PATH);
         LoadLibraryA(selfPath);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // Best-effort diagnostic only -- lpReserved != NULL means the process
+        // itself is terminating (not a plain FreeLibrary), and Microsoft
+        // doesn't guarantee CRT/Kernel32 calls are safe at that point.
+        // Logging anyway since it's the only signal available for a crash
+        // that leaves no Windows Event Log entry and no LogDebug line from
+        // anywhere else in this file (2026-08-04, Sniperwild cold-spawn
+        // instant-vanish incident) -- if this line shows up right before
+        // such a crash, the process was still unwinding normally, which
+        // rules out a fail-fast/stack-corruption kill; if it never appears,
+        // teardown never ran at all.
+        LogDebug(lpReserved ? "DllMain: DLL_PROCESS_DETACH (process terminating)" : "DllMain: DLL_PROCESS_DETACH (FreeLibrary)");
     }
     return TRUE;
 }

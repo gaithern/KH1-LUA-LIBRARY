@@ -341,6 +341,22 @@ fnc_skeleton_blend_call_hook = 0x391C70
 -- handle), in a different call tree from the two hooks above. Steam-only,
 -- same reasoning as the addresses above.
 fnc_keyframe_list_entry_hook = 0x3946BF
+-- Base of the shared 96-slot global entity pool (stride 0x4B0/1200 bytes) --
+-- Sora, party members, doors/chests/markers, and every
+-- fnc_spawn_world_gimmick_entity-constructed creature live in it. Confirmed
+-- live 2026-08-04: soraPointer's resolved struct landed exactly on this
+-- pool's slot-4 boundary. Used by AnyEntityTooCloseToSora in dllmain.cpp to
+-- refuse spawn_enemy when something is already sitting on top of Sora.
+entityPoolBase = 0x2D372A0
+-- Sora + up to 2 active party members' entity pointers (a contiguous
+-- 3-pointer array, confirmed live 2026-08-04 -- g_SoraObjPtr's resolved
+-- value matched soraPointer's exactly). Used by AnyEnemyTooCloseToSora to
+-- exclude the whole party (not just Sora) from the "too close" check --
+-- otherwise a party member following Sora around would always count as
+-- an enemy nearby, since they share the same entity kind byte.
+g_SoraObjPtr = 0x2D37280
+g_PartyMember1ObjectPtr = 0x2D37288
+g_PartyMember2ObjPtr = 0x2D37290
 
 fnc_show_item_message = 0x273410
 fnc_item_popup_text_hook = 0x27358C
