@@ -510,6 +510,17 @@ static bool InstallSkeletonBlendCallGuardHook(unsigned long long hookAddr);
 static bool InstallKeyframeListEntryGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
                                                 unsigned long long notFoundAddr,
                                                 unsigned long long resolveHandleFnAddr);
+static bool InstallKeyframeListEntryParamGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallAnimBlendAdvanceDiagHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                              unsigned long long resolveHandleFnAddr);
+static bool InstallSection2SizeGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                           unsigned long long emptyPathAddr);
+static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static uint64_t g_textSlotTableBase = 0;
+static uint64_t g_resolveHandleFnAddrForTextSlot = 0;
+static bool InstallTextSlotHandleCaptureHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallTextSlotHandleRecordHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallTextSlotFreshResolveHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 
 extern "C" int l_spawn_enemy(void* L) {
     unsigned long long spawnFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -577,6 +588,53 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long soraObjPtrRva = (unsigned long long)p_lua_tointegerx(L, 29, nullptr);
     unsigned long long partyMember1PtrRva = (unsigned long long)p_lua_tointegerx(L, 30, nullptr);
     unsigned long long partyMember2PtrRva = (unsigned long long)p_lua_tointegerx(L, 31, nullptr);
+    // Entry point of fnc_keyframe_list_lookup itself (the risky
+    // record+0x3C read at the function's own +0x15, BEFORE
+    // InstallKeyframeListEntryGuardHook's own patch point at +0x2F -- see
+    // InstallKeyframeListEntryParamGuardHook's own comment). Optional, same
+    // reasoning as the other animation-subsystem hook RVAs above.
+    unsigned long long keyframeListEntryParamHookFnRva = (unsigned long long)p_lua_tointegerx(L, 32, nullptr);
+    // Entry point of "MOV RBX,RAX" + "CALL fnc_resolve_resource_handle" inside
+    // fnc_entity_animation_blend_advance, right after it computes the value
+    // that (when bad) eventually becomes the -1 fed into
+    // fnc_keyframe_list_lookup -- see InstallAnimBlendAdvanceDiagHook's own
+    // comment. Diagnostic-only (doesn't fix anything, just logs). Optional.
+    unsigned long long animBlendAdvanceDiagHookFnRva = (unsigned long long)p_lua_tointegerx(L, 33, nullptr);
+    // Entry point of the section-2 size check inside fnc_link_model_resource_data
+    // (the "MOV EAX,[RBP+0xC]" through "JLE" sequence right before the copy into
+    // entity+0x1D4) -- see InstallSection2SizeGuardHook's own comment. This is a
+    // REAL FIX, not a catch-after-the-fact guard: it corrects the game's own
+    // "section has data" check from "size > 0" to "size >= 0x34" (the minimum
+    // needed to safely read the dword at section+0x30 that becomes entity+0x1D4).
+    // Optional, same degrade-gracefully convention as the other hook RVAs above.
+    unsigned long long section2SizeGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 34, nullptr);
+    // Entry point of fnc_resolve_resource_handle_impl's own bucket-table lookup
+    // (the "SHR RAX,0x19" through "OR RAX,RCX" sequence) -- see
+    // InstallResolveHandleBucketGuardHook's own comment. THE master fix: the
+    // resource-handle system has a hard 64-bucket ceiling, shared across the
+    // whole game and never freed -- once exhausted (confirmed live 2026-08-05,
+    // heavy Crowd Control spawn testing), EVERY caller of
+    // fnc_resolve_resource_handle anywhere in the game can get back a raw -1
+    // "pointer" with no way to detect it, which is almost certainly the real
+    // root cause behind crash sites #1-#6 and the unrelated text-rendering UAF
+    // found the same session -- all of them were symptoms of THIS. Fixing it
+    // here protects every caller at once, not just the handful of call sites
+    // this file has individually hooked so far. Optional, same
+    // degrade-gracefully convention as the other hook RVAs above.
+    unsigned long long resolveHandleBucketGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 35, nullptr);
+    // Status-effect floating-text UAF fix (2026-08-05) -- see
+    // InstallTextSlotHandleCaptureHook/InstallTextSlotHandleRecordHook/
+    // InstallTextSlotFreshResolveHook's own comments. Three coordinated hooks:
+    // capture the ORIGINAL handle inside fnc_status_effect_activate_by_type
+    // before it gets resolved and cached as a raw pointer, record it into a
+    // per-slot side table, then have the one CONFIRMED crash read-site
+    // (FUN_1401eba70) re-resolve fresh from that handle instead of trusting the
+    // long-cached raw pointer. All optional -- degrade gracefully (falls back to
+    // the original cached-pointer behavior) if unconfigured.
+    unsigned long long textSlotHandleCaptureHookFnRva = (unsigned long long)p_lua_tointegerx(L, 36, nullptr);
+    unsigned long long textSlotHandleRecordHookFnRva = (unsigned long long)p_lua_tointegerx(L, 37, nullptr);
+    unsigned long long textSlotFreshResolveHookFnRva = (unsigned long long)p_lua_tointegerx(L, 38, nullptr);
+    unsigned long long textSlotTableBaseRva = (unsigned long long)p_lua_tointegerx(L, 39, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -674,6 +732,50 @@ extern "C" int l_spawn_enemy(void* L) {
         if (!InstallKeyframeListEntryGuardHook(base + keyframeListEntryHookFnRva, base + keyframeListEntryHookFnRva + 13,
                                                  base + keyframeListEntryHookFnRva + 0x2b, base + resolveHandleFnRva)) {
             LogDebug("spawn_enemy: InstallKeyframeListEntryGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (keyframeListEntryParamHookFnRva != 0) {
+        if (!InstallKeyframeListEntryParamGuardHook(base + keyframeListEntryParamHookFnRva, base + keyframeListEntryParamHookFnRva + 5)) {
+            LogDebug("spawn_enemy: InstallKeyframeListEntryParamGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (animBlendAdvanceDiagHookFnRva != 0) {
+        if (!InstallAnimBlendAdvanceDiagHook(base + animBlendAdvanceDiagHookFnRva, base + animBlendAdvanceDiagHookFnRva + 8, base + resolveHandleFnRva)) {
+            LogDebug("spawn_enemy: InstallAnimBlendAdvanceDiagHook failed to install -- proceeding without it");
+        }
+    }
+    if (section2SizeGuardHookFnRva != 0) {
+        // resumeAddr = hookAddr+9 ("ADD RCX,RBP", continuing the "has real data" path);
+        // emptyPathAddr = hookAddr+0x2F ("XOR ECX,ECX" empty-section path). Both fixed
+        // offsets from this exact build's disassembly -- see the hook's own comment.
+        if (!InstallSection2SizeGuardHook(base + section2SizeGuardHookFnRva, base + section2SizeGuardHookFnRva + 9, base + section2SizeGuardHookFnRva + 0x2F)) {
+            LogDebug("spawn_enemy: InstallSection2SizeGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (resolveHandleBucketGuardHookFnRva != 0) {
+        if (!InstallResolveHandleBucketGuardHook(base + resolveHandleBucketGuardHookFnRva, base + resolveHandleBucketGuardHookFnRva + 17)) {
+            LogDebug("spawn_enemy: InstallResolveHandleBucketGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (textSlotTableBaseRva != 0) {
+        g_textSlotTableBase = base + textSlotTableBaseRva;
+    }
+    if (resolveHandleFnRva != 0) {
+        g_resolveHandleFnAddrForTextSlot = base + resolveHandleFnRva;
+    }
+    if (textSlotHandleCaptureHookFnRva != 0) {
+        if (!InstallTextSlotHandleCaptureHook(base + textSlotHandleCaptureHookFnRva, base + textSlotHandleCaptureHookFnRva + 7)) {
+            LogDebug("spawn_enemy: InstallTextSlotHandleCaptureHook failed to install -- proceeding without it");
+        }
+    }
+    if (textSlotHandleRecordHookFnRva != 0) {
+        if (!InstallTextSlotHandleRecordHook(base + textSlotHandleRecordHookFnRva, base + textSlotHandleRecordHookFnRva + 7)) {
+            LogDebug("spawn_enemy: InstallTextSlotHandleRecordHook failed to install -- proceeding without it");
+        }
+    }
+    if (textSlotFreshResolveHookFnRva != 0) {
+        if (!InstallTextSlotFreshResolveHook(base + textSlotFreshResolveHookFnRva, base + textSlotFreshResolveHookFnRva + 7)) {
+            LogDebug("spawn_enemy: InstallTextSlotFreshResolveHook failed to install -- proceeding without it");
         }
     }
     if (mintHandleFnRva == 0) {
@@ -2028,6 +2130,882 @@ static bool InstallKeyframeListEntryGuardHook(unsigned long long hookAddr, unsig
 
     g_keyframeListEntryGuardHookInstalled = true;
     LogDebug("InstallKeyframeListEntryGuardHook: installed successfully");
+    return true;
+}
+
+// --- KEYFRAME LIST ENTRY *PARAM* GUARD HOOK ---
+// Fixes CRASH SITE #6 (found 2026-08-05 via a live WER minidump, after the hook above already
+// covered crash site #1 in this same function): fnc_keyframe_list_lookup's own entry point reads
+// *(int32_t*)(param_1 + 0x3C) -- this is a DIFFERENT read than InstallKeyframeListEntryGuardHook
+// covers (that one guards the CALL to fnc_resolve_resource_handle at +0x2F and the read of its
+// RESULT; this one is the read of param_1 itself at +0x15, three instructions earlier). Confirmed
+// live via crash register dump: RCX (param_1) == -1 (0xFFFFFFFFFFFFFFFF), fault address == 0x3B
+// (== -1 + 0x3C truncated to 32 bits) -- i.e. the CALLER passed an invalid record pointer, not
+// merely an unminted handle. Traced (not yet fully root-caused) to
+// fnc_entity_animation_blend_advance's own entity+0x1D4/+0x168 animation-table lookup -- see that
+// function's plate comment. This crash happens during ordinary per-frame animation update of an
+// already-spawned entity, NOT inside spawn_enemy's own construction call -- unlike every other
+// guard hook in this file, it isn't gated behind a required RVA (nothing to safely "refuse"; the
+// entities affected already exist).
+//
+// Safe value on failure is 0 (a real handle value, not a sentinel): fnc_resolve_resource_handle(0)
+// already returns 0 via its own early-out, and the EXISTING KeyframeListEntryGuardHook already
+// treats a resolved pointer of 0 as unreadable and safely returns "not found" -- so returning 0
+// here reuses that already-proven path instead of duplicating its logic.
+static bool g_keyframeListEntryParamGuardHookInstalled = false;
+static volatile uint64_t g_keyframeListEntryParamGuardSkipCount = 0;
+
+static int32_t CheckKeyframeListEntryParamSafe(uint64_t recordPtr) {
+    __try {
+        return *(int32_t*)(uintptr_t)(recordPtr + 0x3C);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[176];
+        snprintf(msg, sizeof(msg),
+            "KeyframeListEntryParamGuard: recordPtr=0x%llX unreadable (likely -1 propagated from "
+            "fnc_entity_animation_blend_advance's animation-table lookup), treating as handle=0 "
+            "(skipsSoFar=%llu)",
+            (unsigned long long)recordPtr, (unsigned long long)g_keyframeListEntryParamGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_keyframeListEntryParamGuardSkipCount;
+        return 0;
+    }
+}
+
+// Hooks the 5 bytes at fnc_keyframe_list_lookup+0x15: "MOV ECX,[RCX+0x3C]" (3 bytes) + the
+// following "MOV ESI,EDX" (2 bytes) -- exactly 5 bytes, no partial-instruction overwrite needed.
+// EDX (needed later, both as ESI's new value here and again for EBX at +0x1A) is stashed in EBX
+// across the CALL: EBX is callee-saved (its incoming value was already spilled to the stack by
+// this function's own prologue at +0x0, so it's free to reuse here) and the original code doesn't
+// read EBX again until +0x1A, where it gets freshly overwritten from EDX anyway.
+static bool InstallKeyframeListEntryParamGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    if (g_keyframeListEntryParamGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[5] = {
+        0x8B, 0x49, 0x3C,   // mov ecx, [rcx+0x3C]
+        0x8B, 0xF2          // mov esi, edx
+    };
+    if (memcmp(hookPtr, expected, 5) != 0) {
+        LogDebug("InstallKeyframeListEntryParamGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallKeyframeListEntryParamGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[64] = {};
+    size_t off = 0;
+    uint64_t checkFnAddr = (uint64_t)(uintptr_t)&CheckKeyframeListEntryParamSafe;
+
+    stub[off++] = 0x89; stub[off++] = 0xD3; // mov ebx, edx  (stash param_2 across the call)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, checkFnAddr
+    memcpy(stub + off, &checkFnAddr, 8); off += 8;
+
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (rcx already holds param_1; eax <- safe dword)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0x89; stub[off++] = 0xC1; // mov ecx, eax  (arg for the upcoming resolve_resource_handle call)
+    stub[off++] = 0x89; stub[off++] = 0xDA; // mov edx, ebx  (restore param_2)
+    stub[off++] = 0x89; stub[off++] = 0xD6; // mov esi, edx  (replicate the original "mov esi,edx")
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_keyframeListEntryParamGuardHookInstalled = true;
+    LogDebug("InstallKeyframeListEntryParamGuardHook: installed successfully");
+    return true;
+}
+
+// --- ANIM BLEND ADVANCE DIAGNOSTIC HOOK (2026-08-05) ---
+// Diagnostic-only, NOT a fix -- doesn't change behavior, just logs. Purpose: capture the LIVE
+// field values behind the crash site #6 root cause the next time it happens, instead of more
+// static guessing. fnc_entity_animation_blend_advance (RVA 0x29FB30) computes:
+//   uVar1 = entity+0x168 (ushort index)
+//   lVar3 = fnc_resolve_resource_handle(entity+0x1D4)   (table base)
+//   uVar4 = fnc_resolve_resource_handle(*(lVar3 + uVar1*4))   <- this is what becomes -1
+// This hook sits at RVA+0x50 ("MOV RBX,RAX" + "CALL fnc_resolve_resource_handle", 8 bytes total,
+// the instruction boundary immediately after uVar4 is computed into RAX) -- at that point RSI
+// still holds the entity pointer (set at the function's own +0x2E and untouched since), EBX still
+// holds uVar1, and RAX holds uVar4. When uVar4 == -1, logs the entity pointer plus its raw
+// (unresolved) +0x1D0/+0x1D4/+0x168 bytes -- answers whether the field is genuinely zeroed (fresh
+// pool slot, never linked) or non-zero-but-wrong (stale handle surviving a pool-slot reuse). See
+// fnc_entity_animation_blend_advance's own plate comment in Ghidra for the fuller writeup.
+static bool g_animBlendAdvanceDiagHookInstalled = false;
+static volatile uint64_t g_animBlendAdvanceDiagLogCount = 0;
+
+static void LogAnimBlendAdvanceDiag(uint64_t entityPtr, uint32_t uVar1Index, uint64_t uVar4) {
+    __try {
+        uint32_t f1d0 = *(uint32_t*)(uintptr_t)(entityPtr + 0x1D0);
+        uint32_t f1d4 = *(uint32_t*)(uintptr_t)(entityPtr + 0x1D4);
+        uint8_t kind = *(uint8_t*)(uintptr_t)(entityPtr + 0x6);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "AnimBlendAdvanceDiag: entity=0x%llX kind=%u entity+0x1D0=0x%08X entity+0x1D4=0x%08X "
+            "entity+0x168(idx)=0x%04X uVar4(result)=0x%llX (hitsSoFar=%llu)",
+            (unsigned long long)entityPtr, (unsigned)kind, f1d0, f1d4, uVar1Index,
+            (unsigned long long)uVar4, (unsigned long long)g_animBlendAdvanceDiagLogCount + 1);
+        LogDebug(msg);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "AnimBlendAdvanceDiag: entity=0x%llX itself unreadable while logging (hitsSoFar=%llu)",
+            (unsigned long long)entityPtr, (unsigned long long)g_animBlendAdvanceDiagLogCount + 1);
+        LogDebug(msg);
+    }
+    ++g_animBlendAdvanceDiagLogCount;
+}
+
+static bool InstallAnimBlendAdvanceDiagHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                              unsigned long long resolveHandleFnAddr) {
+    if (g_animBlendAdvanceDiagHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[8] = {
+        0x48, 0x8B, 0xD8,               // mov rbx, rax
+        0xE8, 0x38, 0xB2, 0x0E, 0x00    // call fnc_resolve_resource_handle (rel32, this build's offset)
+    };
+    if (memcmp(hookPtr, expected, 8) != 0) {
+        LogDebug("InstallAnimBlendAdvanceDiagHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallAnimBlendAdvanceDiagHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[128] = {};
+    size_t off = 0;
+    uint64_t logFnAddr = (uint64_t)(uintptr_t)&LogAnimBlendAdvanceDiag;
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC3; // mov rbx, rax  (uVar4, callee-saved across everything below)
+    stub[off++] = 0x89; stub[off++] = 0xCF;                     // mov edi, ecx  (stash entity+0x15c arg, RDI callee-saved & free here)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xFB; stub[off++] = 0xFF; // cmp rbx, -1
+    stub[off++] = 0x75; // jnz rel8 (patched below) -> skip_log
+    size_t jnzOperand = off; off += 1;
+
+    // log path: LogAnimBlendAdvanceDiag(entityPtr=RSI, uVar1Index=EBX, uVar4=RBX)
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xF1; // mov rcx, rsi
+    stub[off++] = 0x89; stub[off++] = 0xDA;                     // mov edx, ebx
+    stub[off++] = 0x4C; stub[off++] = 0x8B; stub[off++] = 0xC3; // mov r8, rbx   (arg3 = uVar4)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, logFnAddr
+    memcpy(stub + off, &logFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    size_t skipLogTarget = off;
+    stub[jnzOperand] = (unsigned char)(int8_t)(skipLogTarget - (jnzOperand + 1));
+
+    stub[off++] = 0x89; stub[off++] = 0xF9; // mov ecx, edi  (restore entity+0x15c arg)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, resolveHandleFnAddr
+    memcpy(stub + off, &resolveHandleFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (rax <- uVar5, matches original CALL's effect)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    // Bytes 5-7 of the original 8-byte region are simply jumped over, never executed --
+    // same convention as the other hooks' partial-overwrite case -- but fill with NOPs
+    // rather than leaving stale opcode bytes behind, for cleanliness under a disassembler.
+    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 8);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 8, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 8);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_animBlendAdvanceDiagHookInstalled = true;
+    LogDebug("InstallAnimBlendAdvanceDiagHook: installed successfully");
+    return true;
+}
+
+// --- SECTION-2 SIZE GUARD HOOK (2026-08-05) -- REAL FIX, not a catch-after-the-fact guard ---
+// Root cause found via static tracing (no live process): entity+0x1D4 (the field behind crash
+// site #6 -- see fnc_keyframe_list_lookup's plate comment) is a raw copy of a dword living inside
+// the SHARED per-species 256KB resource blob, at (blob's own "section 2" base)+0x30. That base is
+// computed from the blob's own header offset table (dwords at blob+8 and blob+0xC): if
+// blob+0xC - blob+8 (the section's size) is POSITIVE, the game reads a dword at section+0x30 and
+// copies it into entity+0x1D4 via fnc_copy_blob_section2_anim_handle -- but ">0" only proves the
+// section is non-empty, never that it's large enough to actually CONTAIN a dword at +0x30 (needs
+// >= 0x34 bytes). Species resource blob slots are reused across creatures within a session (see
+// project_spawn_enemy_cold_spawn_crash_containment.md) -- a small-but-nonzero section 2 left over
+// from a earlier, differently-shaped occupant of that same blob slot would pass this check yet
+// still cause a read of stale/adjacent bytes.
+//
+// This hook corrects the check itself (inside fnc_link_model_resource_data, the "MOV EAX,[RBP+0xC]
+// / SUB EAX,ECX / TEST EAX,EAX / JLE" sequence computing section size) from "size > 0" to
+// "size >= 0x34". Sizes in between (nonzero but too small -- the case this fixes) now take the
+// same safe "no section-2 data" path as a genuinely empty section (entity+0x1D4 stays 0, exactly
+// like fnc_resolve_resource_handle(0) already handles cleanly), and get logged so we can confirm
+// live whether this is really what's happening. Sizes >= 0x34 behave identically to the original
+// code -- this hook changes nothing for the common case.
+static bool g_section2SizeGuardHookInstalled = false;
+static volatile uint64_t g_section2SizeGuardCorrectionCount = 0;
+
+static void LogSection2SizeGuardCorrection(uint32_t rawSize) {
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+        "Section2SizeGuard: model resource blob's section-2 size=0x%X is nonzero but smaller than "
+        "the 0x34 bytes needed to safely read entity+0x1D4's animation-table handle at section+0x30 "
+        "-- treating as empty instead of reading past the section (correctionsSoFar=%llu)",
+        rawSize, (unsigned long long)g_section2SizeGuardCorrectionCount + 1);
+    LogDebug(msg);
+    ++g_section2SizeGuardCorrectionCount;
+}
+
+// Hooks the 9 bytes at fnc_link_model_resource_data's "MOV EAX,[RBP+0xC]" (3) + "SUB EAX,ECX" (2)
+// + "TEST EAX,EAX" (2) + "JLE" (2). ECX (blob+8, needed later by "ADD RCX,RBP" at resumeAddr) is
+// never touched by this hook -- only EAX/EDX are used as scratch.
+static bool InstallSection2SizeGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
+                                           unsigned long long emptyPathAddr) {
+    if (g_section2SizeGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[9] = {
+        0x8B, 0x45, 0x0C,   // mov eax, [rbp+0xC]
+        0x2B, 0xC1,          // sub eax, ecx
+        0x85, 0xC0,           // test eax, eax
+        0x7E, 0x26            // jle +0x26 (original short-form jump to the empty path)
+    };
+    if (memcmp(hookPtr, expected, 9) != 0) {
+        LogDebug("InstallSection2SizeGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallSection2SizeGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[96] = {};
+    size_t off = 0;
+    uint64_t logFnAddr = (uint64_t)(uintptr_t)&LogSection2SizeGuardCorrection;
+
+    stub[off++] = 0x8B; stub[off++] = 0x45; stub[off++] = 0x0C; // mov eax, [rbp+0xC]
+    stub[off++] = 0x2B; stub[off++] = 0xC1;                     // sub eax, ecx  (eax = raw section2 size)
+    stub[off++] = 0x89; stub[off++] = 0xC2;                     // mov edx, eax  (save raw size)
+    stub[off++] = 0x85; stub[off++] = 0xC0;                     // test eax, eax
+
+    stub[off++] = 0x0F; stub[off++] = 0x8E; // jle rel32 (patched below) -> tgtEmpty (raw size <= 0, original behavior)
+    size_t jleOperand = off; off += 4;
+
+    stub[off++] = 0x83; stub[off++] = 0xF8; stub[off++] = 0x34; // cmp eax, 0x34
+
+    stub[off++] = 0x0F; stub[off++] = 0x8D; // jge rel32 (patched below) -> tgtResume (size >= 0x34, unchanged behavior)
+    size_t jgeOperand = off; off += 4;
+
+    // 1 <= raw size < 0x34: the case this hook actually corrects. Log it, then fall through
+    // into tgtEmpty (same landing point the jle above uses).
+    stub[off++] = 0x89; stub[off++] = 0xD1;                     // mov ecx, edx  (arg1 = raw size)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, logFnAddr
+    memcpy(stub + off, &logFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    size_t tgtEmpty = off;
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> emptyPathAddr
+    size_t jmpEmptyOperand = off; off += 4;
+
+    size_t tgtResume = off;
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpResumeOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jleRel = (int32_t)((int64_t)(caveBase + tgtEmpty) - (int64_t)(caveBase + jleOperand + 4));
+    memcpy(stub + jleOperand, &jleRel, 4);
+
+    int32_t jgeRel = (int32_t)((int64_t)(caveBase + tgtResume) - (int64_t)(caveBase + jgeOperand + 4));
+    memcpy(stub + jgeOperand, &jgeRel, 4);
+
+    int32_t jmpEmptyRel = (int32_t)((int64_t)emptyPathAddr - (int64_t)(caveBase + jmpEmptyOperand + 4));
+    memcpy(stub + jmpEmptyOperand, &jmpEmptyRel, 4);
+
+    int32_t jmpResumeRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpResumeOperand + 4));
+    memcpy(stub + jmpResumeOperand, &jmpResumeRel, 4);
+
+    unsigned char patch[9];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90; patch[8] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 9, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 9);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 9, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 9);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_section2SizeGuardHookInstalled = true;
+    LogDebug("InstallSection2SizeGuardHook: installed successfully");
+    return true;
+}
+
+// --- RESOLVE-HANDLE BUCKET GUARD HOOK (2026-08-05) -- THE master fix ---
+// fnc_resolve_resource_handle_impl (RVA 0x38AF40) resolves a minted handle via a 64-entry
+// "bucket" table (DAT_142ee3980): top bits of the handle select a bucket (a distinct 32MB-aligned
+// memory region, assigned lazily and NEVER FREED), low 25 bits are an offset within it, combined
+// via bitwise OR (relies on 32MB alignment so the two never overlap).
+//
+// fnc_mint_resource_handle's own bucket-table walk (FUN_14038aee0) has a hard ceiling: if all 64
+// buckets are already claimed by 64 distinct 32MB-aligned regions, minting a handle for a NEW,
+// unmatched region silently returns a handle encoding bucket-index 64 -- one past the end of the
+// real table -- WITHOUT ever registering it. There is no eviction/LRU; the table only ever grows.
+// Later, resolving that handle reads bucket_table[64], past the array's actual bounds, and ORs
+// whatever garbage sits there with the offset -- confirmed LIVE (WER-adjacent game-internal
+// CrashDump.dmp, 2026-08-05) to often just be -1, since bucket_table's own init routine
+// (fnc_resource_handle_bucket_table_init) fills ALL slots to -1 as a "not yet claimed" sentinel,
+// and ORing anything with -1 always yields -1 -- callers then dereference that -1 "pointer"
+// directly with zero validity checking anywhere in the game.
+//
+// This is almost certainly the TRUE root cause behind every -1-handle crash traced this session
+// (crash sites #1-#6, all in the animation/keyframe subsystem) AND the completely unrelated
+// text-rendering use-after-free found the same session -- both are just different callers of
+// fnc_resolve_resource_handle hitting the same underlying exhaustion. The 64-bucket table is
+// shared, global, and never reclaimed, so heavy resource churn from repeated Crowd Control
+// spawn_enemy calls (each minting ~20+ handles) is a very plausible way to exhaust in a single
+// session what normal, room-paced gameplay never would.
+//
+// Fix: after the bucket-index lookup, if the index is out of the real 0-63 range OR the specific
+// bucket slot is still the unclaimed -1 sentinel, return 0 instead of a garbage/-1 value. 0 is the
+// SAME "no data" sentinel fnc_resolve_resource_handle's own fast path already returns for a literal
+// 0 handle, so every caller that already checks "resolved == 0" (the overwhelming majority, per
+// this whole session's tracing) degrades to "no data" cleanly instead of crashing. This protects
+// EVERY caller of fnc_resolve_resource_handle in the entire game at once, not just the handful of
+// individual call sites this file has hooked so far.
+static bool g_resolveHandleBucketGuardHookInstalled = false;
+static volatile uint64_t g_resolveHandleBucketGuardCount = 0;
+
+static void LogResolveHandleBucketGuard(uint32_t maskedHandle) {
+    char msg[224];
+    snprintf(msg, sizeof(msg),
+        "ResolveHandleBucketGuard: handle=0x%08X resolved to an unclaimed/out-of-range resource "
+        "bucket -- the 64-bucket resource-handle table is very likely exhausted. Returning 0 "
+        "instead of a garbage/-1 pointer (hitsSoFar=%llu)",
+        maskedHandle, (unsigned long long)g_resolveHandleBucketGuardCount + 1);
+    LogDebug(msg);
+    ++g_resolveHandleBucketGuardCount;
+}
+
+// --- Bucket memory-validity check (2026-08-05) -- extends the same master fix ---
+// A THIRD failure mode, distinct from "exhausted" (index 64) and "never claimed" (-1 sentinel):
+// live-confirmed via game-internal CrashDump.dmp that a bucket can hold a genuinely real,
+// once-valid 32MB-aligned base whose backing memory was later released -- nothing in the bucket
+// table itself can distinguish that from a still-good bucket, since a mint only ever WRITES an
+// entry when a real pointer was passed in at claim time; there's no unclaim/eviction. The only way
+// to actually know is to ask the OS whether the resulting address is still backed by committed,
+// readable memory -- this is completing fnc_resolve_resource_handle's own contract (it hands back
+// an address without ever having verified the address is real), not a try/except guard bolted onto
+// a caller.
+//
+// VirtualQuery is real kernel-call overhead, and this function is extremely hot (500k+ calls/session
+// just from one caller observed today), so each bucket's validity is cached and only re-checked
+// once every BUCKET_REVALIDATE_INTERVAL accesses TO THAT SPECIFIC BUCKET -- not wall-clock time,
+// not a global counter across all buckets. A bucket can flip from invalid back to valid (a freed
+// region can get legitimately reclaimed by a new, unrelated allocation later), so an invalid result
+// is cached too, not treated as permanent.
+static const int RESOLVE_BUCKET_COUNT = 64;
+static const uint64_t BUCKET_REVALIDATE_INTERVAL = 1024;
+static volatile uint64_t g_bucketMemCheckTick = 0;
+static uint64_t g_bucketLastCheckTick[RESOLVE_BUCKET_COUNT] = {};
+static bool g_bucketLastCheckOk[RESOLVE_BUCKET_COUNT] = {};
+static volatile uint64_t g_bucketMemInvalidCount = 0;
+static volatile uint64_t g_bucketMemCheckCount = 0;
+
+static uint64_t ValidateResolvedBucketAddress(uint64_t bucketIdx, uint64_t candidateAddr) {
+    if (bucketIdx >= (uint64_t)RESOLVE_BUCKET_COUNT) {
+        return candidateAddr; // already guarded elsewhere; be conservative, don't invent new behavior here
+    }
+    uint64_t tick = ++g_bucketMemCheckTick;
+    uint64_t elapsed = tick - g_bucketLastCheckTick[bucketIdx];
+    if (elapsed < BUCKET_REVALIDATE_INTERVAL && g_bucketLastCheckTick[bucketIdx] != 0) {
+        return g_bucketLastCheckOk[bucketIdx] ? candidateAddr : 0;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    SIZE_T res = VirtualQuery((LPCVOID)(uintptr_t)candidateAddr, &mbi, sizeof(mbi));
+    bool ok = (res != 0) && (mbi.State == MEM_COMMIT) && (mbi.Protect != PAGE_NOACCESS) &&
+              ((mbi.Protect & PAGE_GUARD) == 0);
+    g_bucketLastCheckTick[bucketIdx] = tick;
+    g_bucketLastCheckOk[bucketIdx] = ok;
+    ++g_bucketMemCheckCount;
+    if (!ok) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+            "ResolveHandleMemValidation: bucket=%llu addr=0x%llX not committed/readable "
+            "(VirtualQuery result=%llu state=0x%X protect=0x%X) -- underlying memory was very likely "
+            "freed after this bucket was claimed. Returning 0 instead (invalidSoFar=%llu, "
+            "checksSoFar=%llu)",
+            (unsigned long long)bucketIdx, (unsigned long long)candidateAddr, (unsigned long long)res,
+            (unsigned)mbi.State, (unsigned)mbi.Protect, (unsigned long long)g_bucketMemInvalidCount + 1,
+            (unsigned long long)g_bucketMemCheckCount);
+        LogDebug(msg);
+        ++g_bucketMemInvalidCount;
+        return 0;
+    }
+    return candidateAddr;
+}
+
+// Hooks the 17 bytes at fnc_resolve_resource_handle_impl's "SHR RAX,0x19" (4) + "AND ECX,0x1FFFFFF"
+// (6) + "MOV RAX,[RDX+RAX*8]" (4) + "OR RAX,RCX" (3). At hook entry: EAX/RAX already holds the
+// bit31-cleared handle (zero-extended), RBX holds the same value, RDX holds the bucket table base
+// (&DAT_142ee3980). RBX is safe to clobber -- the shared epilogue at resumeAddr POPs the caller's
+// real saved RBX from the stack regardless of this function's own use of the register.
+static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    if (g_resolveHandleBucketGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[17] = {
+        0x48, 0xC1, 0xE8, 0x19,                   // shr rax, 0x19
+        0x81, 0xE1, 0xFF, 0xFF, 0xFF, 0x01,        // and ecx, 0x1FFFFFF
+        0x48, 0x8B, 0x04, 0xC2,                     // mov rax, [rdx+rax*8]
+        0x48, 0x0B, 0xC1                              // or rax, rcx
+    };
+    if (memcmp(hookPtr, expected, 17) != 0) {
+        LogDebug("InstallResolveHandleBucketGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallResolveHandleBucketGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[96] = {};
+    size_t off = 0;
+    uint64_t logFnAddr = (uint64_t)(uintptr_t)&LogResolveHandleBucketGuard;
+
+    stub[off++] = 0x48; stub[off++] = 0xC1; stub[off++] = 0xE8; stub[off++] = 0x19; // shr rax, 0x19
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xF8; stub[off++] = 0x40; // cmp rax, 0x40
+    stub[off++] = 0x0F; stub[off++] = 0x83; // jae rel32 (patched below) -> badHandle
+    size_t jaeOperand = off; off += 4;
+
+    stub[off++] = 0x48; stub[off++] = 0x8B; stub[off++] = 0x0C; stub[off++] = 0xC2; // mov rcx, [rdx+rax*8]
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xF9; stub[off++] = 0xFF; // cmp rcx, -1
+    stub[off++] = 0x0F; stub[off++] = 0x84; // jz rel32 (patched below) -> badHandle
+    size_t jzOperand = off; off += 4;
+
+    // good handle: rax = bucket_table[idx] | (ebx & 0x1FFFFFF)
+    // NOTE: the VirtualQuery-based memory-validity layer (ValidateResolvedBucketAddress) was
+    // tried here and REVERTED 2026-08-05 -- it caused a real, reproducible game freeze in live
+    // testing, almost certainly OS-level VAD-lock contention from calling VirtualQuery this
+    // frequently on a multi-threaded hot path (fnc_resolve_resource_handle is called extremely
+    // often, from more than one thread). A frozen game is worse than the crash this was meant to
+    // prevent. ValidateResolvedBucketAddress/its caching globals are left in the file, unused, in
+    // case a lower-risk way to apply the same idea comes up later (e.g. checked far more rarely,
+    // or off the hot thread entirely) -- do not wire it back into this hot path without solving
+    // the contention risk first.
+    stub[off++] = 0x81; stub[off++] = 0xE3; stub[off++] = 0xFF; stub[off++] = 0xFF; stub[off++] = 0xFF; stub[off++] = 0x01; // and ebx, 0x1FFFFFF
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC8; // mov rax, rcx
+    stub[off++] = 0x48; stub[off++] = 0x0B; stub[off++] = 0xC3; // or rax, rbx
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpGoodOperand = off; off += 4;
+
+    size_t badHandleTarget = off;
+    stub[off++] = 0x89; stub[off++] = 0xD9;                     // mov ecx, ebx  (arg1 = masked handle)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, logFnAddr
+    memcpy(stub + off, &logFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+    stub[off++] = 0x31; stub[off++] = 0xC0; // xor eax, eax
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpBadOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jaeRel = (int32_t)((int64_t)(caveBase + badHandleTarget) - (int64_t)(caveBase + jaeOperand + 4));
+    memcpy(stub + jaeOperand, &jaeRel, 4);
+
+    int32_t jzRel = (int32_t)((int64_t)(caveBase + badHandleTarget) - (int64_t)(caveBase + jzOperand + 4));
+    memcpy(stub + jzOperand, &jzRel, 4);
+
+    int32_t jmpGoodRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpGoodOperand + 4));
+    memcpy(stub + jmpGoodOperand, &jmpGoodRel, 4);
+
+    int32_t jmpBadRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBadOperand + 4));
+    memcpy(stub + jmpBadOperand, &jmpBadRel, 4);
+
+    unsigned char patch[17];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    for (int i = 5; i < 17; ++i) patch[i] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 17, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 17);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 17, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 17);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_resolveHandleBucketGuardHookInstalled = true;
+    LogDebug("InstallResolveHandleBucketGuardHook: installed successfully");
+    return true;
+}
+
+// --- STATUS-EFFECT TEXT SLOT STALE-POINTER FIX (2026-08-05) -- properly re-derive, not a guard ---
+// Root cause (static tracing, confirmed against two live crashes at the identical instruction):
+// fnc_status_effect_activate_by_type resolves a handle from its per-status-type resource table and
+// caches the RESULT -- a raw resolved pointer, not the handle -- into a text-display slot's own
+// +0x98 field, once, at activation time. FUN_1401eba70 (crashed twice today, RVA 0x1EBAAB both
+// times) later dereferences that cached pointer directly, never re-resolving it. Every OTHER
+// resource access traced this whole session re-resolves its handle fresh on every use; this is the
+// one place found that doesn't, which is why it alone goes stale when the underlying memory is
+// later reused for anything else -- the handle itself would still resolve correctly, only the
+// frozen-in-time raw pointer doesn't.
+//
+// Real fix, not a try/except: capture the ORIGINAL handle (not the resolved pointer) at the moment
+// it's minted into a slot, keep it in our own per-slot side table (256 slots, indexed by
+// (slotAddr-tableBase)/0xE0 -- can't safely repurpose bytes in the game's own struct without
+// knowing the full layout), and have the confirmed crash read-site re-resolve fresh from that
+// handle every time instead of trusting the cached pointer -- exactly matching how the rest of the
+// engine already behaves. Falls back to the original cached pointer for any slot this doesn't have
+// a captured handle for, so untracked slots behave exactly as before (no regression risk).
+static const uint64_t TEXT_SLOT_STRIDE = 0xE0;
+static const int TEXT_SLOT_COUNT = 256;
+static uint32_t g_textSlotHandles[TEXT_SLOT_COUNT] = {};
+static bool g_textSlotHandleValid[TEXT_SLOT_COUNT] = {};
+static volatile uint32_t g_pendingStatusEffectHandle = 0;
+
+static volatile uint64_t g_textSlotFreshResolveCount = 0;
+static volatile uint64_t g_textSlotFreshResolveDivergedCount = 0;
+
+// Called from the capture hook, right before fnc_status_effect_activate_by_type resolves the
+// handle into a raw pointer -- just remembers it for the record hook a few instructions later in
+// the same, non-reentrant activation call.
+static void CaptureStatusEffectHandle(uint32_t handle) {
+    g_pendingStatusEffectHandle = handle;
+}
+
+// Called from the record hook, right after the game stores the resolved pointer into slotPtr+0x98
+// -- files the (slot -> original handle) mapping away in our own side table.
+static void RecordTextSlotHandle(uint64_t slotPtr) {
+    if (g_textSlotTableBase == 0 || slotPtr < g_textSlotTableBase) return;
+    uint64_t idx = (slotPtr - g_textSlotTableBase) / TEXT_SLOT_STRIDE;
+    if (idx >= (uint64_t)TEXT_SLOT_COUNT) return;
+    g_textSlotHandles[idx] = g_pendingStatusEffectHandle;
+    g_textSlotHandleValid[idx] = true;
+}
+
+// Called from the fresh-resolve hook at FUN_1401eba70's entry. cachedRawPtr is whatever the game
+// itself already loaded from slotPtr+0x98 -- used as the fallback for any slot we have no captured
+// handle for (never captured, or captured by a code path other than fnc_status_effect_activate_by_type).
+static uint64_t ResolveTextSlotHandleFresh(uint64_t slotPtr, uint64_t cachedRawPtr) {
+    if (g_textSlotTableBase != 0 && slotPtr >= g_textSlotTableBase && g_resolveHandleFnAddrForTextSlot != 0) {
+        uint64_t idx = (slotPtr - g_textSlotTableBase) / TEXT_SLOT_STRIDE;
+        if (idx < (uint64_t)TEXT_SLOT_COUNT && g_textSlotHandleValid[idx]) {
+            typedef uint64_t (*ResolveFn)(uint32_t);
+            ResolveFn resolveFn = (ResolveFn)(uintptr_t)g_resolveHandleFnAddrForTextSlot;
+            uint64_t fresh = resolveFn(g_textSlotHandles[idx]);
+            ++g_textSlotFreshResolveCount;
+            if (fresh != cachedRawPtr) {
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                    "TextSlotFreshResolve: slot=0x%llX cachedPtr=0x%llX freshPtr=0x%llX DIVERGED -- "
+                    "cached pointer was stale, fresh resolve avoided a likely crash "
+                    "(divergedSoFar=%llu, totalSoFar=%llu)",
+                    (unsigned long long)slotPtr, (unsigned long long)cachedRawPtr,
+                    (unsigned long long)fresh, (unsigned long long)g_textSlotFreshResolveDivergedCount + 1,
+                    (unsigned long long)g_textSlotFreshResolveCount);
+                LogDebug(msg);
+                ++g_textSlotFreshResolveDivergedCount;
+            }
+            return fresh;
+        }
+    }
+    return cachedRawPtr;
+}
+
+// Hooks "MOV ECX,[RBX]" (2) + "CALL fnc_resolve_resource_handle" (5) inside
+// fnc_status_effect_activate_by_type, right where it loads the per-status-type handle it's about
+// to resolve and cache. Purely additive -- replicates the original load+call exactly, just taps
+// the handle value on the way through. RBX/the call's behavior are otherwise untouched.
+static bool InstallTextSlotHandleCaptureHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    static bool installed = false;
+    if (installed) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[7] = {
+        0x8B, 0x0B,                                 // mov ecx, [rbx]
+        0xE8, 0x6C, 0xAC, 0x1A, 0x00                // call fnc_resolve_resource_handle (this build's rel32)
+    };
+    if (memcmp(hookPtr, expected, 7) != 0) {
+        LogDebug("InstallTextSlotHandleCaptureHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallTextSlotHandleCaptureHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[64] = {};
+    size_t off = 0;
+    uint64_t captureFnAddr = (uint64_t)(uintptr_t)&CaptureStatusEffectHandle;
+    uint64_t resolveHandleFnAddr = g_resolveHandleFnAddrForTextSlot;
+
+    stub[off++] = 0x8B; stub[off++] = 0x0B; // mov ecx, [rbx]  (arg for the capture call)
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, captureFnAddr
+    memcpy(stub + off, &captureFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0x8B; stub[off++] = 0x0B; // mov ecx, [rbx]  (re-read; RBX unchanged, replicates original arg)
+
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, resolveHandleFnAddr
+    memcpy(stub + off, &resolveHandleFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (replicates original CALL fnc_resolve_resource_handle)
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[7];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; patch[6] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+    memcpy(cave, stub, stubLen);
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 7);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 7);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+    ResumeThreads(threads);
+
+    installed = true;
+    LogDebug("InstallTextSlotHandleCaptureHook: installed successfully");
+    return true;
+}
+
+// Hooks "MOV [RCX+0x98],R15" (7 bytes) inside fnc_status_effect_activate_by_type, right where the
+// resolved pointer gets stored into the slot. Replicates the store, then additionally records
+// (slot=rcx -> the handle CaptureStatusEffectHandle saw a few instructions earlier) into our side
+// table. RCX isn't read again by the original code until it's freshly reloaded from the stack, so
+// it's safe to let our own call clobber it.
+static bool InstallTextSlotHandleRecordHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    static bool installed = false;
+    if (installed) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[7] = {
+        0x4C, 0x89, 0xB9, 0x98, 0x00, 0x00, 0x00 // mov [rcx+0x98], r15
+    };
+    if (memcmp(hookPtr, expected, 7) != 0) {
+        LogDebug("InstallTextSlotHandleRecordHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallTextSlotHandleRecordHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[48] = {};
+    size_t off = 0;
+    uint64_t recordFnAddr = (uint64_t)(uintptr_t)&RecordTextSlotHandle;
+
+    stub[off++] = 0x4C; stub[off++] = 0x89; stub[off++] = 0xB9; // mov [rcx+0x98], r15
+    stub[off++] = 0x98; stub[off++] = 0x00; stub[off++] = 0x00; stub[off++] = 0x00;
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, recordFnAddr
+    memcpy(stub + off, &recordFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax  (rcx already = slot ptr)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[7];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; patch[6] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+    memcpy(cave, stub, stubLen);
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 7);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 7);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+    ResumeThreads(threads);
+
+    installed = true;
+    LogDebug("InstallTextSlotHandleRecordHook: installed successfully");
+    return true;
+}
+
+// Hooks "MOV RSI,[RCX+0x98]" (7 bytes) at FUN_1401eba70's entry -- the confirmed crash site (RVA
+// 0x1EBAAB, hit twice live 2026-08-05). Replaces the raw cached-pointer load with a call to
+// ResolveTextSlotHandleFresh(slotPtr=rcx, cachedRawPtr=[rcx+0x98]), which re-resolves fresh from
+// our captured handle when available, or falls back to the exact original behavior otherwise. RCX
+// (param_1) must survive to the resume point (read again at "MOV R11,[RCX+0xa0]" two instructions
+// later) -- stashed in RBX, which is free scratch here (its incoming value is already preserved by
+// the function's own prologue via a MOV into shadow space, not a register the function itself
+// needs again until it's freshly overwritten much later).
+static bool InstallTextSlotFreshResolveHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    static bool installed = false;
+    if (installed) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[7] = {
+        0x48, 0x8B, 0xB1, 0x98, 0x00, 0x00, 0x00 // mov rsi, [rcx+0x98]
+    };
+    if (memcmp(hookPtr, expected, 7) != 0) {
+        LogDebug("InstallTextSlotFreshResolveHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallTextSlotFreshResolveHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[48] = {};
+    size_t off = 0;
+    uint64_t resolveFreshFnAddr = (uint64_t)(uintptr_t)&ResolveTextSlotHandleFresh;
+
+    stub[off++] = 0x48; stub[off++] = 0x8B; stub[off++] = 0xB1; // mov rsi, [rcx+0x98]  (fallback value)
+    stub[off++] = 0x98; stub[off++] = 0x00; stub[off++] = 0x00; stub[off++] = 0x00;
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xCB; // mov rbx, rcx  (stash param_1)
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xF2; // mov rdx, rsi  (arg2 = cachedRawPtr)
+    // arg1 = rcx, already correct
+
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, resolveFreshFnAddr
+    memcpy(stub + off, &resolveFreshFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xC6; // mov rsi, rax  (result, matches original target reg)
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xD9; // mov rcx, rbx  (restore param_1)
+
+    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[7];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; patch[6] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+    memcpy(cave, stub, stubLen);
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 7);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 7);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+    ResumeThreads(threads);
+
+    installed = true;
+    LogDebug("InstallTextSlotFreshResolveHook: installed successfully");
     return true;
 }
 

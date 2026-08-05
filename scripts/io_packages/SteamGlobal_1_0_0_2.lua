@@ -341,6 +341,43 @@ fnc_skeleton_blend_call_hook = 0x391C70
 -- handle), in a different call tree from the two hooks above. Steam-only,
 -- same reasoning as the addresses above.
 fnc_keyframe_list_entry_hook = 0x3946BF
+-- fnc_keyframe_list_lookup's own entry point ("MOV ECX,[RCX+0x3C]" + "MOV ESI,EDX", 5 bytes) --
+-- see InstallKeyframeListEntryParamGuardHook's comment in dllmain.cpp. CRASH SITE #6, confirmed
+-- live via WER minidump 2026-08-05: fault reading param_1+0x3C when the caller
+-- (fnc_entity_animation_blend_advance) passes an invalid record pointer (observed as literal -1).
+-- This is upstream of (and NOT covered by) fnc_keyframe_list_entry_hook above. Steam-only for now,
+-- same reasoning as the other animation-subsystem hook addresses in this file.
+fnc_keyframe_list_lookup_param_hook = 0x3946A5
+-- Diagnostic-only tap inside fnc_entity_animation_blend_advance (RVA 0x29FB30), right after it
+-- computes the value that (when bad) becomes crash site #6's -1. Logs entity+0x1D0/+0x1D4/+0x168
+-- to kh1_native.log whenever that computed value is -1, to capture the live field values behind
+-- the still-unconfirmed root cause. See InstallAnimBlendAdvanceDiagHook's comment in dllmain.cpp.
+-- Does not change behavior. 2026-08-05.
+fnc_anim_blend_advance_diag_hook = 0x29FB80
+-- Section-2 size check inside fnc_link_model_resource_data ("MOV EAX,[RBP+0xC]" / "SUB EAX,ECX" /
+-- "TEST EAX,EAX" / "JLE", 9 bytes) -- REAL FIX for crash site #6's root cause, not another catch
+-- hook. Corrects the game's own "section has data" check from "size > 0" to "size >= 0x34" (the
+-- minimum needed to safely read the dword at section+0x30 that becomes entity+0x1D4). See
+-- InstallSection2SizeGuardHook's comment in dllmain.cpp. 2026-08-05.
+fnc_link_model_resource_data_section2_check = 0x288593
+-- fnc_resolve_resource_handle_impl's bucket-index lookup ("SHR RAX,0x19" through "OR RAX,RCX",
+-- 17 bytes) -- THE master fix, not another per-call-site guard. The shared 64-bucket
+-- resource-handle table is never freed and can be exhausted by heavy Crowd Control spawn_enemy
+-- churn; once exhausted, ANY caller of fnc_resolve_resource_handle anywhere in the game can get
+-- back a raw -1 "pointer". This corrects the lookup itself so it returns 0 (the same "no data"
+-- sentinel already handled everywhere) instead. See InstallResolveHandleBucketGuardHook's comment
+-- in dllmain.cpp. 2026-08-05.
+fnc_resolve_resource_handle_impl_bucket_check = 0x38AF5C
+-- Status-effect floating-text stale-pointer fix (2026-08-05) -- properly re-derives the value
+-- instead of guarding a bad read. Three coordinated hook points inside
+-- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own
+-- base address (used to index our side table by slot). See
+-- InstallTextSlotHandleCaptureHook/InstallTextSlotHandleRecordHook/InstallTextSlotFreshResolveHook
+-- in dllmain.cpp for the full writeup.
+fnc_status_effect_handle_capture_hook = 0x1E014D
+fnc_status_effect_handle_record_hook = 0x1E0198
+fnc_text_slot_fresh_resolve_hook = 0x1EBA78
+text_slot_table_base = 0x2678280
 -- Base of the shared 96-slot global entity pool (stride 0x4B0/1200 bytes) --
 -- Sora, party members, doors/chests/markers, and every
 -- fnc_spawn_world_gimmick_entity-constructed creature live in it. Confirmed

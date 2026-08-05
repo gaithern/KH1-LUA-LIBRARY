@@ -903,7 +903,11 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         fnc_party_ability_index_resolve_call, charId, weight, template,
         fnc_skeleton_handle_deref_hook, fnc_skeleton_blend_call_hook,
         fnc_keyframe_list_entry_hook, entityPoolBase, soraPointer,
-        g_SoraObjPtr, g_PartyMember1ObjectPtr, g_PartyMember2ObjPtr)
+        g_SoraObjPtr, g_PartyMember1ObjectPtr, g_PartyMember2ObjPtr,
+        fnc_keyframe_list_lookup_param_hook, fnc_anim_blend_advance_diag_hook,
+        fnc_link_model_resource_data_section2_check, fnc_resolve_resource_handle_impl_bucket_check,
+        fnc_status_effect_handle_capture_hook, fnc_status_effect_handle_record_hook,
+        fnc_text_slot_fresh_resolve_hook, text_slot_table_base)
 end
 
 -- Pending spawn_enemy requests
