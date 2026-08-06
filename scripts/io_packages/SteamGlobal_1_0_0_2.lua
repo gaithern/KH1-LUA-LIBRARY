@@ -368,6 +368,15 @@ fnc_link_model_resource_data_section2_check = 0x288593
 -- sentinel already handled everywhere) instead. See InstallResolveHandleBucketGuardHook's comment
 -- in dllmain.cpp. 2026-08-05.
 fnc_resolve_resource_handle_impl_bucket_check = 0x38AF5C
+-- Base of the 64-entry resource-handle bucket table itself (g_apResourceHandleBuckets in Ghidra).
+-- Used by InstallBucketMemoryWatcherThread (dllmain.cpp) -- a background thread, independent of
+-- the hot-path fix above, that periodically VirtualQuery's each claimed bucket and proactively
+-- resets any whose backing memory was freed back to the -1 "unclaimed" sentinel, so the hot-path
+-- guard hook (which already treats -1 as "return 0") catches it with zero added per-call cost.
+-- Closes the one gap the hot-path fix's own comment left open (a bucket pointing at real,
+-- once-valid memory the OS later freed) -- a per-call VirtualQuery check was tried and reverted
+-- the same day for freezing the game; this sidesteps that by checking rarely, off the hot thread.
+resource_handle_bucket_table = 0x2EE3980
 -- Status-effect floating-text stale-pointer fix (2026-08-05) -- properly re-derives the value
 -- instead of guarding a bad read. Three coordinated hook points inside
 -- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own

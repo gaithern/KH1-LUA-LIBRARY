@@ -516,6 +516,7 @@ static bool InstallAnimBlendAdvanceDiagHook(unsigned long long hookAddr, unsigne
 static bool InstallSection2SizeGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
                                            unsigned long long emptyPathAddr);
 static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr);
 static uint64_t g_textSlotTableBase = 0;
 static uint64_t g_resolveHandleFnAddrForTextSlot = 0;
 static bool InstallTextSlotHandleCaptureHook(unsigned long long hookAddr, unsigned long long resumeAddr);
@@ -635,6 +636,11 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long textSlotHandleRecordHookFnRva = (unsigned long long)p_lua_tointegerx(L, 37, nullptr);
     unsigned long long textSlotFreshResolveHookFnRva = (unsigned long long)p_lua_tointegerx(L, 38, nullptr);
     unsigned long long textSlotTableBaseRva = (unsigned long long)p_lua_tointegerx(L, 39, nullptr);
+    // Base of the 64-entry resource-handle bucket table itself (g_apResourceHandleBuckets /
+    // DAT_142ee3980 in Ghidra) -- see InstallBucketMemoryWatcherThread's own comment. Optional,
+    // same degrade-gracefully convention as the other hook RVAs above; unlike those, this isn't a
+    // code hook at all, just a plain data address a background thread reads/writes directly.
+    unsigned long long resourceHandleBucketTableRva = (unsigned long long)p_lua_tointegerx(L, 40, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -757,6 +763,24 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug("spawn_enemy: InstallResolveHandleBucketGuardHook failed to install -- proceeding without it");
         }
     }
+    // DISABLED 2026-08-05, same day it was added -- live-crashed the game on its very
+    // first sweep. Root cause: the check below validates the raw BUCKET BASE (the
+    // handle's pointer with its low 25 bits truncated to 0), not a real resolved
+    // address -- that truncated base is essentially never itself the start of a real
+    // allocation (allocations don't generally start on exact 32MB boundaries), so
+    // VirtualQuery on it routinely reports unmapped/free even for a perfectly valid,
+    // heavily-used bucket. Confirmed live: bucket 0 (base 0x7FF790000000, the 32MB
+    // truncation of the game's own exe module base 0x7FF790BE0000 that session) was
+    // invalidated in the very first sweep, immediately after install -- collateral
+    // damage from that alone (every future resolve of any handle in that whole 32MB
+    // region silently degrading to "no data") is a very plausible explanation for the
+    // crash that followed. ValidateResolvedBucketAddress above avoided this because it
+    // validates the actual resolved base|offset pointer at real resolve time, which
+    // this off-hot-path design never has access to (only the bucket table, not
+    // individual handles). Left installed-but-inert (never called) rather than deleted,
+    // matching this file's existing convention for a tried-and-reverted approach -- do
+    // not re-enable without a real fix for what to actually validate.
+    (void)resourceHandleBucketTableRva;
     if (textSlotTableBaseRva != 0) {
         g_textSlotTableBase = base + textSlotTableBaseRva;
     }
@@ -2719,6 +2743,80 @@ static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, uns
 
     g_resolveHandleBucketGuardHookInstalled = true;
     LogDebug("InstallResolveHandleBucketGuardHook: installed successfully");
+    return true;
+}
+
+// --- BUCKET MEMORY WATCHER THREAD (2026-08-05 follow-up) -- closes the remaining gap ---
+// InstallResolveHandleBucketGuardHook's own comment (and ValidateResolvedBucketAddress just above
+// it) already documents a THIRD failure mode neither that hook nor the exhaustion fix covers: a
+// bucket can hold a genuinely real, once-valid 32MB-aligned base whose backing memory was later
+// freed by the OS -- indistinguishable from a still-good bucket by inspecting the table alone.
+// ValidateResolvedBucketAddress implements the right check (VirtualQuery) but wiring it into the
+// resolve hot path itself caused a real, reproducible game freeze (VAD-lock contention from
+// VirtualQuery on a path called from multiple threads extremely often) and was reverted the same
+// day. That comment explicitly invited "a lower-risk way to apply the same idea... checked far
+// more rarely, or off the hot thread entirely."
+//
+// This is that: move the check entirely OFF the hot path onto a dedicated background thread that
+// sweeps all 64 buckets on a slow timer (default 1s) instead of on every one of
+// fnc_resolve_resource_handle's 500k+ calls/session. A freed bucket sits invalid for at most one
+// sweep interval before being proactively reset to the -1 "unclaimed" sentinel -- which the
+// ALREADY-SHIPPED InstallResolveHandleBucketGuardHook hook already treats as "return 0" on the hot
+// path, so this needs zero hot-path code changes to benefit from. 64 VirtualQuery calls once a
+// second is negligible, and this thread never touches the resolve path or blocks any game thread.
+//
+// A CompareExchange (not a blind write) guards the one real race: if the game's own claim function
+// legitimately re-mints this exact slot between our read and our write (e.g. the freed region gets
+// reused by a new, unrelated allocation and re-claimed for it), we must not clobber that fresh,
+// valid value with a stale -1 -- the exchange only applies if the slot still holds the value we
+// just checked.
+static bool g_bucketWatcherThreadInstalled = false;
+static volatile uint64_t g_bucketWatcherSweepCount = 0;
+static volatile uint64_t g_bucketWatcherInvalidatedCount = 0;
+static const DWORD BUCKET_WATCHER_SLEEP_MS = 1000;
+
+static DWORD WINAPI BucketMemoryWatcherThreadProc(LPVOID param) {
+    volatile int64_t* bucketTable = (volatile int64_t*)param;
+    for (;;) {
+        for (int i = 0; i < RESOLVE_BUCKET_COUNT; ++i) {
+            int64_t candidate = bucketTable[i];
+            if (candidate == -1) continue; // already unclaimed, nothing to check
+
+            MEMORY_BASIC_INFORMATION mbi = {};
+            SIZE_T res = VirtualQuery((LPCVOID)(uintptr_t)candidate, &mbi, sizeof(mbi));
+            bool ok = (res != 0) && (mbi.State == MEM_COMMIT) && (mbi.Protect != PAGE_NOACCESS) &&
+                      ((mbi.Protect & PAGE_GUARD) == 0);
+            if (!ok) {
+                int64_t prev = InterlockedCompareExchange64((volatile LONG64*)&bucketTable[i], -1, candidate);
+                if (prev == candidate) {
+                    char msg[192];
+                    snprintf(msg, sizeof(msg),
+                        "BucketMemoryWatcher: bucket=%d addr=0x%llX no longer committed/readable -- "
+                        "proactively reset to unclaimed (invalidatedSoFar=%llu, sweepsSoFar=%llu)",
+                        i, (unsigned long long)candidate,
+                        (unsigned long long)g_bucketWatcherInvalidatedCount + 1,
+                        (unsigned long long)g_bucketWatcherSweepCount);
+                    LogDebug(msg);
+                    ++g_bucketWatcherInvalidatedCount;
+                }
+            }
+        }
+        ++g_bucketWatcherSweepCount;
+        Sleep(BUCKET_WATCHER_SLEEP_MS);
+    }
+}
+
+static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr) {
+    if (g_bucketWatcherThreadInstalled) return true;
+    HANDLE hThread = CreateThread(nullptr, 0, BucketMemoryWatcherThreadProc,
+                                    (LPVOID)(uintptr_t)bucketTableAddr, 0, nullptr);
+    if (!hThread) {
+        LogDebug("InstallBucketMemoryWatcherThread: CreateThread failed");
+        return false;
+    }
+    CloseHandle(hThread); // fire-and-forget -- the thread outlives this handle
+    g_bucketWatcherThreadInstalled = true;
+    LogDebug("InstallBucketMemoryWatcherThread: installed successfully");
     return true;
 }
 

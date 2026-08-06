@@ -315,6 +315,17 @@ fnc_velocity_blend_util = 0x2B3CB0
 fnc_party_ability_index_resolve_call = 0x1D4192
 fnc_iterate_live_entities = 0x28F990
 
+-- Base of the 64-entry resource-handle bucket table (DAT_142ee4730 in Ghidra -- confirmed via
+-- decompiling this build's own fnc_resolve_resource_handle_impl at RVA 0x38B230, identical decode
+-- formula to Steam). Only the data address is ported here; fnc_resolve_resource_handle_impl_bucket_check
+-- (the hot-path exhaustion-guard HOOK this address's watcher thread is meant to complement -- see
+-- SteamGlobal_1_0_0_2.lua's comment) has NOT been located/ported to EGS yet, so
+-- InstallBucketMemoryWatcherThread still runs here and still prevents dereferencing genuinely-freed
+-- memory (resets it to -1 instead), but a bucket that's merely EXHAUSTED (not freed) still resolves
+-- to a raw -1 pointer on this build with nothing downstream to catch it -- weaker than Steam until
+-- the guard hook itself is ported. 2026-08-05.
+resource_handle_bucket_table = 0x2EE4730
+
 fnc_show_item_message = 0x2712A0
 fnc_item_popup_text_hook = 0x27141C
 fnc_item_popup_text_resume = 0x271424
