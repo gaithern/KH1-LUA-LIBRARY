@@ -285,6 +285,11 @@ static bool AnyEnemyTooCloseToSora(unsigned long long base, unsigned long long e
 // Cached filename string (+4) tells reuse from collision for that slot.
 static const int LOADED_SPECIES_STRIDE = 0x50;
 static const int LOADED_SPECIES_STATE_OFFSET_FROM_PTR = -0x45;
+// The state byte climbs 0..6 across frames as an async asset load progresses; 6 means fully
+// loaded and safe to construct from. Everything below is "still in flight" -- the value the
+// existing readiness check has always compared against (`*stateAddr != 6`), named here because
+// ReuseSlotIsSafe now needs it too.
+static const uint8_t SPECIES_SLOT_STATE_READY = 6;
 // Slot+0 and slot+1 (i.e. ptr-0x48 / ptr-0x47, since the state byte at slot+3 is ptr-0x45):
 // FUN_140286190 stamps OWNER=species into slot+0 and RUN LENGTH=record[0x56] into slot+1 for EVERY
 // slot in a claimed run. Critically it does NOT touch the state byte at slot+3, which only the
@@ -840,6 +845,28 @@ static bool SpeciesRunStillIntact(unsigned long long base, unsigned long long lo
 // releasing a run we have just proven we do not fully own.
 static bool ReuseSlotIsSafe(unsigned long long base, unsigned long long loadedPtrTableRva,
                             uint8_t species, const char* modelPath, const char* via) {
+    // A SLOT WHOSE LOAD IS STILL IN FLIGHT IS NOT A BROKEN RUN (fixed 2026-08-11).
+    //
+    // The ownership test below asks "is every slot of this run still owned by us?". That question
+    // is only meaningful once the loader has actually CLAIMED the run. Asset loads here are
+    // asynchronous -- the state byte climbs 0..6 across many frames -- and the owner bytes are not
+    // written until it completes. Applying the test during that window made a still-loading run
+    // look broken, so every retry frame abandoned it and triggered a FRESH load into the next free
+    // slot. Measured consequence: bursts of 20-35 loads of the SAME model into consecutive slot
+    // runs within a single second (xa_ex_2160 alone: 153 loads in one session), which exhausts the
+    // slot window, litters memory with half-written copies of the same creature, and makes it a
+    // lottery which copy an entity's handles end up bound to.
+    //
+    // So: only judge intactness once the slot reports fully loaded. While it is still loading,
+    // trust our own triggered-load record and let the caller wait for it -- which is what the
+    // "asset load not ready yet, caller should retry next frame" path already exists to do.
+    volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+        LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+    uint8_t state = *stateAddr;
+    if (state != 0 && state < SPECIES_SLOT_STATE_READY) {
+        return true; // load in progress -- not ours to second-guess yet
+    }
+
     int runLen = LoadedSlotRunLen(base, loadedPtrTableRva, species);
     if (SpeciesRunStillIntact(base, loadedPtrTableRva, species, runLen)) return true;
     char msg[240];
@@ -1193,15 +1220,28 @@ static void RecordSpawnedEntity(unsigned long long entityPtr, uint32_t id, uint8
 
 // The decisive check. Re-reads each tracked spawn's slot and reports whether the cached model
 // filename still matches what it was when we constructed from it.
-static void LogSpawnedEntitySlotIntegrity(const char* reason) {
+// liveRowsOnly: log only rows for creatures that are still LIVE (plus the summary). Used for the
+// every-room-change sampling, where the full 16-row dump would be mostly STALE noise and would
+// bury the one line that can carry evidence.
+//
+// WHY THE SAMPLING EXISTS AT ALL (2026-08-11): this check originally ran ONLY from
+// NoteFirstGuardFault -- a one-shot that fires at the first guard fault, i.e. only ever when
+// something has already gone wrong. Every observation of "LIVE creature + owner==0xFF" therefore
+// came from a crash, and was then treated as the cause. That is selection bias: the test never
+// once sampled a HEALTHY transition, so there was no denominator. If the same condition also
+// occurs on the many transitions that do not crash, it is background noise rather than the
+// mechanism. Sampling on every detected room change supplies the missing baseline.
+static void LogSpawnedEntitySlotIntegrity(const char* reason, bool liveRowsOnly = false) {
     if (g_slotMapBase == 0 || g_slotMapLoadedPtrTableRva == 0) return;
     int n = g_trackedSpawnCount < MAX_TRACKED_SPAWNS ? g_trackedSpawnCount : MAX_TRACKED_SPAWNS;
     if (n == 0) return;
 
-    char hdr[192];
-    snprintf(hdr, sizeof(hdr),
-        "spawn_enemy: --- EVICTION TEST (%s): re-checking %d tracked spawn(s) ---", reason, n);
-    LogDebug(hdr);
+    if (!liveRowsOnly) {
+        char hdr[192];
+        snprintf(hdr, sizeof(hdr),
+            "spawn_enemy: --- EVICTION TEST (%s): re-checking %d tracked spawn(s) ---", reason, n);
+        LogDebug(hdr);
+    }
 
     // LIVENESS IS THE WHOLE POINT (fixed 2026-08-11 -- the first version of this test omitted it
     // and produced a false CONFIRMED). A dead creature's slot being reused later is completely
@@ -1255,21 +1295,27 @@ static void LogSpawnedEntitySlotIntegrity(const char* reason) {
         else if (released)      verdict = "<<< SLOT RELEASED (blob WIPED) WHILE THIS CREATURE IS STILL LIVE";
         else                    verdict = "<<< SLOT REUSED WHILE THIS CREATURE IS STILL LIVE";
 
-        char line[320];
-        snprintf(line, sizeof(line),
-            "  %s entity=0x%llX id=0x%X species=%d runLen=%d spawned-as=%-20s now=%-20s owner=%-3d  %s",
-            state, rec.entityPtr, rec.id, (int)rec.species, (int)rec.runLen, rec.modelPath, nowName,
-            (int)owner, verdict);
-        LogDebug(line);
+        if (!liveRowsOnly || isLive) {
+            char line[320];
+            snprintf(line, sizeof(line),
+                "  %s entity=0x%llX id=0x%X species=%d runLen=%d spawned-as=%-20s now=%-20s owner=%-3d  %s",
+                state, rec.entityPtr, rec.id, (int)rec.species, (int)rec.runLen, rec.modelPath, nowName,
+                (int)owner, verdict);
+            LogDebug(line);
+        }
     }
-    char tail[320];
+    char tail[352];
     snprintf(tail, sizeof(tail),
-        "spawn_enemy: --- EVICTION TEST result: live=%d retired=%d stale=%d; "
-        "%d slot(s) RELEASED-or-REUSED under a LIVE creature. %s ---",
-        live, retired, stale, evictedUnderLive,
+        "SlotIntegrity[%s]: live=%d retired=%d stale=%d; %d slot(s) RELEASED-or-REUSED under a LIVE "
+        "creature.%s",
+        reason, live, retired, stale, evictedUnderLive,
+        // Deliberately NOT worded as a verdict any more. A single observation cannot distinguish
+        // cause from coincidence; what matters is the RATE across crashing vs healthy transitions,
+        // which is why this now also samples on every room change. Compare the two before drawing
+        // any conclusion from an individual line.
         evictedUnderLive > 0
-            ? "CONFIRMED -- the engine pulled a species slot out from under a live creature"
-            : "Not seen this time (every loss was of an already-retired creature, which is normal)");
+            ? "  <-- slot pulled from under a LIVE creature (count the healthy transitions too before calling this causal)"
+            : "");
     LogDebug(tail);
 }
 
@@ -1808,6 +1854,13 @@ extern "C" int l_spawn_enemy(void* L) {
         int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
         if (g_lastSpawnRoomValid &&
             (curWorld != g_lastSpawnRoomWorld || curArea != g_lastSpawnRoomArea || curSet != g_lastSpawnRoomSet)) {
+            // Sample BEFORE ReclaimOwnSlotRuns, so what is logged is the state the ENGINE left
+            // behind, not something our own reclaim just did. This is the healthy-transition
+            // baseline the guard-fault one-shot could never provide -- see
+            // LogSpawnedEntitySlotIntegrity's comment. Live rows only: the full dump here would be
+            // mostly stale records and would drown the line that matters.
+            LogSpawnedEntitySlotIntegrity("room change", true);
+
             ReclaimOwnSlotRuns(base, loadedPtrTableRva, releaseSpeciesSlotRunFnRva);
             // A creature we spawned in the previous room cannot still be alive here, so the stale
             // entity pointer from it is meaningless now -- stop re-reading it (it was already
