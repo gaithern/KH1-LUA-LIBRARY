@@ -867,6 +867,58 @@ end
 -- # Advanced: Enemy Spawns # --
 -- ########################## --
 
+--[[Human text for each short refusal code kh1_native.spawn_enemy returns.
+
+These sentences are deliberately written HERE, in Lua, rather than being taken
+from the long message the native side also returns. That long message is not
+reliably readable: a string pushed from native and then read back through Lua's
+own string library (string.format/tostring/json.encode) comes back empty or
+truncated mid-word -- measured at 236 empty out of 319 failure lines in
+KH1-CROWDCONTROL's log, with the SAME message arriving intact on some calls and
+blank on others. Anything shown to a user must therefore originate in Lua; the
+native side only supplies a short code used as a table key below.]]
+local SPAWN_FAILURE_MESSAGES = {
+    bad_args          = "spawn_enemy: model_path/motion_path are required",
+    unconfigured      = "spawn_enemy: this game build is missing an address this feature needs",
+    handles_full      = "spawn_enemy: too many distinct resources loaded this session -- restart the game to clear them",
+    table_invalid     = "spawn_enemy: the room isn't in a spawnable state right now -- try again in a moment",
+    too_close         = "spawn_enemy: another enemy is already too close to Sora -- refusing to spawn on top of it",
+    no_creature_data  = "spawn_enemy: no offline data for this creature (missing from kh1_creature_data.lua)",
+    hook_install_fail = "spawn_enemy: the safety hooks failed to install -- refusing rather than spawn unprotected",
+    slot_collision    = "spawn_enemy: that creature's slot is already used by a different creature in this room",
+    -- NOT "only a restart reclaims them" (the wording before 2026-08-11). On-demand reclamation
+    -- is enabled again, and it has already run by the time this refusal is produced, so this
+    -- means "nothing reclaimable right now", not "nothing ever". Slots come back as spawned
+    -- creatures are defeated and on room changes. Unlike handles_full above, which really is
+    -- restart-only -- nothing in the game ever frees a resource-handle bucket.
+    slots_full        = "spawn_enemy: no creature slots free right now -- each creature type claims several. They come back as spawned enemies are defeated, or when you change rooms.",
+    alloc_fail        = "spawn_enemy: out of memory building the placement table",
+    run_slot_taken    = "spawn_enemy: this creature needs several consecutive slots and one of them is already in use",
+    load_threw        = "spawn_enemy: the asset load threw an exception",
+    blob_invalid      = "spawn_enemy: this creature's resource data isn't valid in this room right now -- try again after re-entering the room",
+    ctor_threw        = "spawn_enemy: the game's own constructor threw an exception",
+    ctor_refused      = "spawn_enemy: the room's concurrent-enemy budget is full right now -- try again after some are defeated",
+    -- Not a failure to fix -- a deliberate per-room block (see g_spawnRoomBlacklist in
+    -- native/KH1Native/dllmain.cpp). Worded so a viewer reads it as "not here" rather than
+    -- "something broke", since it will never succeed on retry in that room.
+    room_blacklisted  = "spawn_enemy: enemy spawning is turned off in this room",
+}
+
+local function describe_spawn_failure(code, native_message)
+    --[[Turns the native refusal into text that is safe to display. Falls back
+    progressively, because `code` is itself a native-pushed string and so is not
+    guaranteed to survive either -- it is short, which is what the surviving
+    values in this environment have in common, but that is an observation rather
+    than a guarantee.]]
+    local text = code and SPAWN_FAILURE_MESSAGES[code]
+    if text then return text end
+    if code and code ~= "" then
+        return "spawn_enemy: refused (" .. code .. ") -- see kh1_native.log for the full reason"
+    end
+    if native_message and native_message ~= "" then return native_message end
+    return "spawn_enemy: refused, reason did not survive the native/Lua boundary -- see kh1_native.log"
+end
+
 local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
     --[[Single-attempt primitive behind spawn_enemy. Spawns a Heartless (or
     other placement-table-driven entity) at an arbitrary world position via
@@ -952,7 +1004,9 @@ local function update_spawn_enemy()
     every frame from your own script's _OnFrame -- see spawn_enemy's comment
     for why this can't happen automatically.]]
     for id, req in pairs(pending_spawn_requests) do
-        local ok, result, stillLoading = spawn_enemy_attempt(req.model_path, req.motion_path, req.x, req.y, req.z)
+        -- 4th value is the short refusal code (see SPAWN_FAILURE_MESSAGES); it
+        -- is nil on success and on the still-loading paths.
+        local ok, result, stillLoading, code = spawn_enemy_attempt(req.model_path, req.motion_path, req.x, req.y, req.z)
         if stillLoading then
             if stillLoading == "cutscene" then
                 -- A cutscene started after this request was already queued
@@ -973,7 +1027,16 @@ local function update_spawn_enemy()
         else
             pending_spawn_requests[id] = nil
             if req.callback then
-                req.callback(ok, result)
+                if ok then
+                    -- result is the spawned entity's pointer.
+                    req.callback(true, result)
+                else
+                    -- Hand callers Lua-authored text rather than the native
+                    -- message, which frequently arrives empty or truncated --
+                    -- see SPAWN_FAILURE_MESSAGES. The raw native message is
+                    -- still passed third for anyone who wants it.
+                    req.callback(false, describe_spawn_failure(code, result), result)
+                end
             end
         end
     end

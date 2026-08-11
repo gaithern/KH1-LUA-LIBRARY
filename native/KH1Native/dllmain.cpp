@@ -332,12 +332,60 @@ static volatile bool g_lastQueuedGimmickRoomIdentityValid = false;
 // slot -- catches a retry frame re-entering while a load is still in
 // flight (the engine's own state byte can't distinguish "loading" from
 // "never started"). Checked before FindLoadedSlotByFilename.
+// --- ROOM BLACKLIST ---
+// Rooms where spawn_enemy refuses outright, matched on world + an INCLUSIVE area range.
+// The Set number is deliberately not part of the match -- see the check site's comment.
+//
+// Add an entry as { world, areaMin, areaMax, "label", "why" }. For a single area, pass the same
+// number for min and max. `why` is written into kh1_native.log on every refusal, so record the
+// actual reason rather than "requested" -- a future session reading this needs to know whether
+// the room can ever be un-blacklisted.
+//
+// This replaces the old COLD_SPAWN_CRASH_WORLD/AREA/SET single-room guard (removed 2026-08-05
+// once the bucket-exhaustion root cause was fixed). That one was a hardcoded triple compared
+// inline; this is a table so entries can be added without touching the check.
+struct BlacklistedRoomRange {
+    int32_t world;
+    int32_t areaMin;
+    int32_t areaMax;
+    const char* label;
+    const char* why;
+};
+static const BlacklistedRoomRange g_spawnRoomBlacklist[] = {
+    // Requested by the user 2026-08-11. World 16 areas 3..13, every set.
+    // NOT diagnosed as a crash -- added as a deliberate content decision, not a workaround for a
+    // known bug, so do not remove it on the grounds that "the underlying crash is fixed".
+    { 16, 3, 13, "world 16 areas 3-13", "spawning disabled here by request" },
+};
+
 struct TriggeredLoadEntry {
     char modelPath[64];
     uint8_t species;
     // How many consecutive slots this creature's load claimed (record+0x56). Needed so the
     // room-change reclamation below knows the full extent of what we took, not just its first slot.
     uint8_t runLen;
+    // LOAD-IDENTITY TOKEN (2026-08-11) -- the loadedSpeciesPtrTable pointer this slot held
+    // immediately after OUR load triggered. See LoadedSlotToken/TriggeredLoadStillOurs.
+    //
+    // Why: before this, "is this run still ours?" was answered by model filename + start index
+    // + owner bytes. None of those distinguish OUR load from a NATIVE one that happens to have
+    // the same model at the same start index -- they would be byte-identical. That matters
+    // because ReclaimOwnSlotRuns runs LAZILY (only on the next spawn_enemy call, by which point
+    // the new room has already loaded and re-tiled the slot table), so it can walk a stale
+    // entry against a freshly-loaded room and release a run the ROOM owns, wiping its resource
+    // blob. Not observed in any log so far -- it needs the same model AND the same start index
+    // to collide -- but nothing in the old checks prevents it.
+    //
+    // A pointer is the right shape for this: a fresh load allocates new backing memory, so a
+    // reload into the same slot changes it. Cross-checked against real log data before being
+    // written -- species 57 carried rec+0x60=0xa6a67680, then 0xa6a67280 after a reload, then
+    // 0xa6a67280 again on a reuse with no reload.
+    unsigned long long loadToken;
+    // GetTickCount64() when this load was recorded. Only used to report a run's age in the
+    // release log, so a freeze that follows a release can be judged against the measured
+    // ~20-second lifetime of a spawned creature -- releasing a 3-second-old run is far more
+    // suspicious than releasing a 5-minute-old one.
+    unsigned long long recordedTick;
 };
 static const int MAX_TRIGGERED_LOADS = 64;
 static TriggeredLoadEntry g_triggeredLoads[MAX_TRIGGERED_LOADS];
@@ -353,15 +401,71 @@ static bool FindTriggeredLoad(const char* modelPath, uint8_t* outSpecies) {
     return false;
 }
 
+// The loadedSpeciesPtrTable pointer a species slot currently holds. This is the slot's own
+// per-load resource pointer (the table entry itself -- every other field in this structure is
+// addressed at a NEGATIVE offset from it), so it changes whenever the slot is reloaded.
+// Used as the load-identity token; see TriggeredLoadEntry::loadToken.
+static unsigned long long LoadedSlotToken(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                          uint8_t species) {
+    return *(volatile unsigned long long*)(uintptr_t)(base + loadedPtrTableRva +
+        (size_t)species * LOADED_SPECIES_STRIDE);
+}
+
+// Is this recorded entry still describing OUR load, rather than a native one that happens to
+// sit at the same slot with the same model? Compares the load-identity token captured when we
+// triggered the load against what the slot holds now.
+//
+// FAILS SAFE BY DESIGN: a mismatch means "don't touch it", so if the token turns out to be less
+// stable than believed, the cost is runs we decline to reclaim -- i.e. today's capacity
+// behaviour -- and never a wrongly-released run. That asymmetry is deliberate; a false positive
+// here wipes a live resource blob, a false negative only leaks a slot.
+static bool TriggeredLoadStillOurs(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                   const TriggeredLoadEntry& entry) {
+    if (entry.loadToken == 0) return false; // not captured yet -- refuse to guess
+    return LoadedSlotToken(base, loadedPtrTableRva, entry.species) == entry.loadToken;
+}
+
+// RecordTriggeredLoad runs at the moment the load is TRIGGERED, which is several frames before
+// the load finishes -- the slot's pointer is typically still 0 then (the log's usual "asset load
+// for species=N not ready yet (state=0)" line). Capturing 0 would leave the entry permanently
+// unmatched, and since TriggeredLoadStillOurs fails safe that would silently disable ALL
+// reclamation. So the token is filled in on the first later call that finds the slot populated,
+// which is any spawn that gets far enough to construct.
+static void EnsureTriggeredLoadToken(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                     uint8_t species) {
+    for (int i = 0; i < g_triggeredLoadCount; ++i) {
+        if (g_triggeredLoads[i].species != species) continue;
+        if (g_triggeredLoads[i].loadToken != 0) return;
+        unsigned long long tok = LoadedSlotToken(base, loadedPtrTableRva, species);
+        if (tok == 0) return; // still not populated -- try again on a later call
+        g_triggeredLoads[i].loadToken = tok;
+        char msg[200];
+        snprintf(msg, sizeof(msg),
+            "spawn_enemy: captured load token for species=%d (%s) once its slot was populated: 0x%llX",
+            (int)species, g_triggeredLoads[i].modelPath, tok);
+        LogDebug(msg);
+        return;
+    }
+}
+
 // Entries stay valid for the rest of the session, even once the load
 // completes.
-static void RecordTriggeredLoad(const char* modelPath, uint8_t species, uint8_t runLen) {
+static void RecordTriggeredLoad(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                const char* modelPath, uint8_t species, uint8_t runLen) {
     if (g_triggeredLoadCount >= MAX_TRIGGERED_LOADS) return;
     TriggeredLoadEntry& entry = g_triggeredLoads[g_triggeredLoadCount];
     strncpy_s(entry.modelPath, modelPath, _TRUNCATE);
     entry.species = species;
     entry.runLen = runLen;
+    entry.loadToken = LoadedSlotToken(base, loadedPtrTableRva, species);
+    entry.recordedTick = GetTickCount64();
     g_triggeredLoadCount++;
+
+    char msg[200];
+    snprintf(msg, sizeof(msg),
+        "spawn_enemy: recorded triggered load species=%d runLen=%d model=%s loadToken=0x%llX",
+        (int)species, (int)runLen, modelPath, entry.loadToken);
+    LogDebug(msg);
 }
 
 // --- ROOM-CHANGE SLOT RECLAMATION (2026-08-10) ---
@@ -407,6 +511,22 @@ static void ReclaimOwnSlotRuns(unsigned long long base, unsigned long long loade
         const TriggeredLoadEntry& entry = g_triggeredLoads[i];
         int runLen = (int)entry.runLen;
         if (runLen < 1) runLen = 1;
+
+        // Identity first: filename+index alone cannot tell our load from a native one that
+        // landed on the same slot with the same model (see TriggeredLoadEntry::loadToken).
+        // This check matters most HERE, because this function runs lazily after a room change
+        // -- by which point the new room has already re-tiled the table.
+        if (!TriggeredLoadStillOurs(base, loadedPtrTableRva, entry)) {
+            char idMsg[200];
+            snprintf(idMsg, sizeof(idMsg),
+                "spawn_enemy: slot %d (%s) no longer carries our load token (0x%llX, now 0x%llX) -- "
+                "a different load owns it now, leaving it alone",
+                (int)entry.species, entry.modelPath, entry.loadToken,
+                LoadedSlotToken(base, loadedPtrTableRva, entry.species));
+            LogDebug(idMsg);
+            ++skippedRuns;
+            continue;
+        }
 
         unsigned long long primaryPtr = base + loadedPtrTableRva + (size_t)entry.species * LOADED_SPECIES_STRIDE;
         const char* cachedName = (const char*)(uintptr_t)(primaryPtr + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR);
@@ -494,12 +614,30 @@ static void ReclaimOwnSlotRuns(unsigned long long base, unsigned long long loade
 // release already runs on every room change via ReclaimOwnSlotRuns (live-confirmed working
 // since 2026-08-10), so the OPERATION is not new here, only its timing.
 //
-// Flip to true to re-test. Turning it off restores the pre-2026-08-11 behaviour, which means
-// the ~7-creature-per-session slot cap comes back -- a refusal is strictly better than a freeze
-// while the cause is unknown. Left inert rather than deleted, per this file's own convention
-// for tried-but-unproven fixes (ValidateResolvedBucketAddress, InstallBucketMemoryWatcherThread,
-// InstallFreezeWatchdogThread).
-static const bool ENABLE_ON_DEMAND_SLOT_RECLAIM = false;
+// RE-ENABLED 2026-08-11 (second attempt), now that every release is additionally gated on the
+// load-identity token (TriggeredLoadEntry::loadToken). READ THIS BEFORE READING THE RESULT:
+//
+// The token closes a DIFFERENT hole than the one suspected of causing the freeze above. It stops
+// us releasing a run that is not ours at all -- a NATIVE run that happens to sit at the same slot
+// with the same model, which the old filename+index+owner checks could not distinguish from our
+// own load. That was a real reachable defect, but it is NOT the freeze mechanism described above.
+//
+// The freeze suspicion is that OUR OWN still-alive creature gets misjudged as dead, because
+// MarkSpeciesInUseByLiveEntities cannot see an entity whose handle fails to resolve. The token
+// does not help there at all: the entry genuinely IS ours, so the token matches, and the blob is
+// wiped under a live creature exactly as before. Do not read "token added" as "freeze fixed".
+//
+// So this is deliberately a real A/B test, not a fix being shipped as safe. If the freeze
+// reappears, the mechanism is now much easier to pin down: every release logs the species, model,
+// token and age of the run immediately before fnc_release_species_slot_run is called, so the
+// last line before the log stops naming a specific released run is strong evidence FOR this
+// function, and its absence is strong evidence AGAINST (i.e. the unrelated long-standing freeze).
+// The targeted follow-up if that happens is a grace period -- require a run to look dead for
+// several consecutive checks before releasing it -- which attacks the actual suspected cause.
+//
+// Flip back to false to restore the pre-2026-08-11 behaviour and the ~7-creature-per-session slot
+// cap; a refusal is strictly better than a freeze while the cause is unknown.
+static const bool ENABLE_ON_DEMAND_SLOT_RECLAIM = true;
 
 static int ReclaimDeadSlotRuns(unsigned long long base, unsigned long long loadedPtrTableRva,
                                unsigned long long releaseFnRva,
@@ -533,6 +671,14 @@ static int ReclaimDeadSlotRuns(unsigned long long base, unsigned long long loade
         }
         if (inUse) { g_triggeredLoads[out++] = entry; continue; }
 
+        // Same identity gate as ReclaimOwnSlotRuns -- see TriggeredLoadEntry::loadToken.
+        // Keep tracking the entry rather than dropping it: the slot is not ours to free, but
+        // forgetting it would let FindTriggeredLoad hand this model that slot again later.
+        if (!TriggeredLoadStillOurs(base, loadedPtrTableRva, entry)) {
+            g_triggeredLoads[out++] = entry;
+            continue;
+        }
+
         unsigned long long primaryPtr = base + loadedPtrTableRva + (size_t)entry.species * LOADED_SPECIES_STRIDE;
         const char* cachedName = (const char*)(uintptr_t)(primaryPtr + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR);
         if (strncmp(cachedName, entry.modelPath, LOADED_SPECIES_MODEL_NAME_SIZE) != 0) {
@@ -548,6 +694,23 @@ static int ReclaimDeadSlotRuns(unsigned long long base, unsigned long long loade
             if (*owner != entry.species) { stillOurs = false; break; }
         }
         if (!stillOurs) { g_triggeredLoads[out++] = entry; continue; }
+
+        // Logged BEFORE the release, deliberately. fnc_release_species_slot_run wipes the
+        // species' resource-blob range, and the freeze this function is on trial for leaves no
+        // other trace -- the log simply stops with no guard hits. A line written after the call
+        // would never appear for the one release that mattered. If the log's final line is this
+        // one, this function is the prime suspect and `age` says how plausible "already dead"
+        // was; if the log ends on an ordinary spawn line with no release logged, that points
+        // away from this function and back at the long-standing unrelated freeze.
+        {
+            unsigned long long ageMs = GetTickCount64() - entry.recordedTick;
+            char relMsg[224];
+            snprintf(relMsg, sizeof(relMsg),
+                "spawn_enemy: RELEASING dead run species=%d runLen=%d model=%s token=0x%llX age=%llus "
+                "-- no live entity found in the run; blob range will be wiped",
+                (int)entry.species, runLen, entry.modelPath, entry.loadToken, ageMs / 1000);
+            LogDebug(relMsg);
+        }
 
         unsigned long long releaseArgs[2] = { (unsigned long long)entry.species, (unsigned long long)runLen };
         unsigned long long releaseResult = 0;
@@ -632,6 +795,63 @@ static bool FindLoadedSlotByFilename(unsigned long long base, unsigned long long
     return false;
 }
 
+// The engine's own recorded run length for a loaded species slot (the loader writes
+// record+0x56's value here). Clamped to >=1 so a zeroed/garbage byte degrades to
+// "just the primary slot" rather than skipping the run check entirely.
+static int LoadedSlotRunLen(unsigned long long base, unsigned long long loadedPtrTableRva, uint8_t species) {
+    volatile uint8_t* runLenAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+        LOADED_SPECIES_RUNLEN_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+    int runLen = (int)*runLenAddr;
+    return runLen < 1 ? 1 : runLen;
+}
+
+// Is every slot of this species' run still owned by that species?
+// Same end-to-end ownership test ReclaimOwnSlotRuns and FindFreeLoadedSlot already apply --
+// factored out here so the REUSE paths can apply it too (see ReuseSlotIsSafe).
+static bool SpeciesRunStillIntact(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                  uint8_t species, int runLen) {
+    for (int k = 0; k < runLen; ++k) {
+        int slot = (int)species + k;
+        if (slot > RESOURCE_BLOB_MAX_SPECIES) return false;
+        volatile uint8_t* owner = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+            LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+        if (*owner != species) return false;
+    }
+    return true;
+}
+
+// Gate on both reuse paths, added 2026-08-11 after a live crash.
+//
+// FindTriggeredLoad and FindLoadedSlotByFilename both identify a slot by its PRIMARY entry
+// alone -- a filename match plus (for the latter) state != 0. Neither re-checks that the
+// rest of the creature's run is still ours, even though a creature's resource blob spans
+// its WHOLE run. That gap crashed the game on 2026-08-11 08:06:39: species 57 was loaded
+// with a 4-slot run (57..60) at 08:01:39; slot 60 was later handed to a different creature
+// as the start of ITS run (60..63) at 08:05:49; then at 08:06:39 the filename scan found
+// slot 57 still named xa_ex_2230.mdls and reused it with needsLoad=0 and the SAME minted
+// handles as five minutes earlier. The blob-header validator passed legitimately -- it reads
+// the PRIMARY slot's header, which was intact; the damage was in the run's tail. Construction
+// then hit a skeleton-blend exception, a float-shaped bogus handle, and null keyframe lists,
+// and the process died. (Bucket table was 34/64 at the time -- this was not exhaustion.)
+//
+// Returns false to mean "do not reuse", which lets the caller fall through to the fresh-load
+// path rather than refusing outright, so this costs a reload rather than a failed spawn.
+// The broken run stays claimed and leaks a slot -- accepted, since the alternative is
+// releasing a run we have just proven we do not fully own.
+static bool ReuseSlotIsSafe(unsigned long long base, unsigned long long loadedPtrTableRva,
+                            uint8_t species, const char* modelPath, const char* via) {
+    int runLen = LoadedSlotRunLen(base, loadedPtrTableRva, species);
+    if (SpeciesRunStillIntact(base, loadedPtrTableRva, species, runLen)) return true;
+    char msg[240];
+    snprintf(msg, sizeof(msg),
+        "spawn_enemy: slot %d (%s, found via %s) is NOT owned end-to-end any more -- part of its "
+        "%d-slot run was re-taken by something else, so its blob is only partly ours. Refusing to "
+        "reuse it; falling through to a fresh load.",
+        (int)species, modelPath, via, runLen);
+    LogDebug(msg);
+    return false;
+}
+
 // The slot-scan helpers don't know if the current room already uses a slot
 // number for something else -- resolves record+0x60's handle to a real
 // string pointer for comparison.
@@ -646,6 +866,14 @@ static bool ResolvedModelMatches(unsigned long long resolveFnAddr, uint32_t mode
 // A room's own native record of the SAME creature being spawned is fine --
 // only a same-species record belonging to a genuinely different creature
 // (resolved model doesn't match) counts as a real collision.
+// NOTE ON FALSE POSITIVES (2026-08-11): ResolvedModelMatches returns false for THREE different
+// situations -- the handle is 0, the handle fails to resolve, or it resolves to a genuinely
+// different model. Only the third is a real collision; the first two are "we could not tell",
+// which this function conservatively also treats as a collision. That is the right default (do
+// not squat on a slot we cannot vouch for) but it means a room full of unresolvable handles can
+// make many slots look occupied. The diagnostic below exists to tell those cases apart, because
+// the refusal text alone never could -- logged only once per (species, model) so a repeatedly
+// retried spawn does not flood the file.
 static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t species, unsigned long long resolveFnAddr, const char* modelPath) {
     for (int32_t i = 0; i < count; ++i) {
         const uint8_t* rec = table + (size_t)i * PLACEMENT_RECORD_SIZE;
@@ -653,6 +881,31 @@ static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t sp
         uint32_t modelHandle;
         memcpy(&modelHandle, rec + PLACEMENT_MODEL_HANDLE_OFFSET, 4);
         if (!ResolvedModelMatches(resolveFnAddr, modelHandle, modelPath)) {
+            static uint8_t lastSpecies = 0xFF;
+            static char lastModel[64] = {0};
+            if (species != lastSpecies || strncmp(lastModel, modelPath, sizeof(lastModel)) != 0) {
+                lastSpecies = species;
+                strncpy_s(lastModel, modelPath, _TRUNCATE);
+                // Resolve once more purely to report WHICH of the three cases this is.
+                unsigned long long resolved = 0;
+                const char* why;
+                if (modelHandle == 0) {
+                    why = "record's model handle is 0 (no model recorded)";
+                } else {
+                    unsigned long long args[1] = { (unsigned long long)modelHandle };
+                    if (!SafeCall(resolveFnAddr, args, 1, resolved) || resolved == 0) {
+                        why = "record's model handle did NOT resolve -- treated as occupied, but this is 'unknown', not a proven collision";
+                    } else {
+                        why = "record resolves to a genuinely different model -- a real collision";
+                    }
+                }
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: room placement record #%d claims species=%d while we want %s -- %s "
+                    "(handle=0x%08X, resolved=0x%llX)",
+                    (int)i, (int)species, modelPath, why, modelHandle, resolved);
+                LogDebug(msg);
+            }
             return true;
         }
     }
@@ -746,9 +999,12 @@ static const uint8_t SPECIES_SLOT_UNCLAIMED_OWNER = 0xFF;
 // state, which is what produced the deterministic bogus float-shaped resource handles this whole
 // investigation was chasing. Searching for a single free slot was never sufficient; the ENTIRE run
 // has to be free, which is what this now checks.
-static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies) {
+// searchFrom lets a caller ask for the NEXT candidate after one it has rejected -- see
+// FindFreeSlotAvoidingRoomNatives. Pass 20 for the normal "first free run" behaviour.
+static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = 20) {
     if (slotRunLen < 1) slotRunLen = 1; // a signed-char <= 0 makes FUN_140286190 claim nothing
-    for (int s = 20; s + slotRunLen - 1 <= SPECIES_SLOT_ALLOC_MAX; ++s) {
+    if (searchFrom < 20) searchFrom = 20;
+    for (int s = searchFrom; s + slotRunLen - 1 <= SPECIES_SLOT_ALLOC_MAX; ++s) {
         bool runFree = true;
         for (int k = 0; k < slotRunLen; ++k) {
             int slot = s + k;
@@ -766,6 +1022,54 @@ static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loade
             *outSpecies = (uint8_t)s;
             return true;
         }
+    }
+    return false;
+}
+
+// Picks a free slot run that ALSO does not collide with one of the room's own placement
+// records, retrying past each rejected candidate.
+//
+// Added 2026-08-11 after live evidence that the previous behaviour was a dead end: slot
+// selection returned only the FIRST free run, and if the room-native collision check rejected
+// it, spawn_enemy refused outright rather than asking for the next one. Because the allocator
+// is deterministic, every creature then failed on the same slot forever -- observed as three
+// different creatures (Angel Star, Large Body, Pirate) all refused on slot 36 within 20
+// seconds of a fresh session start, and previously on slot 35 in an earlier session. The room
+// having a record at that one slot number was enough to block ALL spawning in that room.
+//
+// This is a pre-existing bug that was invisible until the refusal reason reached the caller.
+static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                            const bool* speciesInUseByLiveEntity, int slotRunLen,
+                                            const uint8_t* table, int32_t count,
+                                            unsigned long long resolveFnAddr, const char* modelPath,
+                                            uint8_t* outSpecies) {
+    int searchFrom = 20;
+    uint8_t candidate = 0;
+    int rejected = 0;
+    while (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, slotRunLen,
+                              &candidate, searchFrom)) {
+        if (!RoomHasNativeSpecies(table, count, candidate, resolveFnAddr, modelPath)) {
+            if (rejected > 0) {
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: settled on slot %d for %s after skipping %d candidate(s) claimed by "
+                    "the room's own placement records",
+                    (int)candidate, modelPath, rejected);
+                LogDebug(msg);
+            }
+            *outSpecies = candidate;
+            return true;
+        }
+        ++rejected;
+        searchFrom = (int)candidate + 1;
+    }
+    if (rejected > 0) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "spawn_enemy: every free slot run for %s (%d candidate(s)) is claimed by one of the room's "
+            "own placement records -- no usable slot in this room",
+            modelPath, rejected);
+        LogDebug(msg);
     }
     return false;
 }
@@ -855,6 +1159,37 @@ static void LogEntitySnapshot(const char* when, uint64_t entity, uint32_t expect
         h138, v144, flags374,
         okFlags ? ((flags374 & 0x10000) ? "SET (tick is processing it)" : "CLEAR (tick is SKIPPING it)") : "?");
     LogDebug(msg);
+}
+
+// Every spawn_enemy refusal goes through here so it returns a SHORT machine-readable
+// code alongside its long human message.
+//
+// Why the code exists at all (2026-08-11): the long message was reaching Lua unusably.
+// Measured across kh1_crowdcontrol_native.log, 236 of 319 failure lines printed an EMPTY
+// reason and several printed a TRUNCATED one ("...(all 256 in use) -- r", "spawn_enemy:
+// placement table not va") -- the same message arriving intact on some calls and blank on
+// others, so it is not a code path that pushes nothing. This is the LuaBackend
+// native-string defect already documented at the top of KH1-CROWDCONTROL's
+// kh1_crowdcontrol.lua: a string pushed from native and then read back through Lua's own
+// string library (string.format/tostring/json.encode) comes back empty or cut short,
+// while the native C API reads the identical memory correctly. Mid-word truncation is the
+// tell.
+//
+// The fix is to never let display text originate natively: `code` is short and is used
+// only as a table key on the Lua side, where the human sentence is a Lua-authored string
+// and therefore immune. The long `message` is kept as the second return purely for
+// existing callers and as a fallback -- it is still subject to the same defect, so do NOT
+// make anything user-facing depend on it.
+//
+// Return shape: (false, message, false, code). The third slot is the "still loading"
+// flag, which a refusal never sets -- pushed as boolean false rather than nil so the
+// arity stays fixed at 4 for every refusal.
+static int RefuseSpawn(void* L, const char* code, const char* message) {
+    p_lua_pushboolean(L, 0);
+    p_lua_pushstring(L, message);
+    p_lua_pushboolean(L, 0);
+    p_lua_pushstring(L, code);
+    return 4;
 }
 
 extern "C" int l_spawn_enemy(void* L) {
@@ -1004,17 +1339,15 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long velocityBlendNeighborGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 44, nullptr);
 
     if (!modelPath || !motionPath) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: model_path/motion_path are required");
-        return 2;
+        return RefuseSpawn(L, "bad_args",
+            "spawn_enemy: model_path/motion_path are required");
     }
     // Copy off Lua's own string storage immediately -- see InternPath.
     modelPath = InternPath(modelPath);
     motionPath = InternPath(motionPath);
     if (resolveHandleFnRva == 0) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: fnc_resolve_resource_handle address not configured for this game build");
-        return 2;
+        return RefuseSpawn(L, "unconfigured",
+            "spawn_enemy: fnc_resolve_resource_handle address not configured for this game build");
     }
 
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
@@ -1046,6 +1379,27 @@ extern "C" int l_spawn_enemy(void* L) {
         g_lastSpawnRoomArea = curArea;
         g_lastSpawnRoomSet = curSet;
         g_lastSpawnRoomValid = true;
+
+        // Room blacklist -- checked HERE, after the reclamation above rather than before it, so
+        // that walking into a blacklisted room still hands back the previous room's slot runs.
+        // Refusing earlier would skip that and quietly leak a run every time.
+        //
+        // Matches on world+area only; the Set number is ignored, so every set/variant of a listed
+        // area is blocked. Set is the evdl variant suffix (ard0/ardc/ardd...), not a distinct
+        // room, so blacklisting per-set would let the same physical room through under a
+        // different variant.
+        for (size_t i = 0; i < sizeof(g_spawnRoomBlacklist) / sizeof(g_spawnRoomBlacklist[0]); ++i) {
+            const BlacklistedRoomRange& r = g_spawnRoomBlacklist[i];
+            if (curWorld == r.world && curArea >= r.areaMin && curArea <= r.areaMax) {
+                char msg[224];
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: refusing -- room %d/%d/%d is blacklisted (%s covers areas %d..%d): %s",
+                    curWorld, curArea, curSet, r.label, r.areaMin, r.areaMax, r.why);
+                LogDebug(msg);
+                return RefuseSpawn(L, "room_blacklisted",
+                    "spawn_enemy: enemy spawning is disabled in this room");
+            }
+        }
     }
 
     // Resource-handle bucket-table headroom check (2026-08-10 follow-up). Live
@@ -1087,9 +1441,8 @@ extern "C" int l_spawn_enemy(void* L) {
                 "spawn_enemy: refusing -- resource-handle bucket table nearly full (%d/%d claimed), spawning more risks a downstream crash",
                 claimed, kBucketCount);
             LogDebug(msg);
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: too many distinct resources loaded this session (bucket table nearly full) -- refusing to risk a crash");
-            return 2;
+            return RefuseSpawn(L, "handles_full",
+                "spawn_enemy: too many distinct resources loaded this session (bucket table nearly full) -- refusing to risk a crash");
         }
     }
 
@@ -1099,9 +1452,8 @@ extern "C" int l_spawn_enemy(void* L) {
     uint8_t* oldTable = *tablePtrAddr;
     int32_t oldCount = *tableCountAddr;
     if (!oldTable || oldCount <= 0 || oldCount > 4096) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: placement table not valid right now (wrong room state?)");
-        return 2;
+        return RefuseSpawn(L, "table_invalid",
+            "spawn_enemy: placement table not valid right now (wrong room state?)");
     }
 
     // See AnyEnemyTooCloseToSora's own comment -- a fresh spawn lands at
@@ -1112,9 +1464,8 @@ extern "C" int l_spawn_enemy(void* L) {
     if (AnyEnemyTooCloseToSora(base, entityPoolBaseRva, soraPointerRva, soraObjPtrRva,
                                  partyMember1PtrRva, partyMember2PtrRva, MIN_SPAWN_DISTANCE_FROM_SORA)) {
         LogDebug("spawn_enemy: refusing -- another enemy is already too close to Sora's position");
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: another enemy is already too close to Sora -- refusing to avoid spawning on top of it");
-        return 2;
+        return RefuseSpawn(L, "too_close",
+            "spawn_enemy: another enemy is already too close to Sora -- refusing to avoid spawning on top of it");
     }
 
     // species (the local slot number) is derived below: reuse an
@@ -1127,9 +1478,8 @@ extern "C" int l_spawn_enemy(void* L) {
     // consumed synchronously below, unlike modelPath/motionPath, which must
     // be interned (see InternPath).
     if (luaCharId == 0 || !luaTemplateRecord || luaTemplateLen != PLACEMENT_RECORD_SIZE) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: no offline fallback data for this creature (missing from kh1_creature_data.lua)");
-        return 2;
+        return RefuseSpawn(L, "no_creature_data",
+            "spawn_enemy: no offline fallback data for this creature (missing from kh1_creature_data.lua)");
     }
     const uint8_t* templateRec = (const uint8_t*)luaTemplateRecord;
     uint16_t charId = (uint16_t)luaCharId;
@@ -1140,16 +1490,14 @@ extern "C" int l_spawn_enemy(void* L) {
     const int templateSlotRunLen = (int)(int8_t)templateRec[0x56];
 
     if (loadedPtrTableRva == 0) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: loadedSpeciesPtrTable address not configured for this game build");
-        return 2;
+        return RefuseSpawn(L, "unconfigured",
+            "spawn_enemy: loadedSpeciesPtrTable address not configured for this game build");
     }
     // Install all three crash-fixing hooks (idempotent) before touching
     // anything else.
     if (jobCallbackFnRva == 0 || velocityBlendFnRva == 0 || partyAbilityIndexFnRva == 0) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: job-record-guard/velocity-blend-guard/party-ability-index-guard hook addresses not configured for this game build");
-        return 2;
+        return RefuseSpawn(L, "unconfigured",
+            "spawn_enemy: job-record-guard/velocity-blend-guard/party-ability-index-guard hook addresses not configured for this game build");
     }
     if (!InstallJobRecordGuardHook(base + jobCallbackFnRva, base + jobCallbackFnRva + 5,
                                      tablePtrRva, tableCountRva, worldNumRva, areaNumRva, setNumRva) ||
@@ -1157,9 +1505,8 @@ extern "C" int l_spawn_enemy(void* L) {
         // +9, not +5: the hook replaces both the call and the risky read
         // right after it -- resumeAddr must skip past both.
         !InstallPartyAbilityIndexGuardHook(base + partyAbilityIndexFnRva, base + partyAbilityIndexFnRva + 9, base + resolveHandleFnRva)) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: failed to install the async-load/velocity-blend/party-ability-index guard hooks -- refusing rather than risk the crash they fix");
-        return 2;
+        return RefuseSpawn(L, "hook_install_fail",
+            "spawn_enemy: failed to install the async-load/velocity-blend/party-ability-index guard hooks -- refusing rather than risk the crash they fix");
     }
     // Optional fourth guard hook -- see its own comment for why this one
     // doesn't refuse the spawn if unconfigured/failed to install, unlike
@@ -1278,58 +1625,61 @@ extern "C" int l_spawn_enemy(void* L) {
         }
     }
     if (mintHandleFnRva == 0) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
-        return 2;
+        return RefuseSpawn(L, "unconfigured",
+            "spawn_enemy: fnc_mint_resource_handle not configured for this game build -- can't safely reuse a captured template's model/motion handles");
     }
     bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
     MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, speciesInUseByLiveEntity);
-    if (FindTriggeredLoad(modelPath, &species)) {
+    // Both reuse branches are gated on ReuseSlotIsSafe -- see its comment for the 2026-08-11
+    // crash this closes. A failed gate deliberately falls through to the next branch (and
+    // ultimately to a fresh load) rather than refusing, so the cost is a reload, not a lost
+    // spawn. `species` may hold a stale value after a failed gate; every later branch assigns
+    // it again before use.
+    if (FindTriggeredLoad(modelPath, &species) &&
+        ReuseSlotIsSafe(base, loadedPtrTableRva, species, modelPath, "our own triggered load")) {
         // Already triggered a load for this creature this session -- reuse
         // the species and don't trigger another load.
         if (RoomHasNativeSpecies(oldTable, oldCount, species, base + resolveHandleFnRva, modelPath)) {
             char msg[160];
             snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already triggered by us this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
             LogDebug(msg);
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
-            return 2;
+            return RefuseSpawn(L, "slot_collision",
+                "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
         }
-    } else if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species)) {
+    } else if (FindLoadedSlotByFilename(base, loadedPtrTableRva, modelPath, &species) &&
+               ReuseSlotIsSafe(base, loadedPtrTableRva, species, modelPath, "loaded-slot filename scan")) {
         // Already loaded this session -- reuse it, but check the room's own
         // placement table doesn't already use this slot for something else.
         if (RoomHasNativeSpecies(oldTable, oldCount, species, base + resolveHandleFnRva, modelPath)) {
             char msg[160];
             snprintf(msg, sizeof(msg), "spawn_enemy: slot %d (already loaded elsewhere this session as %s) is used by a different native record in this room -- refusing", species, modelPath);
             LogDebug(msg);
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
-            return 2;
+            return RefuseSpawn(L, "slot_collision",
+                "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
         }
-    } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, templateSlotRunLen, &species) ||
-               // Nothing free on the first pass -- hand back the runs of creatures that have since
-               // died (see ReclaimDeadSlotRuns) and look once more. Short-circuit order matters:
-               // the reclaim only runs when the window is genuinely full, and the retry only runs
-               // when the reclaim actually freed something, so the common path is untouched.
+    // The room-native collision check is now folded INTO slot selection rather than applied
+    // after it. Previously this took the first free run and refused outright if that one run
+    // happened to collide -- a dead end, since the allocator is deterministic and would hand
+    // back the same colliding slot on every retry. See FindFreeSlotAvoidingRoomNatives.
+    } else if (FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
+                                               templateSlotRunLen, oldTable, oldCount,
+                                               base + resolveHandleFnRva, modelPath, &species) ||
+               // Nothing usable on the first pass -- hand back the runs of creatures that have
+               // since died (see ReclaimDeadSlotRuns) and look once more. Short-circuit order
+               // matters: the reclaim only runs when the window is genuinely full, and the retry
+               // only runs when the reclaim actually freed something, so the common path is
+               // untouched.
                (ReclaimDeadSlotRuns(base, loadedPtrTableRva, releaseSpeciesSlotRunFnRva, speciesInUseByLiveEntity) > 0 &&
-                FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, templateSlotRunLen, &species))) {
+                FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
+                                                templateSlotRunLen, oldTable, oldCount,
+                                                base + resolveHandleFnRva, modelPath, &species))) {
         // mintHandleFnRva/loadAssetsFnRva are required for this specific
         // case (a genuinely fresh slot, nothing loaded into it yet) --
         // checked here, before the placement table is touched at all, to
         // keep this particular check a true no-op.
         if (loadAssetsFnRva == 0) {
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: fnc_load_gimmick_assets not configured for this game build -- can't load a creature with zero presence in this room");
-            return 2;
-        }
-        // Same collision risk as the reuse branch above.
-        if (RoomHasNativeSpecies(oldTable, oldCount, species, base + resolveHandleFnRva, modelPath)) {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "spawn_enemy: slot %d is used by a different native record in this room -- refusing", species);
-            LogDebug(msg);
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
-            return 2;
+            return RefuseSpawn(L, "unconfigured",
+                "spawn_enemy: fnc_load_gimmick_assets not configured for this game build -- can't load a creature with zero presence in this room");
         }
         needsLoad = true;
     } else {
@@ -1352,17 +1702,90 @@ extern "C" int l_spawn_enemy(void* L) {
                 LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
             if (*ownerAddr != SPECIES_SLOT_UNCLAIMED_OWNER || IsSpeciesTriggeredThisSession((uint8_t)s)) ++occupied;
         }
+        // WORDING CORRECTED 2026-08-11: this used to say slot state "is never released, so this
+        // does not recover without a restart". That was true only while ENABLE_ON_DEMAND_SLOT_RECLAIM
+        // was false. It is now true again, and ReclaimDeadSlotRuns has ALREADY run by the time
+        // control reaches here (it is the second half of the branch condition above), so reaching
+        // this point means no slots were reclaimable right now -- not that none ever will be.
+        // Recovery no longer needs a restart: runs come back as spawned creatures are defeated,
+        // and again on a room change. Do not restore the old wording; a message that sends users
+        // to restart when defeating an enemy would do is worse than no message.
         char msg[320];
         snprintf(msg, sizeof(msg),
             "spawn_enemy: refusing -- no free run of %d consecutive species slots in the %d..%d "
-            "window (%d of %d slots already claimed this session; slot state is session-global and "
-            "is never released, so this does not recover without a restart)",
+            "window (%d of %d slots claimed right now; on-demand reclamation already ran and freed "
+            "nothing reusable, so every claimed run is either still alive or not ours to release)",
             templateSlotRunLen, 20, SPECIES_SLOT_ALLOC_MAX, occupied,
             SPECIES_SLOT_ALLOC_MAX - 20 + 1);
         LogDebug(msg);
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: no free run of consecutive species slots left this session -- this creature needs several and they are never released, so only a game restart reclaims them");
-        return 2;
+
+        // Slot-table map, logged at most once every 30s on this refusal (it is several lines and
+        // this path can fire every few seconds). Added 2026-08-11 because the occupancy COUNT
+        // alone cannot answer the only question that matters when spawning stops working: is the
+        // window full of the ROOM's own creatures -- in which case this is a capacity limit and
+        // nothing here can reclaim it -- or full of OUR orphaned runs, which would be a real
+        // bookkeeping leak worth fixing. Reads owner/runLen/state/name straight out of the
+        // engine's own table; pure read-only, nothing is written.
+        {
+            static unsigned long long lastMapTick = 0;
+            unsigned long long now = GetTickCount64();
+            if (lastMapTick == 0 || now - lastMapTick > 30000) {
+                lastMapTick = now;
+                // Deliberately maps the WHOLE table (0..63), not just the 20..63 allocation
+                // window, even though nothing may allocate below 20. The occupancy count above
+                // only counts the window, which quietly hides where the room's own creatures
+                // actually sit -- the engine tiles them upward from slot 0, so most of a room's
+                // roster can live in 0..19 and never appear in "N of 44 claimed". The point of
+                // this map is to answer whether the window is full of the ROOM's creatures (a
+                // capacity limit) or OUR orphaned runs (a leak), and that cannot be judged
+                // without seeing the region the count omits.
+                //
+                // It also shows whether the hardcoded lower bound of 20 is still earning its
+                // keep. That bound has no recorded justification anywhere in this file or the
+                // investigation notes -- unlike SPECIES_SLOT_ALLOC_MAX, whose raise from 47 to
+                // 63 is documented with live evidence. Do NOT lower it on the strength of this
+                // map alone: "0..19 looks free right now" is not the same as "nothing claims
+                // 0..19", and getting that wrong corrupts a live creature's blob silently rather
+                // than failing visibly. Find out what claims that region and when, first.
+                LogDebug("spawn_enemy: --- species slot map 0..63 (allocation window is 20..63; 0..19 shown for context) ---");
+                for (int s = 0; s <= SPECIES_SLOT_ALLOC_MAX; ) {
+                    unsigned long long slotPtr = base + loadedPtrTableRva + (size_t)s * LOADED_SPECIES_STRIDE;
+                    uint8_t owner = *(volatile uint8_t*)(uintptr_t)(slotPtr + LOADED_SPECIES_OWNER_OFFSET_FROM_PTR);
+                    if (owner == SPECIES_SLOT_UNCLAIMED_OWNER) {
+                        int runStart = s;
+                        while (s <= SPECIES_SLOT_ALLOC_MAX &&
+                               *(volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+                                   (size_t)s * LOADED_SPECIES_STRIDE + LOADED_SPECIES_OWNER_OFFSET_FROM_PTR)
+                                   == SPECIES_SLOT_UNCLAIMED_OWNER) ++s;
+                        char freeMsg[128];
+                        snprintf(freeMsg, sizeof(freeMsg), "  %2d-%2d  FREE (%d slots)%s",
+                            runStart, s - 1, s - runStart,
+                            (s - 1) < 20 ? "  [below slot 20 -- OUTSIDE the allocation window, unusable today]"
+                                         : (runStart < 20 ? "  [straddles slot 20 -- only the 20+ part is usable today]" : ""));
+                        LogDebug(freeMsg);
+                        continue;
+                    }
+                    uint8_t runLen = *(volatile uint8_t*)(uintptr_t)(slotPtr + LOADED_SPECIES_RUNLEN_OFFSET_FROM_PTR);
+                    uint8_t state = *(volatile uint8_t*)(uintptr_t)(slotPtr + LOADED_SPECIES_STATE_OFFSET_FROM_PTR);
+                    const char* name = (const char*)(uintptr_t)(slotPtr + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR);
+                    char nameBuf[LOADED_SPECIES_MODEL_NAME_SIZE + 1] = {0};
+                    memcpy(nameBuf, name, LOADED_SPECIES_MODEL_NAME_SIZE);
+                    nameBuf[LOADED_SPECIES_MODEL_NAME_SIZE] = 0;
+                    char entryMsg[224];
+                    snprintf(entryMsg, sizeof(entryMsg),
+                        "  %2d     owner=%-3d runLen=%-2d state=%-2d %-20s %s%s",
+                        s, (int)owner, (int)runLen, (int)state, nameBuf,
+                        IsSpeciesTriggeredThisSession((uint8_t)s) ? "<- OURS (tracked)" : "",
+                        s < 20 ? "  [outside allocation window]" : "");
+                    LogDebug(entryMsg);
+                    ++s;
+                }
+                LogDebug("spawn_enemy: --- end slot map ---");
+            }
+        }
+
+        return RefuseSpawn(L, "slots_full",
+            "spawn_enemy: no creature slots free right now -- each creature type claims several. They come back as spawned enemies are defeated, or when you change rooms.");
     }
     // Room-exclusion guard for World=3/Area=2/Set=2 intentionally REMOVED
     // 2026-08-04 -- under active investigation now instead of being refused
@@ -1397,9 +1820,8 @@ extern "C" int l_spawn_enemy(void* L) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "spawn_enemy: slot %d is CLAIMED (owner=%u) by a different creature this session (cached model file doesn't match %s) -- refusing to avoid corrupting it", species, (unsigned)*ownerAddr, modelPath);
                 LogDebug(msg);
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: chosen slot collides with another creature already active in this room -- refusing");
-                return 2;
+                return RefuseSpawn(L, "slot_collision",
+                    "spawn_enemy: chosen slot collides with another creature already active in this room -- refusing");
             }
         }
     }
@@ -1407,9 +1829,8 @@ extern "C" int l_spawn_enemy(void* L) {
     size_t newSize = (size_t)(oldCount + 1) * PLACEMENT_RECORD_SIZE;
     uint8_t* newTable = (uint8_t*)VirtualAlloc(nullptr, newSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!newTable) {
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: VirtualAlloc failed");
-        return 2;
+        return RefuseSpawn(L, "alloc_fail",
+            "spawn_enemy: VirtualAlloc failed");
     }
 
     memcpy(newTable, oldTable, (size_t)oldCount * PLACEMENT_RECORD_SIZE);
@@ -1536,9 +1957,8 @@ extern "C" int l_spawn_enemy(void* L) {
                 LogDebug(msg);
                 *tablePtrAddr = oldTable;
                 *tableCountAddr = oldCount;
-                p_lua_pushboolean(L, 0);
-                p_lua_pushstring(L, "spawn_enemy: this creature's asset load would claim several consecutive species slots and one of them is already in use -- refusing to avoid corrupting a live creature");
-                return 2;
+                return RefuseSpawn(L, "run_slot_taken",
+                    "spawn_enemy: this creature's asset load would claim several consecutive species slots and one of them is already in use -- refusing to avoid corrupting a live creature");
             }
         }
 
@@ -1551,13 +1971,12 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug(msg);
             *tablePtrAddr = oldTable;
             *tableCountAddr = oldCount;
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: exception during asset-load trigger call");
-            return 2;
+            return RefuseSpawn(L, "load_threw",
+                "spawn_enemy: exception during asset-load trigger call");
         }
         // Record immediately, even though the load hasn't completed, to
         // stop a retry frame from triggering a second concurrent load.
-        RecordTriggeredLoad(modelPath, species, (uint8_t)(slotRunLen > 0 ? slotRunLen : 1));
+        RecordTriggeredLoad(base, loadedPtrTableRva, modelPath, species, (uint8_t)(slotRunLen > 0 ? slotRunLen : 1));
 
         // Doesn't block: the async job is drained by the game's own
         // per-frame loop on this same thread, so blocking here would
@@ -1725,15 +2144,19 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug(msg);
             *tablePtrAddr = oldTable;
             *tableCountAddr = oldCount;
-            p_lua_pushboolean(L, 0);
-            p_lua_pushstring(L, "spawn_enemy: this creature's resource data is not valid in this room right now (blob header invalid) -- try again after re-entering the room");
-            return 2;
+            return RefuseSpawn(L, "blob_invalid",
+                "spawn_enemy: this creature's resource data is not valid in this room right now (blob header invalid) -- try again after re-entering the room");
         }
     }
 
     unsigned long long spawnFnAddr = base + spawnFnRva;
     unsigned long long args[1] = { (unsigned long long)newId };
     unsigned long long result = 0;
+
+    // The slot is loaded and about to be constructed against, so its pointer is populated --
+    // the one reliable moment to capture the load-identity token if the trigger-time capture
+    // came back 0. No-op once captured, and no-op for a species we never loaded ourselves.
+    EnsureTriggeredLoadToken(base, loadedPtrTableRva, (uint8_t)species);
 
     // Diagnostic: log the record's handle-bearing fields before the
     // constructor call, since a crash rolls the table publish back with no
@@ -1760,9 +2183,8 @@ extern "C" int l_spawn_enemy(void* L) {
         // Roll back the table publish -- no entity was constructed.
         *tablePtrAddr = oldTable;
         *tableCountAddr = oldCount;
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: exception during constructor call");
-        return 2;
+        return RefuseSpawn(L, "ctor_threw",
+            "spawn_enemy: exception during constructor call");
     }
 
     // A null return means the constructor refused (room's concurrent-entity
@@ -1773,9 +2195,8 @@ extern "C" int l_spawn_enemy(void* L) {
         LogDebug(msg);
         *tablePtrAddr = oldTable;
         *tableCountAddr = oldCount;
-        p_lua_pushboolean(L, 0);
-        p_lua_pushstring(L, "spawn_enemy: constructor refused (room's concurrent-entity budget is likely full right now) -- try again after some are cleared");
-        return 2;
+        return RefuseSpawn(L, "ctor_refused",
+            "spawn_enemy: constructor refused (room's concurrent-entity budget is likely full right now) -- try again after some are cleared");
     }
 
     // Construction succeeded and returned a non-null entity -- snapshot it immediately, so a
