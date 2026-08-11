@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <intrin.h> // _AddressOfReturnAddress, for the bad-handle caller diagnostic
 
 // --- DEBUG LOGGING ---
 
@@ -284,6 +285,17 @@ static bool AnyEnemyTooCloseToSora(unsigned long long base, unsigned long long e
 // Cached filename string (+4) tells reuse from collision for that slot.
 static const int LOADED_SPECIES_STRIDE = 0x50;
 static const int LOADED_SPECIES_STATE_OFFSET_FROM_PTR = -0x45;
+// Slot+0 and slot+1 (i.e. ptr-0x48 / ptr-0x47, since the state byte at slot+3 is ptr-0x45):
+// FUN_140286190 stamps OWNER=species into slot+0 and RUN LENGTH=record[0x56] into slot+1 for EVERY
+// slot in a claimed run. Critically it does NOT touch the state byte at slot+3, which only the
+// primary slot's own load progression sets -- so a slot claimed as a run MEMBER still reads
+// state==0 and looks completely free. Live-proved 2026-08-10: after a creature claimed a run of 4
+// starting at 24, the next two spawns were handed 25 and 26 (both inside that run) and the game
+// crashed. Occupancy therefore has to test the RUN-LENGTH byte, not just the state byte. It is a
+// reliable signal because this table is BSS (zero-initialised) and FUN_140286190 only ever writes a
+// non-zero count, so slot+1 != 0 means "claimed by somebody's run".
+static const int LOADED_SPECIES_OWNER_OFFSET_FROM_PTR = -0x48;
+static const int LOADED_SPECIES_RUNLEN_OFFSET_FROM_PTR = -0x47;
 static const int LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR = -0x44;
 static const int LOADED_SPECIES_MODEL_NAME_SIZE = 0x20;
 static const int SPECIES_SLOT_COUNT = 256; // species/slot index is a uint8_t (record+0x55) -- the full addressable range
@@ -483,12 +495,41 @@ static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned lon
 // on resolving each live entity's own resource handle, which is exactly
 // the kind of call that fails for the creatures this whole file is trying
 // to guard. Our own triggered-load bookkeeping doesn't have that problem.
-static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, uint8_t* outSpecies) {
-    for (int s = 20; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
-        if (speciesInUseByLiveEntity && speciesInUseByLiveEntity[s]) continue;
-        if (IsSpeciesTriggeredThisSession((uint8_t)s)) continue;
-        volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
-        if (*stateAddr == 0) {
+// Upper bound is SPECIES_SLOT_ALLOC_MAX, not RESOURCE_BLOB_MAX_SPECIES (2026-08-10): the comment
+// above has always said slots ~48-64 are avoided as hardcoded-reserved by unrelated engine
+// subsystems, but the loop bound never actually implemented that -- it ran to 64 inclusive and
+// would hand out a reserved slot as soon as 20..47 were all busy. Found by reading, NOT the cause
+// of the bogus-handle crashes being investigated 2026-08-10 (those pick slot 20, well inside the
+// intended range) -- fixed here because it's a real latent bug, not because it fixes those.
+// RESOURCE_BLOB_MAX_SPECIES stays 64: that IS the true table extent, and the resource-blob bounds
+// check elsewhere still needs it. This is a narrower *allocation* policy on top of it.
+static const int SPECIES_SLOT_ALLOC_MAX = 47;
+
+// slotRunLen (2026-08-10): the loader claims a RUN of consecutive slots, not one slot --
+// fnc_async_load_job_callback passes record+0x56 to FUN_140286190, which stamps owner/run bytes
+// into slotRunLen consecutive 0x50-stride entries starting at the chosen species. Live-confirmed
+// this evening: the crashing creature's record+0x56 is 5, so picking slot 20 was really claiming
+// slots 20-24, and slot 21 was occupied by a live creature -- silently corrupting its resource
+// state, which is what produced the deterministic bogus float-shaped resource handles this whole
+// investigation was chasing. Searching for a single free slot was never sufficient; the ENTIRE run
+// has to be free, which is what this now checks.
+static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies) {
+    if (slotRunLen < 1) slotRunLen = 1; // a signed-char <= 0 makes FUN_140286190 claim nothing
+    for (int s = 20; s + slotRunLen - 1 <= SPECIES_SLOT_ALLOC_MAX; ++s) {
+        bool runFree = true;
+        for (int k = 0; k < slotRunLen; ++k) {
+            int slot = s + k;
+            if (slot > RESOURCE_BLOB_MAX_SPECIES) { runFree = false; break; }
+            if (speciesInUseByLiveEntity && speciesInUseByLiveEntity[slot]) { runFree = false; break; }
+            if (IsSpeciesTriggeredThisSession((uint8_t)slot)) { runFree = false; break; }
+            volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+            if (*stateAddr != 0) { runFree = false; break; }
+            // Also reject a slot already claimed as a MEMBER of somebody else's run -- those keep
+            // state==0 and are invisible to the check above. See the offset constants' comment.
+            volatile uint8_t* runLenAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_RUNLEN_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+            if (*runLenAddr != 0) { runFree = false; break; }
+        }
+        if (runFree) {
             *outSpecies = (uint8_t)s;
             return true;
         }
@@ -519,6 +560,13 @@ static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, uns
 static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr);
 static bool InstallBehaviorScriptCopyGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 static bool InstallJointRemapSetupGuardHook(unsigned long long hookAddr);
+static bool InstallFreezeWatchdogThread();
+// Live address of the 64-entry resource-handle bucket table, stashed by l_spawn_enemy's headroom
+// check so LogResolveHandleBucketGuard (which runs from a code cave and can't be handed it) can
+// report how full the table actually was at the moment of a bad-handle hit -- the single most
+// important number for telling a genuine exhaustion apart from the unrelated bad-handle bug.
+// 0 if this build has no bucket-table RVA configured.
+static volatile uint64_t g_resourceHandleBucketTableAddr = 0;
 static uint64_t g_textSlotTableBase = 0;
 static uint64_t g_resolveHandleFnAddrForTextSlot = 0;
 static bool InstallTextSlotHandleCaptureHook(unsigned long long hookAddr, unsigned long long resumeAddr);
@@ -639,9 +687,10 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long textSlotFreshResolveHookFnRva = (unsigned long long)p_lua_tointegerx(L, 38, nullptr);
     unsigned long long textSlotTableBaseRva = (unsigned long long)p_lua_tointegerx(L, 39, nullptr);
     // Base of the 64-entry resource-handle bucket table itself (g_apResourceHandleBuckets /
-    // DAT_142ee3980 in Ghidra) -- see InstallBucketMemoryWatcherThread's own comment. Optional,
-    // same degrade-gracefully convention as the other hook RVAs above; unlike those, this isn't a
-    // code hook at all, just a plain data address a background thread reads/writes directly.
+    // DAT_142ee3980 in Ghidra). Originally added for InstallBucketMemoryWatcherThread
+    // (reverted the same day for a false-positive bug -- see its own comment), now used
+    // for a much simpler read-only headroom check below, right after `base` is computed.
+    // Optional, same degrade-gracefully convention as the other hook RVAs above.
     unsigned long long resourceHandleBucketTableRva = (unsigned long long)p_lua_tointegerx(L, 40, nullptr);
     // Entry point of the memcpy call inside KH1_BehaviorScriptInterpreter's
     // class-0/sub-op-0xA handler (see InstallBehaviorScriptCopyGuardHook's own
@@ -670,6 +719,52 @@ extern "C" int l_spawn_enemy(void* L) {
     }
 
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+
+    // Resource-handle bucket-table headroom check (2026-08-10 follow-up). Live
+    // testing this evening found THREE more, completely unrelated call sites
+    // (crash sites #6/#7/#8, spread across a behavior-script interpreter, a
+    // joint-remap builder, and a keyframe lookup) that all share the same shape:
+    // fnc_resolve_resource_handle returns 0 once the shared 64-entry bucket table
+    // is exhausted (the 2026-08-05 fix's own intended behavior), and the caller
+    // dereferences the result with zero validation. Patching each one as it's
+    // found isn't converging -- there are evidently many more of these scattered
+    // through the animation/keyframe system than can be hunted in one evening.
+    // Rather than keep chasing symptoms, refuse to spawn once the table is
+    // getting full, BEFORE the game's own code has a chance to hit real
+    // exhaustion from spawn_enemy's own churn -- the actual trigger every crash
+    // tonight traced back to. This is a pure read-only count of non-(-1)
+    // entries, nothing is written -- unlike the reverted watcher thread
+    // (see InstallBucketMemoryWatcherThread's own comment), there is no
+    // false-positive risk here, since correctness only depends on the sentinel
+    // value, not on guessing whether an address is still valid memory.
+    // NOTE: this only prevents spawn_enemy itself from being the thing that
+    // pushes the table over the edge -- it can't undo exhaustion already caused
+    // by other gameplay, and other native-content resource claims could still
+    // exhaust it independently. Harm reduction for the demonstrated trigger, not
+    // a complete fix for the underlying scattered-unguarded-callers problem.
+    if (resourceHandleBucketTableRva != 0) {
+        const int kBucketCount = 64;
+        const int kBucketSafeHeadroom = 6; // refuse once fewer than this many buckets remain free
+        volatile int64_t* bucketTable = (volatile int64_t*)(uintptr_t)(base + resourceHandleBucketTableRva);
+        // Stash it for LogResolveHandleBucketGuard, which runs from a code cave with no way to be
+        // handed this address itself but badly needs it to report real table fullness on a hit.
+        g_resourceHandleBucketTableAddr = (uint64_t)(uintptr_t)bucketTable;
+        int claimed = 0;
+        for (int i = 0; i < kBucketCount; ++i) {
+            if (bucketTable[i] != -1) ++claimed;
+        }
+        if (claimed >= kBucketCount - kBucketSafeHeadroom) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                "spawn_enemy: refusing -- resource-handle bucket table nearly full (%d/%d claimed), spawning more risks a downstream crash",
+                claimed, kBucketCount);
+            LogDebug(msg);
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: too many distinct resources loaded this session (bucket table nearly full) -- refusing to risk a crash");
+            return 2;
+        }
+    }
+
     uint8_t** tablePtrAddr = (uint8_t**)(uintptr_t)(base + tablePtrRva);
     int32_t* tableCountAddr = (int32_t*)(uintptr_t)(base + tableCountRva);
 
@@ -711,6 +806,10 @@ extern "C" int l_spawn_enemy(void* L) {
     const uint8_t* templateRec = (const uint8_t*)luaTemplateRecord;
     uint16_t charId = (uint16_t)luaCharId;
     uint8_t weight = (uint8_t)luaWeight;
+    // How many consecutive species slots this creature's asset load will claim (record+0x56, read
+    // through a signed char exactly as the game does). Needed BEFORE slot selection so we can find
+    // a free RUN instead of a single free slot -- see FindFreeLoadedSlot's own comment.
+    const int templateSlotRunLen = (int)(int8_t)templateRec[0x56];
 
     if (loadedPtrTableRva == 0) {
         p_lua_pushboolean(L, 0);
@@ -758,6 +857,26 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug("spawn_enemy: InstallKeyframeListEntryParamGuardHook failed to install -- proceeding without it");
         }
     }
+    // DISABLED 2026-08-10, the same evening it was written -- it FALSE-POSITIVED constantly,
+    // reporting "the game appears FROZEN" every few seconds during completely normal play and
+    // flooding kh1_native.log badly enough to bury the spawn diagnostics we actually rely on.
+    //
+    // Why it was wrong: GetThreadContext on a RUNNING thread returns undefined/stale data (MSDN is
+    // explicit that the thread must be suspended for a valid context). In practice it returns the
+    // thread's last kernel-entry address, which does NOT change while the thread is busy -- so the
+    // detector's core premise ("a thread executing exe code shows a changing RIP") is simply false
+    // without suspending. Every sampled RIP sat in an unchanging ntdll wait, so "no exe-code thread
+    // made progress" was always true. The deliberate choice NOT to suspend threads (made to avoid
+    // deadlock risk) is exactly what made the measurement meaningless.
+    //
+    // This is the SAME failure shape as InstallBucketMemoryWatcherThread (reverted 2026-08-05): an
+    // off-hot-path checker that validates the wrong thing because the value it needs isn't
+    // available where it's looking. Left in the file, inert, per this file's convention -- a v2
+    // needs a real per-frame heartbeat (a counter incremented from a hooked per-frame function) for
+    // DETECTION, and should only suspend/sample thread contexts once that heartbeat says the loop
+    // has actually stopped. Do not re-enable as-is.
+    // InstallFreezeWatchdogThread();
+    (void)&InstallFreezeWatchdogThread;
     if (animBlendAdvanceDiagHookFnRva != 0) {
         if (!InstallAnimBlendAdvanceDiagHook(base + animBlendAdvanceDiagHookFnRva, base + animBlendAdvanceDiagHookFnRva + 8, base + resolveHandleFnRva)) {
             LogDebug("spawn_enemy: InstallAnimBlendAdvanceDiagHook failed to install -- proceeding without it");
@@ -854,7 +973,7 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
             return 2;
         }
-    } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, &species)) {
+    } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, templateSlotRunLen, &species)) {
         // mintHandleFnRva/loadAssetsFnRva are required for this specific
         // case (a genuinely fresh slot, nothing loaded into it yet) --
         // checked here, before the placement table is touched at all, to
@@ -986,6 +1105,64 @@ extern "C" int l_spawn_enemy(void* L) {
         } else {
             g_lastQueuedGimmickRoomIdentityValid = false;
         }
+        // --- SLOT-RUN SAFETY CHECK (2026-08-10) ---
+        // fnc_async_load_job_callback calls FUN_140286190(species, (int)(signed char)record[0x56]),
+        // and that function claims record[0x56] CONSECUTIVE species slots -- writing owner=species
+        // and runLen=count into slot[species], slot[species+1], ... each 0x50 apart. So triggering
+        // a load does NOT touch just the one slot we carefully verified free: it can stomp the
+        // owner/run bytes of however many slots follow, which live creatures may be using right
+        // now. FindFreeLoadedSlot/RoomHasNativeSpecies only ever validated the FIRST slot, so this
+        // was completely unchecked. record+0x56 is inherited unsanitized from the cloned fallback
+        // template -- unlike +0x55 (species), +0x4c (charId) and +0x59 (weight), which we force.
+        //
+        // This is the concrete mechanism behind session 14's long-standing theory that the load
+        // path "force-resets a room-shared, session-global per-slot state with no check for whether
+        // some other currently-alive entity depends on that slot right now", and it plausibly
+        // explains the bogus float-shaped resource handles being chased 2026-08-10: clobbering a
+        // live species' slot bytes leaves its resource table inconsistent, which sends
+        // fnc_resource_entry_lookup_with_fallback down its silent header-slice fallback path.
+        //
+        // Refuse rather than trigger a load that would clobber an occupied slot. Note the game
+        // casts +0x56 through a SIGNED char, so a value >= 0x80 goes negative and FUN_140286190
+        // claims nothing at all -- only 1..127 actually claim a run.
+        int slotRunLen = (int)(int8_t)newRec[0x56];
+        {
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                "spawn_enemy: load-trigger species=%d, record+0x56 slot-run length = %d (the loader "
+                "will claim that many CONSECUTIVE species slots starting at %d)",
+                species, slotRunLen, species);
+            LogDebug(msg);
+        }
+        if (slotRunLen > 1) {
+            int conflictSlot = -1;
+            for (int s = species + 1; s < species + slotRunLen; ++s) {
+                if (s > RESOURCE_BLOB_MAX_SPECIES) { conflictSlot = s; break; }
+                volatile uint8_t* runStateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+                    LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
+                if (*runStateAddr != 0) { conflictSlot = s; break; }
+                // Same run-member blind spot as FindFreeLoadedSlot had: a slot claimed as part of
+                // another creature's run keeps state==0, so the run-length byte must be tested too.
+                volatile uint8_t* runLenAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+                    LOADED_SPECIES_RUNLEN_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
+                if (*runLenAddr != 0) { conflictSlot = s; break; }
+            }
+            if (conflictSlot >= 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: refusing -- loading species=%d would claim %d consecutive slots "
+                    "and slot %d is already in use (or out of range); triggering this load would "
+                    "corrupt a live creature's resource state",
+                    species, slotRunLen, conflictSlot);
+                LogDebug(msg);
+                *tablePtrAddr = oldTable;
+                *tableCountAddr = oldCount;
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: this creature's asset load would claim several consecutive species slots and one of them is already in use -- refusing to avoid corrupting a live creature");
+                return 2;
+            }
+        }
+
         unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
         unsigned long long loadResult = 0;
         bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);
@@ -1231,6 +1408,218 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
         CloseHandle(h);
     }
     handles.clear();
+}
+
+// --- FREEZE WATCHDOG (2026-08-10) ---
+// Diagnoses the silent freeze that happens a few seconds after DEFEATING a spawned creature (see
+// the memory file project_spawn_enemy_cold_spawn_crash_containment.md). That freeze produces ZERO
+// log output from every existing guard hook, so nothing currently in this file can see it.
+//
+// Why in-process instead of a debugger: Cheat Engine's MCP bridge cannot sample per-thread
+// contexts -- debug_break_thread(tid) followed by debug_get_context() returns the same cached
+// context no matter which thread was named (verified live 2026-08-10 on two different threads), and
+// worse, CE's debugger CANNOT BE DETACHED once attached (debug_detach returned detached:false), so
+// attaching to a live test session permanently contaminates it. From inside the process we can just
+// call GetThreadContext on every thread ourselves, which sidesteps all of that.
+//
+// SAFETY, and this is deliberate: this thread NEVER suspends a thread and NEVER writes any game
+// state -- it only reads thread contexts and appends to our log. Two specific reasons:
+//   1. SuspendThread on 90+ threads once a second is a real deadlock risk (a suspended thread can
+//      hold a lock we'd then need), and would itself be capable of causing the very freeze we're
+//      trying to diagnose.
+//   2. The hard lesson from InstallBucketMemoryWatcherThread (reverted 2026-08-05): a background
+//      thread that WRITES game state based on a check that turns out to be wrong can destroy a
+//      session instantly. Read-only removes that whole class of risk.
+// GetThreadContext on a running thread is technically undefined, but that's fine here: a genuinely
+// stuck thread isn't moving, so its RIP reads back stable, which is exactly the signal we want.
+//
+// Freeze detection needs no game knowledge: on a healthy frame, at least one thread executing exe
+// code makes progress (its RIP changes between samples). If NO exe-code thread has moved for
+// several consecutive seconds, the game loop has stopped. Then dump the stuck threads, including a
+// heuristic scan of each stack for exe-range return addresses -- so a thread parked in a kernel
+// wait still tells us which game code led it there.
+static bool g_freezeWatchdogStarted = false;
+static const int FREEZE_WATCHDOG_INTERVAL_MS = 1000;
+static const int FREEZE_STALL_SAMPLES = 5;  // ~5s of no exe-code progress before reporting
+static const int FREEZE_MAX_WATCHED_THREADS = 256;
+static const int FREEZE_MAX_DUMPED_THREADS = 24; // keep a 90+-thread process from flooding the log
+
+struct WatchdogThreadSample {
+    DWORD tid;
+    uint64_t lastRip;
+    int sameCount;
+};
+
+// Logs one stuck thread: its RIP (as an exe RVA when it's in game code) plus up to 8 exe-range
+// return addresses found on its stack. Separate function so the stack walk's __try doesn't
+// constrain the caller.
+static void LogStuckThread(DWORD tid, uint64_t rip, uint64_t rsp, int sameCount,
+                           uint64_t exeBase, uint64_t exeSize) {
+    char msg[512];
+    int written;
+    if (rip >= exeBase && rip < exeBase + exeSize) {
+        written = snprintf(msg, sizeof(msg),
+            "FreezeWatchdog:   tid=%lu stuck %ds RIP=exe+0x%llX callers:",
+            (unsigned long)tid, sameCount, (unsigned long long)(rip - exeBase));
+    } else {
+        written = snprintf(msg, sizeof(msg),
+            "FreezeWatchdog:   tid=%lu stuck %ds RIP=0x%llX (outside exe) callers:",
+            (unsigned long)tid, sameCount, (unsigned long long)rip);
+    }
+    if (written <= 0) return;
+
+    int found = 0;
+    __try {
+        uintptr_t* sp = (uintptr_t*)(uintptr_t)rsp;
+        for (int i = 0; i < 256 && found < 8; ++i) {
+            uintptr_t v = sp[i];
+            if ((uint64_t)v > exeBase && (uint64_t)v < exeBase + exeSize) {
+                int n = snprintf(msg + written, sizeof(msg) - (size_t)written, " 0x%llX",
+                                 (unsigned long long)((uint64_t)v - exeBase));
+                if (n <= 0 || (size_t)(written + n) >= sizeof(msg)) break;
+                written += n;
+                ++found;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A thread's stack can be unreadable mid-teardown -- log what we have.
+    }
+    if (found == 0) {
+        snprintf(msg + written, sizeof(msg) - (size_t)written, " (none on stack)");
+    }
+    LogDebug(msg);
+}
+
+static DWORD WINAPI FreezeWatchdogThreadProc(LPVOID) {
+    uint64_t exeBase = (uint64_t)(uintptr_t)GetModuleHandleA(nullptr);
+    uint64_t exeSize = 0;
+    if (exeBase) {
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)(uintptr_t)exeBase;
+        IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(uintptr_t)(exeBase + dos->e_lfanew);
+        exeSize = (uint64_t)nt->OptionalHeader.SizeOfImage;
+    }
+    if (!exeBase || !exeSize) return 0;
+
+    const DWORD myTid = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+
+    static WatchdogThreadSample samples[FREEZE_MAX_WATCHED_THREADS] = {};
+    int sampleCount = 0;
+    int stalledRounds = 0;
+    bool alreadyReported = false;
+
+    for (;;) {
+        Sleep(FREEZE_WATCHDOG_INTERVAL_MS);
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
+
+        THREADENTRY32 te = {};
+        te.dwSize = sizeof(te);
+        bool anyExeProgress = false;
+
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == myTid) continue;
+                HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (!h) continue;
+
+                alignas(16) CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_CONTROL; // RIP + RSP, all we need
+                if (GetThreadContext(h, &ctx)) {
+                    uint64_t rip = (uint64_t)ctx.Rip;
+                    bool inExe = (rip >= exeBase && rip < exeBase + exeSize);
+
+                    int idx = -1;
+                    for (int i = 0; i < sampleCount; ++i) {
+                        if (samples[i].tid == te.th32ThreadID) { idx = i; break; }
+                    }
+                    if (idx < 0 && sampleCount < FREEZE_MAX_WATCHED_THREADS) {
+                        idx = sampleCount++;
+                        samples[idx].tid = te.th32ThreadID;
+                        samples[idx].lastRip = rip;
+                        samples[idx].sameCount = 0;
+                    } else if (idx >= 0) {
+                        if (samples[idx].lastRip == rip) {
+                            ++samples[idx].sameCount;
+                        } else {
+                            samples[idx].sameCount = 0;
+                            samples[idx].lastRip = rip;
+                            if (inExe) anyExeProgress = true;
+                        }
+                    }
+                }
+                CloseHandle(h);
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+
+        if (anyExeProgress) {
+            stalledRounds = 0;
+            alreadyReported = false; // re-arm for a future freeze
+            continue;
+        }
+
+        ++stalledRounds;
+        if (stalledRounds < FREEZE_STALL_SAMPLES || alreadyReported) continue;
+        alreadyReported = true;
+
+        char header[224];
+        snprintf(header, sizeof(header),
+            "FreezeWatchdog: no exe-code thread has made progress for ~%ds -- the game appears "
+            "FROZEN. Dumping stuck threads (RIP + exe-range return addresses per stack):",
+            stalledRounds);
+        LogDebug(header);
+
+        HANDLE snap2 = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap2 != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te2 = {};
+            te2.dwSize = sizeof(te2);
+            int dumped = 0;
+            if (Thread32First(snap2, &te2)) {
+                do {
+                    if (te2.th32OwnerProcessID != pid || te2.th32ThreadID == myTid) continue;
+                    if (dumped >= FREEZE_MAX_DUMPED_THREADS) break;
+                    int idx = -1;
+                    for (int i = 0; i < sampleCount; ++i) {
+                        if (samples[i].tid == te2.th32ThreadID) { idx = i; break; }
+                    }
+                    if (idx < 0 || samples[idx].sameCount < FREEZE_STALL_SAMPLES - 1) continue;
+
+                    HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te2.th32ThreadID);
+                    if (!h) continue;
+                    alignas(16) CONTEXT ctx = {};
+                    ctx.ContextFlags = CONTEXT_CONTROL;
+                    if (GetThreadContext(h, &ctx)) {
+                        LogStuckThread(te2.th32ThreadID, (uint64_t)ctx.Rip, (uint64_t)ctx.Rsp,
+                                       samples[idx].sameCount, exeBase, exeSize);
+                        ++dumped;
+                    }
+                    CloseHandle(h);
+                } while (Thread32Next(snap2, &te2));
+            }
+            CloseHandle(snap2);
+            if (dumped >= FREEZE_MAX_DUMPED_THREADS) {
+                LogDebug("FreezeWatchdog: (dump capped -- more stuck threads existed than were logged)");
+            }
+        }
+        LogDebug("FreezeWatchdog: end of stuck-thread dump");
+    }
+}
+
+static bool InstallFreezeWatchdogThread() {
+    if (g_freezeWatchdogStarted) return true;
+    HANDLE h = CreateThread(nullptr, 0, FreezeWatchdogThreadProc, nullptr, 0, nullptr);
+    if (!h) {
+        LogDebug("InstallFreezeWatchdogThread: CreateThread failed -- proceeding without freeze diagnostics");
+        return false;
+    }
+    CloseHandle(h);
+    g_freezeWatchdogStarted = true;
+    LogDebug("InstallFreezeWatchdogThread: started (read-only: samples thread RIPs once a second, "
+             "never suspends a thread, never writes game state)");
+    return true;
 }
 
 // --- TEXT BOX HOOK ---
@@ -2590,15 +2979,93 @@ static bool InstallSection2SizeGuardHook(unsigned long long hookAddr, unsigned l
 // individual call sites this file has hooked so far.
 static bool g_resolveHandleBucketGuardHookInstalled = false;
 static volatile uint64_t g_resolveHandleBucketGuardCount = 0;
+static const int RESOLVE_BUCKET_COUNT = 64;
+
+// Scans our own stack for return addresses that land inside the game exe's image and logs them as
+// RVAs, nearest frame first. Deliberately a heuristic scan rather than a real unwind: the callers
+// of fnc_resolve_resource_handle are frame-pointer-less, heavily-optimized game code that a proper
+// backtrace API does not walk reliably here, and all we actually need is "which function asked for
+// this handle" -- a short list of candidate call sites is enough to identify that in Ghidra. Only
+// ever runs on the already-rare bad-handle path, so it adds nothing to the hot path.
+static void LogResolveHandleBucketGuardCallers() {
+    uint64_t exeBase = (uint64_t)(uintptr_t)GetModuleHandleA(nullptr);
+    if (!exeBase) return;
+
+    char msg[512] = {};
+    __try {
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)(uintptr_t)exeBase;
+        IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(uintptr_t)(exeBase + dos->e_lfanew);
+        uint64_t exeSize = (uint64_t)nt->OptionalHeader.SizeOfImage;
+
+        int written = snprintf(msg, sizeof(msg),
+            "ResolveHandleBucketGuard: candidate caller RVAs (nearest frame first):");
+        int found = 0;
+        uintptr_t* sp = (uintptr_t*)_AddressOfReturnAddress();
+        for (int i = 0; i < 512 && found < 10; ++i) {
+            uintptr_t v = sp[i];
+            if (v > exeBase && v < exeBase + exeSize) {
+                int n = snprintf(msg + written, sizeof(msg) - (size_t)written, " 0x%llX",
+                                 (unsigned long long)((uint64_t)v - exeBase));
+                if (n <= 0 || (size_t)(written + n) >= sizeof(msg)) break;
+                written += n;
+                ++found;
+            }
+        }
+        if (found == 0) {
+            snprintf(msg, sizeof(msg),
+                "ResolveHandleBucketGuard: stack scan found no exe-range return addresses");
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        snprintf(msg, sizeof(msg), "ResolveHandleBucketGuard: stack scan faulted, no caller info");
+    }
+    LogDebug(msg);
+}
 
 static void LogResolveHandleBucketGuard(uint32_t maskedHandle) {
-    char msg[224];
+    // Only the -1 "never claimed" branch can actually reach here. At the hook point RAX holds the
+    // bit31-cleared handle, so RAX>>25 is structurally always 0..63 and the stub's own ">=64
+    // out-of-range" test is unreachable dead code. Live-verified 2026-08-10 (CE read of the table
+    // at the moment of a hit) that a hit is NOT exhaustion -- only 8/64 buckets were claimed --
+    // so this deliberately no longer claims the table is "very likely exhausted", which is what
+    // sent an earlier session down the wrong root cause. See the memory file
+    // project_spawn_enemy_cold_spawn_crash_containment for the full account.
+    unsigned bucketIdx = (unsigned)((maskedHandle & 0x7FFFFFFFu) >> 25);
+    unsigned offset = (unsigned)(maskedHandle & 0x1FFFFFFu);
+
+    float asFloat = 0.0f;
+    memcpy(&asFloat, &maskedHandle, sizeof(asFloat));
+
+    int claimed = -1;
+    uint64_t tableAddr = g_resourceHandleBucketTableAddr;
+    if (tableAddr) {
+        __try {
+            volatile int64_t* table = (volatile int64_t*)(uintptr_t)tableAddr;
+            int n = 0;
+            for (int i = 0; i < RESOLVE_BUCKET_COUNT; ++i) {
+                if (table[i] != -1) ++n;
+            }
+            claimed = n;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { claimed = -1; }
+    }
+
+    char msg[400];
     snprintf(msg, sizeof(msg),
-        "ResolveHandleBucketGuard: handle=0x%08X resolved to an unclaimed/out-of-range resource "
-        "bucket -- the 64-bucket resource-handle table is very likely exhausted. Returning 0 "
-        "instead of a garbage/-1 pointer (hitsSoFar=%llu)",
-        maskedHandle, (unsigned long long)g_resolveHandleBucketGuardCount + 1);
+        "ResolveHandleBucketGuard: handle=0x%08X decodes to bucket=%u (offset=0x%X), which is NOT "
+        "claimed -- returning 0 instead of a garbage/-1 pointer. Buckets claimed right now: %d/%d. "
+        "Reinterpreted as a float this handle is %g -- a float-shaped or otherwise non-handle value "
+        "here means something read a non-handle field AS a handle, which is a different bug from "
+        "table exhaustion. (hitsSoFar=%llu)",
+        maskedHandle, bucketIdx, offset, claimed, RESOLVE_BUCKET_COUNT, (double)asFloat,
+        (unsigned long long)g_resolveHandleBucketGuardCount + 1);
     LogDebug(msg);
+
+    // Caller identification for the first few hits only -- that is all it takes to name the
+    // function, and it keeps the log readable if a hit ever starts recurring every frame.
+    if (g_resolveHandleBucketGuardCount < 5) {
+        LogResolveHandleBucketGuardCallers();
+    }
     ++g_resolveHandleBucketGuardCount;
 }
 
@@ -2619,7 +3086,7 @@ static void LogResolveHandleBucketGuard(uint32_t maskedHandle) {
 // not a global counter across all buckets. A bucket can flip from invalid back to valid (a freed
 // region can get legitimately reclaimed by a new, unrelated allocation later), so an invalid result
 // is cached too, not treated as permanent.
-static const int RESOLVE_BUCKET_COUNT = 64;
+// (RESOLVE_BUCKET_COUNT is defined further up, next to the bad-handle logger that also needs it.)
 static const uint64_t BUCKET_REVALIDATE_INTERVAL = 1024;
 static volatile uint64_t g_bucketMemCheckTick = 0;
 static uint64_t g_bucketLastCheckTick[RESOLVE_BUCKET_COUNT] = {};
