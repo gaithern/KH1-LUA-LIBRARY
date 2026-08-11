@@ -1138,7 +1138,27 @@ static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned lo
     int rejected = 0;
     while (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, slotRunLen,
                               &candidate, searchFrom)) {
-        if (!RoomHasNativeSpecies(table, count, candidate, resolveFnAddr, modelPath)) {
+        // Check the WHOLE run against the room's placement table, not just the start slot
+        // (fixed 2026-08-11). The original only tested `candidate`, so a long run happily
+        // swallowed room-native species sitting further along it -- live-observed: slots 30 and
+        // 31 were correctly skipped as room-claimed, then a 13-slot run was taken at 32, silently
+        // covering 32..44 with no check on 33..44. The room's own creatures then re-claim those
+        // slots (the slot table later showed our species-32 slot reading owner=30), overwriting a
+        // LIVE creature's model/motion/script data, which is what the behaviour-script
+        // interpreter then reads a garbage loop count from.
+        //
+        // Same lesson as the record+0x56 run-length fix: a creature occupies a RUN, so every
+        // per-slot safety test has to cover the whole run. This one was missed.
+        bool runCollides = false;
+        for (int k = 0; k < slotRunLen; ++k) {
+            int slot = (int)candidate + k;
+            if (slot > SPECIES_SLOT_ALLOC_MAX) { runCollides = true; break; }
+            if (RoomHasNativeSpecies(table, count, (uint8_t)slot, resolveFnAddr, modelPath)) {
+                runCollides = true;
+                break;
+            }
+        }
+        if (!runCollides) {
             if (rejected > 0) {
                 char msg[192];
                 snprintf(msg, sizeof(msg),
