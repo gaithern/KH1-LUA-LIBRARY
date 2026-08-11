@@ -315,6 +315,10 @@ fnc_velocity_blend_util = 0x2B5E50
 fnc_iterate_live_entities = 0x291B20
 fnc_party_ability_index_resolve_call = 0x1D62F2
 fnc_load_gimmick_assets = 0x285EE0
+-- The game's own release routine for a run of species slots: (species, runLen) -> sets each slot's
+-- owner byte to the 0xFF unclaimed sentinel and wipes the matching resource-blob range. Used by
+-- spawn_enemy to hand back slots on a room change so a session stops running out of them.
+fnc_release_species_slot_run = 0x2858E0
 loadedSpeciesPtrTable = 0x2869E18
 fnc_mint_resource_handle = 0x38AD90
 fnc_resolve_resource_handle = 0x38ADC0
