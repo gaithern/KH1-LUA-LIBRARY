@@ -396,6 +396,15 @@ fnc_behavior_script_copy_guard_hook = 0x2CCFED
 -- function has 5+ callers plus indirect table references -- see
 -- InstallJointRemapSetupGuardHook (dllmain.cpp) for the full writeup.
 fnc_joint_remap_setup_guard_hook = 0x2A0350
+-- Entry of fnc_velocity_blend_neighbor_UNGUARDED -- walks every other live entity looking
+-- for one to blend velocity against, chaining through fnc_resolve_resource_handle results
+-- with FOUR unguarded dereferences in a single loop. Crash site #4: known since
+-- 2026-08-04, live-crashed twice at the identical instruction (RVA 0x2B5BF0) six days
+-- apart, and the top remaining crash site as of 2026-08-10. Wrapped whole rather than
+-- patched inline -- its own "no neighbor found" return (0, param_2 untouched) is a clean,
+-- in-band failure result, unlike most sites here. See
+-- InstallVelocityBlendNeighborGuardHook (dllmain.cpp) for the full writeup.
+fnc_velocity_blend_neighbor_guard_hook = 0x2B5AF0
 -- Status-effect floating-text stale-pointer fix (2026-08-05) -- properly re-derives the value
 -- instead of guarding a bad read. Three coordinated hook points inside
 -- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own

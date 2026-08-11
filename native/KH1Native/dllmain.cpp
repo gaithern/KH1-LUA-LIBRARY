@@ -457,6 +457,125 @@ static void ReclaimOwnSlotRuns(unsigned long long base, unsigned long long loade
     LogDebug(msg);
 }
 
+// --- ON-DEMAND SLOT RECLAMATION (2026-08-11) ---
+// ReclaimOwnSlotRuns above only fires on a ROOM CHANGE, so within a single room the 20..63
+// window fills monotonically and spawning dies with "no free run of N consecutive species
+// slots". Live-observed: 42 of 44 slots claimed, every further spawn refused, and a restart
+// was the only recovery.
+//
+// The measurement that makes this fixable: across 53 spawns in one session, every entity was
+// activated at construct (+0x374 SET, 53/53), but the follow-up rechecks found +0x374 fully
+// ZEROED 338 times vs still-set 13 -- i.e. the game frees our spawned creatures within roughly
+// twenty seconds. Their slot runs are therefore almost always pure dead weight, still claimed
+// on behalf of an entity that no longer exists. Reclaiming those on demand is what turns a
+// hard session cap into a recycling pool.
+//
+// Only ever releases a run that (a) has NO live entity anywhere in it, (b) still carries our
+// own cached model filename, and (c) is still owned end-to-end by us -- the exact ownership
+// checks ReclaimOwnSlotRuns already uses, since a partial release would leave the engine's
+// bookkeeping inconsistent. Uses the engine's own fnc_release_species_slot_run, so the
+// resource-blob range is wiped the way the engine does it (a hand-rolled reset skipped that,
+// and stale blob content is itself a documented crash cause -- sessions 9-12).
+// Returns the number of slots actually freed.
+// DISABLED BY DEFAULT PENDING AN A/B TEST (2026-08-11). Shipped enabled, and the very next
+// play session froze silently ~25s later -- log's last line a clean post-construct, file never
+// grew again, not one guard hit. That is the exact signature of the long-standing never-root-
+// caused freeze (sessions 7/8/16, and the 2026-08-10 post-defeat freeze), so this may well be
+// unrelated. But it CANNOT be ruled out as the cause, for a specific reason:
+// fnc_release_species_slot_run WIPES the species' resource-blob range, and the liveness test
+// gating it (MarkSpeciesInUseByLiveEntities) is explicitly documented a few hundred lines above
+// as unreliable -- "even if ... MarkSpeciesInUseByLiveEntities couldn't resolve the occupying
+// entity's handle. That resolve failing is exactly the same failure mode as the crashes this
+// DLL guards against elsewhere". An entity whose +0x134 fails to resolve is invisible to that
+// scan, so its run would be freed and its blob wiped while it is still alive -- a textbook
+// freeze. That warning existed before this function was written and should have gated it.
+//
+// Counter-evidence, which is why this is a flag rather than a deletion: the same blob-wiping
+// release already runs on every room change via ReclaimOwnSlotRuns (live-confirmed working
+// since 2026-08-10), so the OPERATION is not new here, only its timing.
+//
+// Flip to true to re-test. Turning it off restores the pre-2026-08-11 behaviour, which means
+// the ~7-creature-per-session slot cap comes back -- a refusal is strictly better than a freeze
+// while the cause is unknown. Left inert rather than deleted, per this file's own convention
+// for tried-but-unproven fixes (ValidateResolvedBucketAddress, InstallBucketMemoryWatcherThread,
+// InstallFreezeWatchdogThread).
+static const bool ENABLE_ON_DEMAND_SLOT_RECLAIM = false;
+
+static int ReclaimDeadSlotRuns(unsigned long long base, unsigned long long loadedPtrTableRva,
+                               unsigned long long releaseFnRva,
+                               const bool* speciesInUseByLiveEntity) {
+    if (!ENABLE_ON_DEMAND_SLOT_RECLAIM) {
+        LogDebug("spawn_enemy: slot window full -- on-demand reclamation is DISABLED pending a "
+                 "freeze A/B test (see ENABLE_ON_DEMAND_SLOT_RECLAIM), so this refusal stands");
+        return 0;
+    }
+    if (releaseFnRva == 0) return 0;
+
+    int reclaimedRuns = 0, reclaimedSlots = 0;
+    int out = 0;
+    for (int i = 0; i < g_triggeredLoadCount; ++i) {
+        TriggeredLoadEntry entry = g_triggeredLoads[i]; // by value -- the array is compacted below
+        int runLen = (int)entry.runLen;
+        if (runLen < 1) runLen = 1;
+
+        // "In use" MUST be tested across the whole run, not just its first slot.
+        // MarkSpeciesInUseByLiveEntities derives a species by dividing the resolved blob pointer
+        // by the 0x40000 stride, but a creature's blob spans its ENTIRE run -- so an entity whose
+        // data sits partway in reports a run MEMBER index, never the run's owner. Testing only
+        // entry.species would therefore miss a live creature and free a run out from under it.
+        bool inUse = false;
+        for (int k = 0; k < runLen; ++k) {
+            int slot = (int)entry.species + k;
+            if (slot >= 0 && slot <= RESOURCE_BLOB_MAX_SPECIES && speciesInUseByLiveEntity[slot]) {
+                inUse = true;
+                break;
+            }
+        }
+        if (inUse) { g_triggeredLoads[out++] = entry; continue; }
+
+        unsigned long long primaryPtr = base + loadedPtrTableRva + (size_t)entry.species * LOADED_SPECIES_STRIDE;
+        const char* cachedName = (const char*)(uintptr_t)(primaryPtr + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR);
+        if (strncmp(cachedName, entry.modelPath, LOADED_SPECIES_MODEL_NAME_SIZE) != 0) {
+            g_triggeredLoads[out++] = entry; // something else owns it now -- keep tracking, don't touch
+            continue;
+        }
+        bool stillOurs = true;
+        for (int k = 0; k < runLen; ++k) {
+            int slot = (int)entry.species + k;
+            if (slot > RESOURCE_BLOB_MAX_SPECIES) { stillOurs = false; break; }
+            volatile uint8_t* owner = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+                LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+            if (*owner != entry.species) { stillOurs = false; break; }
+        }
+        if (!stillOurs) { g_triggeredLoads[out++] = entry; continue; }
+
+        unsigned long long releaseArgs[2] = { (unsigned long long)entry.species, (unsigned long long)runLen };
+        unsigned long long releaseResult = 0;
+        if (!SafeCall(base + releaseFnRva, releaseArgs, 2, releaseResult)) {
+            char failMsg[192];
+            snprintf(failMsg, sizeof(failMsg),
+                "spawn_enemy: on-demand fnc_release_species_slot_run(%u,%d) threw -- leaving that run claimed",
+                (unsigned)entry.species, runLen);
+            LogDebug(failMsg);
+            g_triggeredLoads[out++] = entry;
+            continue;
+        }
+        reclaimedSlots += runLen;
+        ++reclaimedRuns;
+    }
+    g_triggeredLoadCount = out;
+
+    if (reclaimedRuns > 0) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+            "spawn_enemy: slot window was full -- reclaimed %d run(s) (%d slots) whose spawned "
+            "creature is no longer alive; %d still-live run(s) left claimed",
+            reclaimedRuns, reclaimedSlots, g_triggeredLoadCount);
+        LogDebug(msg);
+    }
+    return reclaimedSlots;
+}
+
 // A species recorded here was already assigned to a specific creature by a
 // load WE triggered this session -- never hand it to a DIFFERENT creature,
 // even if the live engine's own state byte looks free or
@@ -674,6 +793,7 @@ static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, uns
 static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr);
 static bool InstallBehaviorScriptCopyGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 static bool InstallJointRemapSetupGuardHook(unsigned long long hookAddr);
+static bool InstallVelocityBlendNeighborGuardHook(unsigned long long hookAddr);
 static bool InstallFreezeWatchdogThread();
 // Live address of the 64-entry resource-handle bucket table, stashed by l_spawn_enemy's headroom
 // check so LogResolveHandleBucketGuard (which runs from a code cave and can't be handed it) can
@@ -877,6 +997,11 @@ extern "C" int l_spawn_enemy(void* L) {
     // Optional, same degrade-gracefully convention as the other RVAs: without it we simply cannot
     // reclaim, which is the pre-2026-08-10 behaviour.
     unsigned long long releaseSpeciesSlotRunFnRva = (unsigned long long)p_lua_tointegerx(L, 43, nullptr);
+    // Entry point of fnc_velocity_blend_neighbor_UNGUARDED (Steam 0x2B5AF0) -- see
+    // InstallVelocityBlendNeighborGuardHook's own comment. Fixes crash site #4, known
+    // and unfixed since 2026-08-04 and the TOP remaining crash site as of 2026-08-10.
+    // Optional, same degrade-gracefully convention as the other hook RVAs above.
+    unsigned long long velocityBlendNeighborGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 44, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -1126,6 +1251,11 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug("spawn_enemy: InstallJointRemapSetupGuardHook failed to install -- proceeding without it");
         }
     }
+    if (velocityBlendNeighborGuardHookFnRva != 0) {
+        if (!InstallVelocityBlendNeighborGuardHook(base + velocityBlendNeighborGuardHookFnRva)) {
+            LogDebug("spawn_enemy: InstallVelocityBlendNeighborGuardHook failed to install -- proceeding without it");
+        }
+    }
     if (textSlotTableBaseRva != 0) {
         g_textSlotTableBase = base + textSlotTableBaseRva;
     }
@@ -1176,7 +1306,13 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
             return 2;
         }
-    } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, templateSlotRunLen, &species)) {
+    } else if (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, templateSlotRunLen, &species) ||
+               // Nothing free on the first pass -- hand back the runs of creatures that have since
+               // died (see ReclaimDeadSlotRuns) and look once more. Short-circuit order matters:
+               // the reclaim only runs when the window is genuinely full, and the retry only runs
+               // when the reclaim actually freed something, so the common path is untouched.
+               (ReclaimDeadSlotRuns(base, loadedPtrTableRva, releaseSpeciesSlotRunFnRva, speciesInUseByLiveEntity) > 0 &&
+                FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, templateSlotRunLen, &species))) {
         // mintHandleFnRva/loadAssetsFnRva are required for this specific
         // case (a genuinely fresh slot, nothing loaded into it yet) --
         // checked here, before the placement table is touched at all, to
@@ -1236,13 +1372,30 @@ extern "C" int l_spawn_enemy(void* L) {
     //
     // Defense in depth: re-check the slot right before touching anything,
     // in case its state changed since the scan above.
+    //
+    // MUST gate on owner == SPECIES_SLOT_UNCLAIMED_OWNER first (fixed 2026-08-11). This check
+    // predates the 2026-08-10 discovery that `owner == 0xFF` is the ONLY authoritative "slot is
+    // free" test, and it was never brought in line: it keyed purely on the state byte plus the
+    // cached model filename. But `fnc_release_species_slot_run` -- the engine's own release
+    // routine, which ReclaimOwnSlotRuns now calls on every room change -- sets owner back to 0xFF
+    // and clears the flags byte WITHOUT clearing the state byte or the cached model name. Those
+    // fields are therefore STALE, not current, on a genuinely free slot.
+    //
+    // The result was a direct self-contradiction, caught live in Hundred Acre Wood: the room
+    // change reclaimed our run ("reclaimed 1 of our own slot runs (5 slots)"), FindFreeLoadedSlot
+    // correctly handed back slot 20 as free, and then this check refused that very slot on the
+    // dead creature's leftover filename -- so spawning failed in a room where nothing was
+    // actually colliding. Consulting stale metadata about a slot nobody owns is meaningless; only
+    // a slot that is really claimed can really collide.
     if (needsLoad) {
+        volatile uint8_t* ownerAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+            LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
         volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
-        if (*stateAddr != 0) {
+        if (*ownerAddr != SPECIES_SLOT_UNCLAIMED_OWNER && *stateAddr != 0) {
             const char* cachedName = (const char*)(uintptr_t)(base + loadedPtrTableRva + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
             if (strncmp(cachedName, modelPath, LOADED_SPECIES_MODEL_NAME_SIZE) != 0) {
                 char msg[192];
-                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d already holds a different creature's data this session (cached model file doesn't match %s) -- refusing to avoid corrupting it", species, modelPath);
+                snprintf(msg, sizeof(msg), "spawn_enemy: slot %d is CLAIMED (owner=%u) by a different creature this session (cached model file doesn't match %s) -- refusing to avoid corrupting it", species, (unsigned)*ownerAddr, modelPath);
                 LogDebug(msg);
                 p_lua_pushboolean(L, 0);
                 p_lua_pushstring(L, "spawn_enemy: chosen slot collides with another creature already active in this room -- refusing");
@@ -1447,6 +1600,134 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: asset load still in progress -- call again next frame (this is normal for a creature's first load this session)");
             p_lua_pushboolean(L, 1);
             return 3;
+        }
+    }
+
+    // --- SPECIES RESOURCE-BLOB HEADER VALIDATION (2026-08-11) -- an UPSTREAM fix ---
+    // Root cause found by decompiling fnc_link_model_resource_data (Steam 0x140288460), the
+    // function the constructor calls right after resolving record+8 to the 256KB species blob.
+    // EVERY resource handle it hangs on the new entity is minted straight from the blob's own
+    // section-offset header:
+    //     entity+0x154 = mint(blob + *(int*)(blob+0x04))
+    //     entity+0x1d0 = mint(blob + *(int*)(blob+0x08))   -> fnc_copy_blob_section2_anim_handle
+    //     entity+0x134 = mint(blob + *(int*)(blob+0x0c))   -> the collision/shape table
+    //     entity+0x68  = mint(blob + *(int*)(blob+0x10))
+    // fnc_mint_resource_handle does NOT validate its pointer (session 5 established it is a
+    // generic pointer->handle encoder with no requirement that the pointer be a real allocation),
+    // so a garbage header mints perfectly well-formed handles pointing into arbitrary memory.
+    // Resolving them later returns whatever bytes live there -- and reading +0x14/+0x18 off such
+    // an object yields FLOATS, which is exactly the float-shaped bogus handles
+    // ResolveHandleBucketGuard has been reporting all along (0.90022, 6, 30, 154.571, 8192, ...).
+    // The handles were never corrupted; they were faithfully resolved from a bad blob.
+    //
+    // This single defect explains, as ONE bug rather than four:
+    //   - crash site #4 (fnc_velocity_blend_neighbor_scan)  -> resolve(resolve(entity+0x134)+0x14)
+    //   - crash site #9 (FUN_1402b4460, 2026-08-11)         -> resolve(resolve(entity+0x134)+0x18)
+    //   - the "exception during constructor call" in Hundred Acre Wood: Meadow (RVA 0x1D6230,
+    //     fnc_copy_blob_section2_anim_handle reading resolvedSection2Ptr+0x30)
+    //   - the recurring bogus-handle guard hits themselves
+    //
+    // So rather than add a FIFTH consumer-side guard (sites #6/#7/#8 already proved that does not
+    // converge), refuse to construct at all when the blob header is not sane. Deliberately
+    // read-only and entirely on our side: no game code is patched, nothing is written, nothing
+    // runs on a hot path, and a refusal rolls the table publish back like every other refusal
+    // here. That keeps it in the same low-risk category as the bucket-headroom check, and well
+    // clear of session 9's blob-PRIMING attempt, which made things worse and was reverted --
+    // this never writes blob contents, it only declines to use a bad one.
+    //
+    // Validity test: the five section offsets must be non-negative, non-decreasing, and inside
+    // the blob. That is the exact invariant fnc_link_model_resource_data itself assumes when it
+    // computes each section's size as the difference between consecutive entries.
+    //
+    // THE BLOB SPANS THE WHOLE SLOT RUN, NOT ONE SLOT (corrected 2026-08-11, same evening, from
+    // live data). The first version of this check bounded offsets by RESOURCE_BLOB_SIZE
+    // (0x40000) and immediately false-positived on every creature, blocking all spawning: real
+    // headers came back as e.g. species=20 -> {128, 337920, 1020160, 1020160, 1026688} and
+    // species=52 -> {128, 277632, 400768, 400768, 400768}, all perfectly well-formed but far
+    // past 0x40000. Cross-checked against each creature's own record+0x56 run length: species 20
+    // claims 6 slots (6 * 0x40000 = 1572864 > 1026688) and species 52 claims 5 (1310720 >
+    // 400768). Both fit exactly. THAT is why the loader claims a run of CONSECUTIVE slots -- the
+    // resource blob is one contiguous region spanning the entire run, so the per-species stride
+    // bounds the slot, not the data. Bound by runLen * RESOURCE_BLOB_SIZE accordingly.
+    if (speciesResourceTableRva != 0 && species >= 0 && species <= RESOURCE_BLOB_MAX_SPECIES) {
+        unsigned long long blobAddr =
+            base + speciesResourceTableRva + (unsigned long long)species * RESOURCE_BLOB_SIZE;
+
+        // Bound GENEROUSLY, by everything left in the blob table from this species onward,
+        // rather than by this creature's own record+0x56. Reason (2026-08-11): record+0x56 is a
+        // property of the CREATURE being spawned, but the blob sitting in the slot was written by
+        // whichever creature actually loaded it, which may have claimed a LONGER run -- so a
+        // per-creature bound can reject a perfectly good blob. Live data shows how little headroom
+        // there is: species 20's real header ends at 1026688 while its own runLen=4 would allow
+        // only 1048576. Having already false-positived once here and blocked all spawning, the
+        // asymmetry is clear -- a missed bad blob costs a caught SafeCall exception, a false
+        // positive costs the user the whole feature. This still rejects genuinely wild values
+        // (negative, or hundreds of MB), which is what a garbage header actually looks like.
+        int blobRunLen = (int)(int8_t)newRec[0x56];
+        if (blobRunLen < 1) blobRunLen = 1;
+        const unsigned long long blobSpan =
+            (unsigned long long)(RESOURCE_BLOB_MAX_SPECIES + 1 - species) *
+            (unsigned long long)RESOURCE_BLOB_SIZE;
+
+        int32_t sec[5] = {};
+        bool readOk = false;
+        __try {
+            memcpy(sec, (const void*)(uintptr_t)(blobAddr + 4), sizeof(sec));
+            readOk = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { readOk = false; }
+
+        bool headerSane = readOk;
+        if (headerSane) {
+            int32_t prev = 0;
+            for (int i = 0; i < 5; ++i) {
+                if (sec[i] < 0 || (unsigned long long)sec[i] > blobSpan || sec[i] < prev) {
+                    headerSane = false;
+                    break;
+                }
+                prev = sec[i];
+            }
+            // An all-zero header means the blob was never populated (or was wiped by a room
+            // change while our session-global slot bookkeeping still claimed it was loaded --
+            // exactly the Hundred Acre Wood case).
+            if (headerSane && sec[0] == 0 && sec[4] == 0) headerSane = false;
+        }
+
+        // Always log the header, not just on refusal. The Hundred Acre Wood failure is a real,
+        // deterministic fault whose blob header has never actually been observed -- the first
+        // version of this check guessed at the invariant and got it wrong. Capturing the header
+        // on every attempt means the next repro shows what a genuinely bad one looks like
+        // side by side with the good ones, instead of another guess.
+        if (readOk) {
+            char hdrMsg[256];
+            snprintf(hdrMsg, sizeof(hdrMsg),
+                "spawn_enemy: species=%d blob header sections +4..+0x14 = %d, %d, %d, %d, %d "
+                "(recRunLen=%d, sane=%d)",
+                species, sec[0], sec[1], sec[2], sec[3], sec[4], blobRunLen, (int)headerSane);
+            LogDebug(hdrMsg);
+        }
+
+        if (!headerSane) {
+            char msg[320];
+            if (!readOk) {
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: species=%d resource blob at 0x%llx is unreadable -- refusing to "
+                    "construct (would mint handles from garbage; see fnc_link_model_resource_data)",
+                    species, blobAddr);
+            } else {
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: species=%d resource blob header is invalid "
+                    "(sections +4..+0x14 = %d, %d, %d, %d, %d; runLen=%d, blobSpan=%llu) -- "
+                    "refusing to construct. The blob was never loaded or was reset by a room "
+                    "change while the slot still claimed 'loaded'; constructing would mint "
+                    "entity+0x134/+0x1d0/+0x154 from garbage.",
+                    species, sec[0], sec[1], sec[2], sec[3], sec[4], blobRunLen, blobSpan);
+            }
+            LogDebug(msg);
+            *tablePtrAddr = oldTable;
+            *tableCountAddr = oldCount;
+            p_lua_pushboolean(L, 0);
+            p_lua_pushstring(L, "spawn_enemy: this creature's resource data is not valid in this room right now (blob header invalid) -- try again after re-entering the room");
+            return 2;
         }
     }
 
@@ -3283,21 +3564,69 @@ static void LogResolveHandleBucketGuard(uint32_t maskedHandle) {
         __except (EXCEPTION_EXECUTE_HANDLER) { claimed = -1; }
     }
 
-    char msg[400];
-    snprintf(msg, sizeof(msg),
-        "ResolveHandleBucketGuard: handle=0x%08X decodes to bucket=%u (offset=0x%X), which is NOT "
-        "claimed -- returning 0 instead of a garbage/-1 pointer. Buckets claimed right now: %d/%d. "
-        "Reinterpreted as a float this handle is %g -- a float-shaped or otherwise non-handle value "
-        "here means something read a non-handle field AS a handle, which is a different bug from "
-        "table exhaustion. (hitsSoFar=%llu)",
-        maskedHandle, bucketIdx, offset, claimed, RESOLVE_BUCKET_COUNT, (double)asFloat,
-        (unsigned long long)g_resolveHandleBucketGuardCount + 1);
-    LogDebug(msg);
+    // Per-DISTINCT-HANDLE bookkeeping (2026-08-11). The previous "first 5 hits only" rule for
+    // caller identification looked reasonable but failed in practice the first time it mattered:
+    // in the 2026-08-10 crash session the first 5 hits were all the already-known float-shaped
+    // effect-emitter handles logged in one burst early on, so the budget was spent long before
+    // the handle that actually preceded the fatal crash (0x5665669B, which then hit 1026 times)
+    // ever appeared -- and that one was never caller-logged at all. Keying on the distinct handle
+    // VALUE instead guarantees every genuinely new bad handle gets its call site named exactly
+    // once, which is the whole point of the scan.
+    //
+    // It also fixes a real second problem: those 1026 byte-identical lines flooded kh1_native.log
+    // and buried the spawn diagnostics around them (the same way the reverted freeze watchdog's
+    // spam did). Repeats are now collapsed to a periodic line carrying the running count.
+    //
+    // Racy across threads by design: the worst case is a duplicated log line or a missed
+    // dedupe, never a crash or a wrong decision. Nothing here writes game memory, and all of it
+    // runs only on the already-rare bad-handle path.
+    const int SEEN_CAP = 32;
+    static uint32_t seenHandles[SEEN_CAP] = {};
+    static uint64_t seenCounts[SEEN_CAP] = {};
+    static int seenUsed = 0;
 
-    // Caller identification for the first few hits only -- that is all it takes to name the
-    // function, and it keeps the log readable if a hit ever starts recurring every frame.
-    if (g_resolveHandleBucketGuardCount < 5) {
+    int slot = -1;
+    for (int i = 0; i < seenUsed; ++i) {
+        if (seenHandles[i] == maskedHandle) { slot = i; break; }
+    }
+    bool firstTimeForThisHandle = false;
+    uint64_t timesForThisHandle = 0;
+    if (slot < 0) {
+        if (seenUsed < SEEN_CAP) {
+            slot = seenUsed++;
+            seenHandles[slot] = maskedHandle;
+            seenCounts[slot] = 1;
+            firstTimeForThisHandle = true;
+            timesForThisHandle = 1;
+        } else {
+            // Table full -- degrade to the old always-log behaviour rather than go silent.
+            firstTimeForThisHandle = true;
+            timesForThisHandle = 0;
+        }
+    } else {
+        timesForThisHandle = ++seenCounts[slot];
+    }
+
+    char msg[512];
+    if (firstTimeForThisHandle) {
+        snprintf(msg, sizeof(msg),
+            "ResolveHandleBucketGuard: NEW bad handle=0x%08X decodes to bucket=%u (offset=0x%X), "
+            "which is NOT claimed -- returning 0 instead of a garbage/-1 pointer. Buckets claimed "
+            "right now: %d/%d. Reinterpreted as a float this handle is %g -- a float-shaped or "
+            "otherwise non-handle value here means something read a non-handle field AS a handle, "
+            "which is a different bug from table exhaustion. (hitsSoFar=%llu, distinctSoFar=%d)",
+            maskedHandle, bucketIdx, offset, claimed, RESOLVE_BUCKET_COUNT, (double)asFloat,
+            (unsigned long long)g_resolveHandleBucketGuardCount + 1, seenUsed);
+        LogDebug(msg);
+        // Name the call site once per distinct handle -- this is what turns "some unknown caller"
+        // into a named function in a single repro.
         LogResolveHandleBucketGuardCallers();
+    } else if ((timesForThisHandle % 1024) == 0) {
+        snprintf(msg, sizeof(msg),
+            "ResolveHandleBucketGuard: handle=0x%08X (bucket=%u, float %g) seen %llu times now "
+            "-- repeats collapsed; call site was logged on its first occurrence.",
+            maskedHandle, bucketIdx, (double)asFloat, (unsigned long long)timesForThisHandle);
+        LogDebug(msg);
     }
     ++g_resolveHandleBucketGuardCount;
 }
@@ -3768,6 +4097,141 @@ static bool InstallJointRemapSetupGuardHook(unsigned long long hookAddr) {
 
     g_jointRemapSetupGuardHookInstalled = true;
     LogDebug("InstallJointRemapSetupGuardHook: installed successfully");
+    return true;
+}
+
+// --- VELOCITY-BLEND NEIGHBOR GUARD HOOK (2026-08-11) -- CRASH SITE #4, finally guarded ---
+// fnc_velocity_blend_neighbor_UNGUARDED (Steam RVA 0x2B5AF0) has been a known, unfixed
+// crash site since 2026-08-04, and was the TOP remaining crash site as of 2026-08-10 --
+// it faulted at RVA 0x2B5BF0 in two separate live crashes, six days apart, at the exact
+// same instruction. The 2026-08-10 crash came from the game's own CrashDump.dmp:
+//     ExceptionCode = 0xC0000005 (read) at 0x7FF7EEA98CB8  -- wild, ~4GB past the image
+//     Rip = exe + 0x2B5BF0
+//     Rdx = g_apResourceHandleBuckets (the bucket TABLE base) -- i.e. immediately
+//           downstream of a resolve, the same family as every other site here.
+//
+// The function walks every other live entity looking for a nearby one to blend velocity
+// against. Per iteration it resolves entity+0x134 and chains through the result with NO
+// validation anywhere -- there are FOUR unguarded dereferences of a resolve result in
+// this one loop, not just the instruction that happened to fault:
+//     0x2B5BC4  MOV ECX,[RAX+0x14]     ; 1st resolve's result, deref'd raw
+//     0x2B5BDC  CMP byte ptr [RAX+5],SIL ; 3rd resolve's result -> the loop bound
+//     0x2B5BF0  MOVZX ECX,byte ptr [RBX-1] ; RBX = 2nd resolve's result + 2  <-- faulted
+//     0x2B5DDD  MOVZX ECX,[RAX+5]      ; loop bound re-read every iteration
+// Guarding only the faulting instruction would leave the other three live, and this
+// investigation has already established (sites #6/#7/#8) that patching one consumer
+// instruction at a time does not converge. So this wraps the WHOLE function, using the
+// same two-trampoline __try/__except technique as InstallSkeletonBlendCallGuardHook and
+// InstallJointRemapSetupGuardHook.
+//
+// WHY RETURNING 0 IS SAFE HERE, AND WHY THAT IS UNUSUALLY CLEAN FOR THIS INVESTIGATION:
+// unlike InstallVelocityBlendGuardHook -- where session 18 found that "skip" left the
+// caller's uninitialized stack buffer to be folded into real entity state, and the fix
+// had to zero-fill it -- this function has NO output-parameter side effects on the
+// failure path. It writes to param_2 (+4) only on the two success paths, immediately
+// before returning the found neighbor. Its own "no neighbor found" path is literally
+// `XOR EAX,EAX; ret` with param_2 untouched, which is the overwhelmingly common outcome
+// every frame. Its single caller (FUN_14029b4e0) consumes the result as
+// `FUN_140297df0(param_1, result)`, which just mints a handle from it into
+// entity+0x398 -- and minting 0 ("minted null") is an established, normal pattern in
+// this engine. So an exception -> return 0 is not a synthesized fallback value; it is
+// exactly the function's own in-band "nothing nearby this frame" result.
+static bool g_velocityBlendNeighborGuardHookInstalled = false;
+static volatile uint64_t g_velocityBlendNeighborGuardSkipCount = 0;
+
+typedef int64_t (*VelocityBlendNeighborOriginalFn)(int64_t, int64_t);
+static VelocityBlendNeighborOriginalFn g_velocityBlendNeighborOriginalTrampoline = nullptr;
+
+// Tail-jumped into with the exact register/stack state the real function's caller set up
+// (RCX = entity, RDX = motion/velocity struct), matching Ghidra's decompiled signature.
+static int64_t CallVelocityBlendNeighborSafe(int64_t param_1, int64_t param_2) {
+    __try {
+        return g_velocityBlendNeighborOriginalTrampoline(param_1, param_2);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "VelocityBlendNeighborGuard: exception walking neighbor entities, reporting 'no neighbor' for this entity/frame (skipsSoFar=%llu)",
+            (unsigned long long)g_velocityBlendNeighborGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_velocityBlendNeighborGuardSkipCount;
+        return 0;
+    }
+}
+
+static bool InstallVelocityBlendNeighborGuardHook(unsigned long long hookAddr) {
+    if (g_velocityBlendNeighborGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    // mov rax,rsp; mov [rax+0x18],rbx  -- 7 bytes, no RIP-relative operands, so they
+    // can be replayed verbatim from the cave. Verified byte-for-byte against the live
+    // Ghidra database before shipping (48 8b c4 48 89 58 18).
+    static const unsigned char expected[7] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18 };
+    if (memcmp(hookPtr, expected, 7) != 0) {
+        LogDebug("InstallVelocityBlendNeighborGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* replayCave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!replayCave) {
+        LogDebug("InstallVelocityBlendNeighborGuardHook: failed to allocate replay code cave");
+        return false;
+    }
+    {
+        unsigned char stub[16] = {};
+        size_t off = 0;
+        memcpy(stub + off, expected, 7); off += 7; // replay original 7 bytes
+        stub[off++] = 0xE9; // jmp rel32 -> hookAddr+7 (rest of the real function body)
+        size_t jmpOperand = off; off += 4;
+        size_t stubLen = off;
+        uintptr_t caveBase = (uintptr_t)replayCave;
+        int32_t jmpRel = (int32_t)((int64_t)(hookAddr + 7) - (int64_t)(caveBase + jmpOperand + 4));
+        memcpy(stub + jmpOperand, &jmpRel, 4);
+        memcpy(replayCave, stub, stubLen);
+        FlushInstructionCache(GetCurrentProcess(), replayCave, stubLen);
+    }
+    g_velocityBlendNeighborOriginalTrampoline = (VelocityBlendNeighborOriginalFn)(uintptr_t)replayCave;
+
+    void* redirectCave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!redirectCave) {
+        LogDebug("InstallVelocityBlendNeighborGuardHook: failed to allocate redirect code cave");
+        return false;
+    }
+    {
+        unsigned char stub[16] = {};
+        size_t off = 0;
+        uint64_t wrapperAddr = (uint64_t)(uintptr_t)&CallVelocityBlendNeighborSafe;
+        // Clobbering RAX here is safe: this is a function ENTRY point, and RAX carries
+        // no argument under the x64 calling convention. The replayed `mov rax,rsp`
+        // re-establishes it inside the cave, against the trampoline call's own (equally
+        // valid, shadow-space-backed) frame.
+        stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, wrapperAddr
+        memcpy(stub + off, &wrapperAddr, 8); off += 8;
+        stub[off++] = 0xFF; stub[off++] = 0xE0; // jmp rax
+        size_t stubLen = off;
+        memcpy(redirectCave, stub, stubLen);
+        FlushInstructionCache(GetCurrentProcess(), redirectCave, stubLen);
+    }
+
+    unsigned char patch[7];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)(uintptr_t)redirectCave - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; // nop, pad the remaining 2 original bytes
+    patch[6] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 7);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 7, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 7);
+
+    ResumeThreads(threads);
+
+    g_velocityBlendNeighborGuardHookInstalled = true;
+    LogDebug("InstallVelocityBlendNeighborGuardHook: installed successfully");
     return true;
 }
 

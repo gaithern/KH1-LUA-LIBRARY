@@ -909,7 +909,7 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         fnc_status_effect_handle_capture_hook, fnc_status_effect_handle_record_hook,
         fnc_text_slot_fresh_resolve_hook, text_slot_table_base, resource_handle_bucket_table,
         fnc_behavior_script_copy_guard_hook, fnc_joint_remap_setup_guard_hook,
-        fnc_release_species_slot_run)
+        fnc_release_species_slot_run, fnc_velocity_blend_neighbor_guard_hook)
 end
 
 -- Pending spawn_enemy requests
