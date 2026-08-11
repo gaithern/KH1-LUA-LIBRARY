@@ -916,6 +916,31 @@ static bool RoomHasNativeSpecies(const uint8_t* table, int32_t count, uint8_t sp
 // advance, 0 means done) and marks each entity's resource-handle as
 // "species in use" -- catches an unrelated live entity using a slot with
 // no placement-table record.
+// BLINDNESS COUNTERS (2026-08-11). This scan is the ONLY thing stopping FindFreeLoadedSlot from
+// allocating over a live creature and ReclaimDeadSlotRuns from releasing one out from under
+// itself -- and it identifies an entity's species by RESOLVING entity+0x134. An entity whose
+// handle does not resolve is therefore invisible to it, and this file has warned about exactly
+// that ("the MarkSpeciesInUseByLiveEntities resolve scan cannot be trusted alone") without ever
+// measuring how often it happens.
+//
+// A one-off census on 2026-08-11 found only 3 of 22 live entities resolving to a species. That is
+// alarming at face value but ambiguous, because two very different cases were being lumped
+// together, and the fix depends entirely on which one dominates:
+//   noHandle           -- entity+0x134 == 0. Almost certainly not a creature at all (props,
+//                         effects, doors, party members). Harmless; the scan SHOULD ignore these.
+//   handleUnresolvable -- entity+0x134 != 0 but does not resolve into the species blob table.
+//                         THIS is the dangerous case: a real creature the scan cannot see, whose
+//                         slot we may then hand out or release.
+//
+// The second case matters most because it is self-reinforcing: resolve failure is the core
+// symptom of the bug being chased, so the safety check goes blind precisely when handles start
+// going bad -- i.e. exactly when it most needs to work.
+//
+// Counting rides the walk that already happens on every spawn_enemy call. No extra iteration, no
+// timer, no sampling during teardown -- deliberately unlike the reverted LiveEntityCensus, whose
+// timer-driven walk froze the game by running while the engine was tearing the pool down.
+// Consecutive identical summaries are collapsed so the retry bursts during an asset load do not
+// flood the file.
 static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned long long entityIterFnRva,
                                              unsigned long long resolveHandleFnRva, unsigned long long speciesResourceTableRva,
                                              bool outInUse[RESOURCE_BLOB_MAX_SPECIES + 1]) {
@@ -924,21 +949,59 @@ static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned lon
     unsigned long long entity = 0;
     unsigned long long iterArgs[1] = { 0 };
     if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) return;
+    // resolveFailed vs outsideBlobTable is THE distinction that matters -- see the comment above.
+    // Lumping them (as the first version of this counter did) makes a healthy effect entity look
+    // identical to a creature with a corrupted handle, and the counts are dominated by the former.
+    int walked = 0, resolved_ = 0, noHandle = 0, resolveFailed = 0, outsideBlobTable = 0;
     int guard = 0; // hard cap matching the pool's own real size -- never trust an external loop to self-terminate
     while (entity != 0 && guard < 128) {
         ++guard;
+        ++walked;
         uint32_t handle = *(volatile uint32_t*)(uintptr_t)(entity + 0x134);
-        if (handle != 0) {
+        if (handle == 0) {
+            ++noHandle;
+        } else {
             unsigned long long resolveArgs[1] = { (unsigned long long)handle };
             unsigned long long resolved = 0;
-            if (SafeCall(base + resolveHandleFnRva, resolveArgs, 1, resolved) && resolved != 0 &&
-                resolved >= tableBase && resolved < tableBase + (unsigned long long)(RESOURCE_BLOB_MAX_SPECIES + 1) * RESOURCE_BLOB_SIZE) {
+            bool ok = SafeCall(base + resolveHandleFnRva, resolveArgs, 1, resolved);
+            if (!ok || resolved == 0) {
+                // The resolve genuinely failed. resolved==0 is precisely what the bucket guard
+                // returns for a bogus handle, so this is the count that measures real corruption
+                // -- and any entity in here is a potential creature the in-use check cannot see.
+                ++resolveFailed;
+            } else if (resolved >= tableBase &&
+                       resolved < tableBase + (unsigned long long)(RESOURCE_BLOB_MAX_SPECIES + 1) * RESOURCE_BLOB_SIZE) {
                 int species = (int)((resolved - tableBase) >> 18);
-                if (species >= 0 && species <= RESOURCE_BLOB_MAX_SPECIES) outInUse[species] = true;
+                if (species >= 0 && species <= RESOURCE_BLOB_MAX_SPECIES) {
+                    outInUse[species] = true;
+                    ++resolved_;
+                } else {
+                    ++outsideBlobTable;
+                }
+            } else {
+                // Resolved to a real address in some OTHER resource table. Healthy, and simply
+                // not a species-blob-backed creature -- effects, models, props. Benign.
+                ++outsideBlobTable;
             }
         }
         iterArgs[0] = entity;
-        if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) return;
+        if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) break;
+    }
+
+    static int lastWalked = -1, lastResolved = -1, lastNoHandle = -1,
+               lastResolveFailed = -1, lastOutside = -1;
+    if (walked != lastWalked || resolved_ != lastResolved || noHandle != lastNoHandle ||
+        resolveFailed != lastResolveFailed || outsideBlobTable != lastOutside) {
+        lastWalked = walked; lastResolved = resolved_; lastNoHandle = noHandle;
+        lastResolveFailed = resolveFailed; lastOutside = outsideBlobTable;
+        char msg[320];
+        snprintf(msg, sizeof(msg),
+            "LiveEntityScan: walked=%d resolved=%d noHandle=%d outsideBlobTable=%d resolveFAILED=%d%s",
+            walked, resolved_, noHandle, outsideBlobTable, resolveFailed,
+            resolveFailed > 0
+                ? "  <-- resolveFAILED are BROKEN handles: real corruption, and invisible to the in-use check"
+                : "  (outsideBlobTable is benign -- healthy non-creature entities)");
+        LogDebug(msg);
     }
 }
 
@@ -1074,6 +1137,244 @@ static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned lo
     return false;
 }
 
+// --- ROOM-TRANSITION EVICTION TEST (2026-08-11) ---
+// Purpose: prove or disprove one specific hypothesis, and nothing else.
+//
+// HYPOTHESIS: the game preloads the NEXT room during the door-opening scene -- before
+// g_WorldNumber/AreaNumber/SetNumber change, so before our own lazy room-change detection can
+// fire -- and that preload EVICTS species slots in place (fnc_async_load_job_callback compares
+// the slot's cached filename and reloads on mismatch). That is safe for the engine only because
+// a normal transition has already killed every creature. Creatures WE spawned are not part of
+// the room roster and are still alive, so their resource blobs get reused underneath them; their
+// .bd scripts then read another creature's data, which is what the BehaviorScriptCopyGuard
+// faults and the two KH1_BehaviorScriptInterpreter crashes (RVA 0x2CD023 read, 0x2CD064 stack
+// smash) both look like.
+//
+// User-reported timing is what makes this testable: the crash happens while APPROACHING a door,
+// not after the room has changed.
+//
+// THE TEST: remember, for each creature we spawn, the species slot it was constructed from and
+// the model filename that slot held at the time. When BehaviorScriptCopyGuard first faults, walk
+// those records and re-read the slot's cached filename. If it no longer matches, the slot was
+// evicted out from under a live creature and the hypothesis is confirmed outright -- no
+// inference needed. If every filename still matches, the hypothesis is WRONG and the corruption
+// comes from somewhere else, which is just as useful to know.
+//
+// Read-only. Nothing here writes game memory or changes behaviour.
+static unsigned long long g_slotMapBase = 0;
+static unsigned long long g_slotMapLoadedPtrTableRva = 0;
+
+// Defined further down with the entity-snapshot helpers; needed here for the liveness check.
+static bool TryReadU32(uint64_t addr, uint32_t* out);
+
+struct SpawnedEntityRecord {
+    unsigned long long entityPtr;
+    uint32_t id;
+    uint8_t species;
+    uint8_t runLen;
+    char modelPath[LOADED_SPECIES_MODEL_NAME_SIZE + 1];
+};
+static const int MAX_TRACKED_SPAWNS = 16;
+static SpawnedEntityRecord g_trackedSpawns[MAX_TRACKED_SPAWNS];
+static int g_trackedSpawnCount = 0;
+
+static void RecordSpawnedEntity(unsigned long long entityPtr, uint32_t id, uint8_t species,
+                                uint8_t runLen, const char* modelPath) {
+    // Ring buffer -- only the most recent spawns can plausibly still be alive (measured lifetime
+    // is ~20s), so overwriting the oldest loses nothing this test needs.
+    SpawnedEntityRecord& rec = g_trackedSpawns[g_trackedSpawnCount % MAX_TRACKED_SPAWNS];
+    rec.entityPtr = entityPtr;
+    rec.id = id;
+    rec.species = species;
+    rec.runLen = runLen;
+    strncpy_s(rec.modelPath, modelPath, _TRUNCATE);
+    ++g_trackedSpawnCount;
+}
+
+// The decisive check. Re-reads each tracked spawn's slot and reports whether the cached model
+// filename still matches what it was when we constructed from it.
+static void LogSpawnedEntitySlotIntegrity(const char* reason) {
+    if (g_slotMapBase == 0 || g_slotMapLoadedPtrTableRva == 0) return;
+    int n = g_trackedSpawnCount < MAX_TRACKED_SPAWNS ? g_trackedSpawnCount : MAX_TRACKED_SPAWNS;
+    if (n == 0) return;
+
+    char hdr[192];
+    snprintf(hdr, sizeof(hdr),
+        "spawn_enemy: --- EVICTION TEST (%s): re-checking %d tracked spawn(s) ---", reason, n);
+    LogDebug(hdr);
+
+    // LIVENESS IS THE WHOLE POINT (fixed 2026-08-11 -- the first version of this test omitted it
+    // and produced a false CONFIRMED). A dead creature's slot being reused later is completely
+    // NORMAL -- that is what reclamation is for. The hypothesis is only supported if a slot is
+    // reused while its creature is STILL ALIVE. Without this check the test was reporting stale
+    // ring-buffer records, provably so: two records showed the same entity pointer AND id with
+    // different species, which can only happen once the entity pool has recycled that slot.
+    //
+    // Three states, and only the third is evidence:
+    //   STALE   -- entity+0x04 no longer matches the id we recorded; the pool reused the slot.
+    //   RETIRED -- id matches but the +0x374 tick bit is clear; the engine is done with it.
+    //   LIVE    -- id matches and the tick bit is set. A filename change HERE is the real thing.
+    int evictedUnderLive = 0, live = 0, retired = 0, stale = 0;
+    for (int i = 0; i < n; ++i) {
+        const SpawnedEntityRecord& rec = g_trackedSpawns[i];
+        if (rec.entityPtr == 0) continue;
+
+        uint32_t id = 0, flags = 0;
+        bool idOk = TryReadU32(rec.entityPtr + 4, &id) && id == rec.id;
+        bool flagsOk = idOk && TryReadU32(rec.entityPtr + ENTITY_OCCUPIED_FLAG_OFFSET, &flags);
+        bool isLive = flagsOk && (flags & 0x10000) != 0;
+        const char* state;
+        if (!idOk)        { state = "STALE  "; ++stale; }
+        else if (!isLive) { state = "RETIRED"; ++retired; }
+        else              { state = "LIVE   "; ++live; }
+
+        unsigned long long slotPtr = g_slotMapBase + g_slotMapLoadedPtrTableRva +
+            (size_t)rec.species * LOADED_SPECIES_STRIDE;
+        char nowName[LOADED_SPECIES_MODEL_NAME_SIZE + 1] = {0};
+        memcpy(nowName, (const void*)(uintptr_t)(slotPtr + LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR),
+               LOADED_SPECIES_MODEL_NAME_SIZE);
+        uint8_t owner = *(volatile uint8_t*)(uintptr_t)(slotPtr + LOADED_SPECIES_OWNER_OFFSET_FROM_PTR);
+
+        // TWO independent ways a slot can be pulled out from under a creature, and the second one
+        // is the one that actually happens (corrected 2026-08-11 after it hid the root cause):
+        //   REUSED   -- the cached filename changed; something else loaded into the slot.
+        //   RELEASED -- owner == 0xFF. fnc_release_species_slot_run writes that sentinel AND wipes
+        //               the resource blob, but does NOT clear the cached filename. Testing the
+        //               filename alone therefore reports "slot unchanged" for the exact case that
+        //               destroys the creature's data, which is why this test kept printing
+        //               "Hypothesis NOT supported" while `owner=255` sat in its own output.
+        bool reused = (strncmp(nowName, rec.modelPath, LOADED_SPECIES_MODEL_NAME_SIZE) != 0);
+        bool released = (owner == SPECIES_SLOT_UNCLAIMED_OWNER);
+        bool lost = reused || released;
+        if (lost && isLive) ++evictedUnderLive;
+
+        const char* verdict;
+        if (!lost)              verdict = "slot intact";
+        else if (!isLive)       verdict = "slot released/reused (creature already gone -- normal, not evidence)";
+        else if (released && reused) verdict = "<<< SLOT RELEASED **AND** REUSED WHILE THIS CREATURE IS STILL LIVE";
+        else if (released)      verdict = "<<< SLOT RELEASED (blob WIPED) WHILE THIS CREATURE IS STILL LIVE";
+        else                    verdict = "<<< SLOT REUSED WHILE THIS CREATURE IS STILL LIVE";
+
+        char line[320];
+        snprintf(line, sizeof(line),
+            "  %s entity=0x%llX id=0x%X species=%d runLen=%d spawned-as=%-20s now=%-20s owner=%-3d  %s",
+            state, rec.entityPtr, rec.id, (int)rec.species, (int)rec.runLen, rec.modelPath, nowName,
+            (int)owner, verdict);
+        LogDebug(line);
+    }
+    char tail[320];
+    snprintf(tail, sizeof(tail),
+        "spawn_enemy: --- EVICTION TEST result: live=%d retired=%d stale=%d; "
+        "%d slot(s) RELEASED-or-REUSED under a LIVE creature. %s ---",
+        live, retired, stale, evictedUnderLive,
+        evictedUnderLive > 0
+            ? "CONFIRMED -- the engine pulled a species slot out from under a live creature"
+            : "Not seen this time (every loss was of an already-retired creature, which is normal)");
+    LogDebug(tail);
+}
+
+// --- LIVE ENTITY CENSUS (2026-08-11) ---
+// Tests one inherited assumption that this whole investigation has been leaning on without ever
+// checking it.
+//
+// The comment above ReclaimDeadSlotRuns asserts the engine's slot eviction at room load "is safe
+// for the engine purely because nothing from the previous room is still alive at that moment".
+// That was written in an earlier session with no stated evidence, and everything since -- including
+// the reverted quiet_spawned_entities containment -- has been built on it. Its only support is
+// circular: the engine evicts, the game does not normally crash, therefore nothing must be alive.
+// That is inference from absence, not observation. A native creature has never actually been seen
+// being retired at a transition.
+//
+// WHAT THIS ANSWERS: during the door-opening scene, are the ROOM's own creatures still in the live
+// entity pool?
+//   - If the pool empties to just Sora/party, the assumption holds and creatures we spawned really
+//     are the anomaly (they survive when nothing else does).
+//   - If native creatures are STILL enumerated mid-transition, the assumption is FALSE, and the
+//     difference cannot be lifetime. It would have to be something about our creatures' resource
+//     DATA -- e.g. path B firing only for species we cold-loaded, or our minted handles differing
+//     from the ones a room's own .ard produces. That redirects the search entirely.
+//
+// Uses the same fnc_iterate_live_entities walk and the same resolved-blob-to-species arithmetic as
+// MarkSpeciesInUseByLiveEntities, including its 128 iteration cap. Read-only; no game state is
+// written. `cutsceneFlag` is passed in from Lua (it owns the version-specific address) purely so
+// the log line can be correlated with the door scene without guessing.
+static void LogLiveEntityCensus(unsigned long long base, unsigned long long entityIterFnRva,
+                                unsigned long long resolveHandleFnRva,
+                                unsigned long long speciesResourceTableRva,
+                                int cutsceneFlag) {
+    if (entityIterFnRva == 0 || speciesResourceTableRva == 0 || resolveHandleFnRva == 0) return;
+    unsigned long long tableBase = base + speciesResourceTableRva;
+    unsigned long long entity = 0;
+    unsigned long long iterArgs[1] = { 0 };
+    if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) return;
+
+    int total = 0, unresolved = 0, ours = 0;
+    char list[600];
+    int listLen = 0;
+    list[0] = 0;
+
+    int guard = 0;
+    while (entity != 0 && guard < 128) {
+        ++guard;
+        ++total;
+        int species = -1;
+        uint32_t handle = *(volatile uint32_t*)(uintptr_t)(entity + 0x134);
+        if (handle != 0) {
+            unsigned long long resolveArgs[1] = { (unsigned long long)handle };
+            unsigned long long resolved = 0;
+            if (SafeCall(base + resolveHandleFnRva, resolveArgs, 1, resolved) && resolved != 0 &&
+                resolved >= tableBase &&
+                resolved < tableBase + (unsigned long long)(RESOURCE_BLOB_MAX_SPECIES + 1) * RESOURCE_BLOB_SIZE) {
+                species = (int)((resolved - tableBase) >> 18);
+            }
+        }
+        if (species < 0) ++unresolved;
+
+        // Is this one of ours? Match on the entity pointer we recorded at construct, not on
+        // species -- species can legitimately be shared with a room native of the same creature.
+        bool isOurs = false;
+        int nTracked = g_trackedSpawnCount < MAX_TRACKED_SPAWNS ? g_trackedSpawnCount : MAX_TRACKED_SPAWNS;
+        for (int i = 0; i < nTracked; ++i) {
+            if (g_trackedSpawns[i].entityPtr == entity) { isOurs = true; break; }
+        }
+        if (isOurs) ++ours;
+
+        if (listLen < (int)sizeof(list) - 24) {
+            int w = snprintf(list + listLen, sizeof(list) - listLen, "%s%d%s",
+                             listLen ? " " : "", species, isOurs ? "*" : "");
+            if (w > 0) listLen += w;
+        }
+
+        iterArgs[0] = entity;
+        if (!SafeCall(base + entityIterFnRva, iterArgs, 1, entity)) break;
+    }
+
+    char msg[800];
+    snprintf(msg, sizeof(msg),
+        "LiveEntityCensus: cutscene=%d live=%d ours=%d native=%d unresolvedSpecies=%d  species=[%s]  "
+        "(* = spawned by us; 'native' here means every live entity that is not one of ours, "
+        "including Sora/party)",
+        cutsceneFlag, total, ours, total - ours, unresolved, list);
+    LogDebug(msg);
+}
+
+// Fires the eviction test on the FIRST fault from ANY guard, process-wide.
+//
+// Originally this was hung off BehaviorScriptCopyGuard alone, because that guard preceded the
+// two KH1_BehaviorScriptInterpreter crashes. That was too narrow and the test simply did not run
+// on the next crash, which arrived behind a PartyAbilityIndexGuard storm instead (638 faults,
+// then death). Whichever guard trips first, the question is the same -- had a live creature's
+// species slot been reused? -- so any of them is a valid moment to ask it.
+//
+// Interlocked one-shot: several of these guards run from more than one thread and can fault in
+// bursts, and the answer is only meaningful for the FIRST fault anyway (later ones are downstream
+// of whatever already went wrong).
+static volatile long g_anyGuardFaultReported = 0;
+static void NoteFirstGuardFault(const char* guardName) {
+    if (InterlockedCompareExchange(&g_anyGuardFaultReported, 1, 0) != 0) return;
+    LogSpawnedEntitySlotIntegrity(guardName);
+}
+
 // Forward declarations -- defined later in this file, installed from here.
 static bool InstallJobRecordGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
                                         unsigned long long tablePtrRva, unsigned long long tableCountRva,
@@ -1098,6 +1399,11 @@ static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr)
 static bool InstallBehaviorScriptCopyGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 static bool InstallJointRemapSetupGuardHook(unsigned long long hookAddr);
 static bool InstallVelocityBlendNeighborGuardHook(unsigned long long hookAddr);
+static bool InstallResourceEntryFallbackGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallResourceEntryLookupCounterHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+// Resolve-fn address for the path-B diagnostic's own re-derivation of which condition fired --
+// stashed here because the hook's logger runs from a code cave and can't be handed it.
+static uint64_t g_resolveHandleFnAddrForPathB = 0;
 static bool InstallFreezeWatchdogThread();
 // Live address of the 64-entry resource-handle bucket table, stashed by l_spawn_enemy's headroom
 // check so LogResolveHandleBucketGuard (which runs from a code cave and can't be handed it) can
@@ -1130,6 +1436,16 @@ static bool InstallTextSlotFreshResolveHook(unsigned long long hookAddr, unsigne
 static uint64_t g_lastSpawnedEntityPtr = 0;
 static uint32_t g_lastSpawnedEntityId = 0;
 
+static bool TryWriteU32(uint64_t addr, uint32_t value) {
+    __try {
+        *(volatile uint32_t*)(uintptr_t)addr = value;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 static bool TryReadU32(uint64_t addr, uint32_t* out) {
     __try {
         *out = *(volatile uint32_t*)(uintptr_t)addr;
@@ -1159,6 +1475,115 @@ static void LogEntitySnapshot(const char* when, uint64_t entity, uint32_t expect
         h138, v144, flags374,
         okFlags ? ((flags374 & 0x10000) ? "SET (tick is processing it)" : "CLEAR (tick is SKIPPING it)") : "?");
     LogDebug(msg);
+}
+
+// census_live_entities(entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, cutsceneFlag)
+//
+// Logs one LiveEntityCensus line. Purely diagnostic and read-only -- see LogLiveEntityCensus for
+// the assumption it exists to test. Lua supplies the RVAs (it owns the version-specific address
+// tables) and the current cutscene flag, and is responsible for its own call rate; this does no
+// throttling of its own so the caller can sample as finely as a transition needs.
+extern "C" int l_census_live_entities(void* L) {
+    unsigned long long entityIterFnRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long resolveHandleFnRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    unsigned long long speciesResourceTableRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    int cutsceneFlag = (int)p_lua_tointegerx(L, 4, nullptr);
+    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+    LogLiveEntityCensus(base, entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, cutsceneFlag);
+    return 0;
+}
+
+// quiet_spawned_entities() -> number of creatures quieted
+//
+// *** TRIED AND REVERTED 2026-08-11. STILL EXPORTED BUT NOTHING CALLS IT. ***
+// kh1_lua_library.lua's update_spawn_enemy used to call this on the rising edge of `inCutscene`.
+// It did exactly what it says -- kh1_native.log confirms the bit flipping on the right entities --
+// and the game crashed anyway, in the same second, at RVA 0x2B01B3 behind a
+// "VelocityBlendNeighborGuard: exception walking neighbor entities".
+//
+// WHY IT DOES NOT WORK: bit 0x10000 gates an entity's OWN per-frame tick. It does not remove the
+// entity from the world. Other creatures and systems still enumerate it as a NEIGHBOUR and still
+// read its corrupted data, which is the path the surviving crash came through. This contained the
+// wrong half of the problem. A real fix needs the engine's own despawn/retire routine so the
+// entity stops existing, not a flag that only stops it thinking.
+//
+// Left in the file, inert, per this project's convention for tried-but-unproven fixes
+// (ValidateResolvedBucketAddress, InstallBucketMemoryWatcherThread, InstallFreezeWatchdogThread).
+// Do not re-wire it without a genuinely new idea about the neighbour-walk path.
+//
+// Original description follows.
+//
+// Clears the per-frame tick bit on every creature WE spawned that is still being ticked, so the
+// engine stops running their per-frame update (and therefore their .bd behaviour scripts).
+// Intended to be called the moment a cutscene / room transition begins.
+//
+// WHY THIS EXISTS: live-reproduced repeatedly on 2026-08-11 -- a Crowd-Control-spawned creature
+// that is still alive when the player approaches a door crashes the game during the door scene,
+// consistently inside code that walks its animation/behaviour data (KH1_BehaviorScriptInterpreter
+// RVA 0x2CD023 read and 0x2CD064 stack smash, plus VelocityBlendGuard storms striding a 0x14-byte
+// array off a NULL base). The room's own creatures never hit this because a real transition
+// retires them first; ours are not part of the room roster and keep being ticked.
+//
+// WHAT THIS DOES NOT CLAIM: it does not fix why their data goes bad. The slot-eviction theory was
+// TESTED AND DISPROVED (see LogSpawnedEntitySlotIntegrity -- 0 of 5 tracked slots reused, and the
+// only released runs belonged to creatures already retired by the engine). The actual corruption
+// is still the long-standing bogus/zero-handle problem. This is containment: a creature that is
+// not ticked cannot run a script over bad data, whatever made the data bad.
+//
+// SAFETY: only entities this DLL spawned are touched, and only after re-reading entity+0x04 and
+// confirming the id still matches what we recorded -- the entity pool recycles slots, so a stale
+// pointer would otherwise mean writing into an unrelated creature. Both the read and the write go
+// through SEH. Only the single bit 0x10000 is cleared; every other flag is preserved. A record
+// that fails any check is dropped from tracking rather than retried.
+//
+// FIELD PROVENANCE: entity+0x374 bit 0x10000 is the per-frame tick gate, established live in
+// session 9 (see LogEntitySnapshot's own comment) -- not inferred here. Every entity snapshot
+// logged today agrees: retired creatures read +0x374 == 0, live ones have the bit set.
+extern "C" int l_quiet_spawned_entities(void* L) {
+    int quieted = 0, dropped = 0, alreadyQuiet = 0;
+    int n = g_trackedSpawnCount < MAX_TRACKED_SPAWNS ? g_trackedSpawnCount : MAX_TRACKED_SPAWNS;
+    for (int i = 0; i < n; ++i) {
+        SpawnedEntityRecord& rec = g_trackedSpawns[i];
+        if (rec.entityPtr == 0) continue;
+
+        uint32_t id = 0;
+        if (!TryReadU32(rec.entityPtr + 4, &id) || id != rec.id) {
+            rec.entityPtr = 0; // pool slot recycled or unreadable -- not ours any more
+            ++dropped;
+            continue;
+        }
+        uint32_t flags = 0;
+        if (!TryReadU32(rec.entityPtr + ENTITY_OCCUPIED_FLAG_OFFSET, &flags)) {
+            rec.entityPtr = 0;
+            ++dropped;
+            continue;
+        }
+        if ((flags & 0x10000) == 0) {
+            ++alreadyQuiet; // engine already retired it -- nothing to do
+            continue;
+        }
+        if (TryWriteU32(rec.entityPtr + ENTITY_OCCUPIED_FLAG_OFFSET, flags & ~0x10000u)) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                "quiet_spawned_entities: cleared tick bit on entity=0x%llX id=0x%X species=%d (%s) "
+                "-- +0x374 0x%08X -> 0x%08X",
+                rec.entityPtr, rec.id, (int)rec.species, rec.modelPath, flags, flags & ~0x10000u);
+            LogDebug(msg);
+            ++quieted;
+        } else {
+            rec.entityPtr = 0;
+            ++dropped;
+        }
+    }
+    if (quieted > 0 || dropped > 0) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "quiet_spawned_entities: quieted %d, already-retired %d, dropped %d (of %d tracked)",
+            quieted, alreadyQuiet, dropped, n);
+        LogDebug(msg);
+    }
+    p_lua_pushinteger(L, (long long)quieted);
+    return 1;
 }
 
 // Every spawn_enemy refusal goes through here so it returns a SHORT machine-readable
@@ -1338,6 +1763,16 @@ extern "C" int l_spawn_enemy(void* L) {
     // Optional, same degrade-gracefully convention as the other hook RVAs above.
     unsigned long long velocityBlendNeighborGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 44, nullptr);
 
+    // Entry of PATH B inside fnc_resource_entry_lookup_with_fallback (Steam 0x1DD6AB) -- the
+    // silent fallback that hands callers a slice of the header object as if it were a resource
+    // entry. Diagnostic only; see InstallResourceEntryFallbackGuardHook. Optional, same
+    // degrade-gracefully convention as every other hook RVA here.
+    unsigned long long resourceEntryFallbackHookFnRva = (unsigned long long)p_lua_tointegerx(L, 45, nullptr);
+
+    // ENTRY of the same function (Steam 0x1DD650). Counts calls so a zero path-B count can be
+    // told apart from the function never running -- see InstallResourceEntryLookupCounterHook.
+    unsigned long long resourceEntryLookupCounterFnRva = (unsigned long long)p_lua_tointegerx(L, 46, nullptr);
+
     if (!modelPath || !motionPath) {
         return RefuseSpawn(L, "bad_args",
             "spawn_enemy: model_path/motion_path are required");
@@ -1351,6 +1786,11 @@ extern "C" int l_spawn_enemy(void* L) {
     }
 
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+
+    // Stashed so the guard hooks -- which run on the game's own thread with no access to these
+    // Lua-supplied RVAs -- can read the slot table for the eviction test. Read-only use.
+    g_slotMapBase = base;
+    g_slotMapLoadedPtrTableRva = loadedPtrTableRva;
 
     // Re-read the PREVIOUS spawn's entity before doing anything else. If it was culled, or its pool
     // slot got recycled since, that shows up here as an unreadable or mismatched id -- which
@@ -1601,6 +2041,23 @@ extern "C" int l_spawn_enemy(void* L) {
     if (velocityBlendNeighborGuardHookFnRva != 0) {
         if (!InstallVelocityBlendNeighborGuardHook(base + velocityBlendNeighborGuardHookFnRva)) {
             LogDebug("spawn_enemy: InstallVelocityBlendNeighborGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (resourceEntryFallbackHookFnRva != 0) {
+        // Stash the resolve-fn address first -- the hook's logger needs it to tell condition 2
+        // (handle won't resolve) apart from condition 3 (blob resolved but empty).
+        if (resolveHandleFnRva != 0) g_resolveHandleFnAddrForPathB = base + resolveHandleFnRva;
+        // Resume 8 bytes on: the patch covers LEA(4) + SHL(4), both replayed inside the stub.
+        if (!InstallResourceEntryFallbackGuardHook(base + resourceEntryFallbackHookFnRva,
+                                                    base + resourceEntryFallbackHookFnRva + 8)) {
+            LogDebug("spawn_enemy: InstallResourceEntryFallbackGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (resourceEntryLookupCounterFnRva != 0) {
+        // Resume 5 bytes on -- the patch replaces exactly one 5-byte instruction, replayed in the stub.
+        if (!InstallResourceEntryLookupCounterHook(base + resourceEntryLookupCounterFnRva,
+                                                    base + resourceEntryLookupCounterFnRva + 5)) {
+            LogDebug("spawn_enemy: InstallResourceEntryLookupCounterHook failed to install -- proceeding without it");
         }
     }
     if (textSlotTableBaseRva != 0) {
@@ -2205,6 +2662,12 @@ extern "C" int l_spawn_enemy(void* L) {
     LogEntitySnapshot("post-construct:", (uint64_t)result, (uint32_t)newId);
     g_lastSpawnedEntityPtr = (uint64_t)result;
     g_lastSpawnedEntityId = (uint32_t)newId;
+
+    // Remember which species slot this creature was built from, and what model that slot held at
+    // the time, so the eviction test can later detect the slot being reused underneath it.
+    RecordSpawnedEntity((uint64_t)result, (uint32_t)newId, (uint8_t)species,
+                        (uint8_t)LoadedSlotRunLen(base, loadedPtrTableRva, (uint8_t)species),
+                        modelPath);
 
     p_lua_pushboolean(L, 1);
     p_lua_pushinteger(L, (long long)result);
@@ -3142,6 +3605,7 @@ static uint64_t CheckVelocityBlendParamSafe(uint64_t param2, uint64_t param3) {
             (unsigned long long)param2, g_lastSpawnAttemptId,
             (unsigned long long)g_velocityBlendGuardSkipCount + 1);
         LogDebug(msg);
+        NoteFirstGuardFault("VelocityBlendGuard");
         ++g_velocityBlendGuardSkipCount;
         return 0;
     }
@@ -3280,6 +3744,7 @@ static int32_t CheckPartyAbilityIndexSafe(uint64_t basePtr, uint64_t index) {
             (unsigned long long)basePtr, (unsigned long long)index,
             (unsigned long long)g_partyAbilityIndexGuardSkipCount + 1);
         LogDebug(msg);
+        NoteFirstGuardFault("PartyAbilityIndexGuard");
         ++g_partyAbilityIndexGuardSkipCount;
         return -1;
     }
@@ -3407,6 +3872,7 @@ static int32_t CheckKeyframeListEntrySafe(uint64_t ptr) {
             "KeyframeListEntryGuard: ptr=0x%llX unreadable, treating as end-of-list sentinel (skipsSoFar=%llu)",
             (unsigned long long)ptr, (unsigned long long)g_keyframeListEntryGuardSkipCount + 1);
         LogDebug(msg);
+        NoteFirstGuardFault("KeyframeListEntryGuard");
         ++g_keyframeListEntryGuardSkipCount;
         return -1;
     }
@@ -3784,6 +4250,254 @@ static void LogSection2SizeGuardCorrection(uint32_t rawSize) {
 // Hooks the 9 bytes at fnc_link_model_resource_data's "MOV EAX,[RBP+0xC]" (3) + "SUB EAX,ECX" (2)
 // + "TEST EAX,EAX" (2) + "JLE" (2). ECX (blob+8, needed later by "ADD RCX,RBP" at resumeAddr) is
 // never touched by this hook -- only EAX/EDX are used as scratch.
+// --- RESOURCE-ENTRY FALLBACK (PATH B) DIAGNOSTIC (2026-08-11) ---
+// Answers the last unverified question upstream of every crash in this investigation.
+//
+// fnc_resource_entry_lookup_with_fallback (Steam 0x1401dd650) returns a 16-byte "entry record".
+// Path A resolves a real table entry. Path B (0x1401dd6ab) silently returns a slice of the HEADER
+// OBJECT ITSELF, which callers then read +4/+8 from as resource handles -- which is where the
+// deterministic, float-shaped bogus handles come from. That much is already established.
+//
+// What has NEVER been verified live is WHICH of path B's three triggers actually fires:
+//   1. magic absent            -- *(int*)(param_1+0x10) != 0x96969696
+//   2. blob handle unresolvable -- resolve(*(int*)(param_1+0x14)) == 0
+//   3. empty blob              -- *(void**)resolved == 0
+// The fix is completely different for each, which is why guarding consumers has never converged:
+// sites #6/#7/#8/#10/#11 are all victims of whatever this is.
+//
+// Hooked at PATH B's entry rather than the function entry on purpose: this function is a hot
+// resource lookup, and instrumenting every call would add a resolve to the hot path. Here the
+// cost is only paid when the fallback is actually taken.
+//
+// Read-only: it re-derives the condition from param_1 and logs. It does not alter the return
+// value or the path taken -- the original LEA/SHL are replayed verbatim before resuming.
+// g_resolveHandleFnAddrForPathB is defined with the other hook globals near the top of this file.
+static bool g_resourceEntryFallbackHookInstalled = false;
+static volatile uint64_t g_pathBHitCount = 0;
+
+static void LogResourceEntryFallbackPathB(uint64_t param1, uint64_t idx) {
+    uint64_t hit = ++g_pathBHitCount;
+    // Full detail for the first 20, then 1-in-1024. Path B can fire extremely often once things
+    // go wrong, and burying the first (most diagnostic) hits under a flood would defeat the point.
+    if (hit > 20 && (hit & 1023) != 0) return;
+
+    uint32_t magic = 0, blobHandle = 0;
+    bool magicOk = TryReadU32(param1 + 0x10, &magic);
+    bool handleOk = TryReadU32(param1 + 0x14, &blobHandle);
+
+    const char* why;
+    unsigned long long resolved = 0;
+    uint64_t blobFirstQword = 0;
+
+    if (!magicOk) {
+        why = "COND?: param_1+0x10 unreadable -- param_1 itself is a bad pointer";
+    } else if (magic != 0x96969696) {
+        why = "COND 1: magic absent (param_1+0x10 != 0x96969696) -- this object is not a resource header at all";
+    } else if (!handleOk) {
+        why = "COND?: magic ok but param_1+0x14 unreadable";
+    } else if (g_resolveHandleFnAddrForPathB == 0) {
+        why = "COND 2 or 3 (magic ok; no resolve-fn address configured to tell them apart)";
+    } else {
+        unsigned long long args[1] = { (unsigned long long)blobHandle };
+        if (!SafeCall(g_resolveHandleFnAddrForPathB, args, 1, resolved) || resolved == 0) {
+            why = "COND 2: blob handle did NOT resolve -- the handle at param_1+0x14 is itself bad";
+        } else {
+            uint32_t lo = 0, hi = 0;
+            bool ok = TryReadU32(resolved, &lo) && TryReadU32(resolved + 4, &hi);
+            blobFirstQword = ok ? (((uint64_t)hi << 32) | lo) : 0;
+            if (!ok) {
+                why = "COND 3?: blob resolved but its first qword is unreadable";
+            } else if (blobFirstQword == 0) {
+                why = "COND 3: blob resolved but *blob == 0 -- the table is allocated but EMPTY (load not finished?)";
+            } else {
+                why = "NONE OF 1/2/3 re-derived -- state changed between the branch and this hook (race), or a 4th path";
+            }
+        }
+    }
+
+    char msg[400];
+    snprintf(msg, sizeof(msg),
+        "ResourceEntryFallback: PATH B taken (hit #%llu) idx=%llu param_1=0x%llX magic=0x%08X "
+        "blobHandle=0x%08X resolved=0x%llX *blob=0x%llX -- %s",
+        hit, idx, param1, magic, blobHandle, resolved, blobFirstQword, why);
+    LogDebug(msg);
+}
+
+// --- RESOURCE-ENTRY LOOKUP CALL COUNTER (2026-08-11) ---
+// Settles an ambiguity the path-B hook alone cannot: it recorded ZERO path B hits across a whole
+// session that ended in the usual KH1_BehaviorScriptInterpreter crash. That has two readings and
+// they point in opposite directions:
+//   1. path B genuinely is not taken -- the "bogus handles come from path B" chain does not apply
+//      to these crashes, and the null the interpreter reads comes from somewhere else entirely.
+//   2. the path-B hook is watching a road with no traffic -- if fnc_resource_entry_lookup_with_
+//      fallback is never CALLED, zero hits proves nothing at all.
+// "Installed successfully" only means the bytes were patched; it never meant the code ran.
+//
+// This counts calls at the function's ENTRY and reports the running path-B total alongside, so a
+// single log line distinguishes the two readings outright.
+//
+// Cost: an increment plus a compare on the common path; the log and the magic read happen on call
+// #1 and every 4096th thereafter. Registers -- at entry RCX=param_1 and RDX=idx are live and both
+// are volatile, so they are pushed around the call; RCX still holds param_1 at the call site, so
+// it doubles as the logger's argument for free. Stack: entry RSP%16==8, and push/push/sub 0x28
+// lands the CALL on a 16-byte boundary as the ABI requires.
+static volatile uint64_t g_resourceEntryLookupCallCount = 0;
+static bool g_resourceEntryLookupCounterInstalled = false;
+
+static void LogResourceEntryLookupCall(uint64_t param1) {
+    uint64_t n = ++g_resourceEntryLookupCallCount;
+    if (n != 1 && (n & 4095) != 0) return;
+    uint32_t magic = 0;
+    bool ok = TryReadU32(param1 + 0x10, &magic);
+    char msg[240];
+    snprintf(msg, sizeof(msg),
+        "ResourceEntryLookup: call #%llu param_1=0x%llX magic=%s0x%08X -- PATH B hits so far: %llu",
+        n, param1, ok ? "" : "(unreadable) ", magic,
+        (unsigned long long)g_pathBHitCount);
+    LogDebug(msg);
+}
+
+static bool InstallResourceEntryLookupCounterHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    if (g_resourceEntryLookupCounterInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    // 0x1401dd650: MOV qword ptr [RSP+0x8], RBX -- exactly 5 bytes, so the JMP replaces it whole.
+    static const unsigned char expected[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+    if (memcmp(hookPtr, expected, 5) != 0) {
+        LogDebug("InstallResourceEntryLookupCounterHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallResourceEntryLookupCounterHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[96] = {};
+    size_t off = 0;
+    uint64_t logFnAddr = (uint64_t)(uintptr_t)&LogResourceEntryLookupCall;
+
+    stub[off++] = 0x51;                                         // push rcx  (save param_1)
+    stub[off++] = 0x52;                                         // push rdx  (save idx)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x28; // sub rsp,0x28
+    stub[off++] = 0x48; stub[off++] = 0xB8;                     // mov rax, logFnAddr
+    memcpy(stub + off, &logFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0;                     // call rax   (arg1 = rcx = param_1)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x28; // add rsp,0x28
+    stub[off++] = 0x5A;                                         // pop rdx
+    stub[off++] = 0x59;                                         // pop rcx
+
+    // Replay the original instruction, now that RSP is back to its entry value.
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0x5C; stub[off++] = 0x24; stub[off++] = 0x08;
+
+    stub[off++] = 0xE9; // jmp rel32 -> resumeAddr
+    size_t jmpResumeOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jmpResumeRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpResumeOperand + 4));
+    memcpy(stub + jmpResumeOperand, &jmpResumeRel, 4);
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_resourceEntryLookupCounterInstalled = true;
+    LogDebug("InstallResourceEntryLookupCounterHook: installed successfully");
+    return true;
+}
+
+static bool InstallResourceEntryFallbackGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    if (g_resourceEntryFallbackHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    // 0x1401dd6ab: LEA RAX,[RDI+0x1] ; SHL RAX,0x4   -- 8 bytes, both replayed in the stub.
+    static const unsigned char expected[8] = {
+        0x48, 0x8D, 0x47, 0x01,   // lea rax, [rdi+1]
+        0x48, 0xC1, 0xE0, 0x04    // shl rax, 4
+    };
+    if (memcmp(hookPtr, expected, 8) != 0) {
+        LogDebug("InstallResourceEntryFallbackGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallResourceEntryFallbackGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    // Only RBX (param_1) and RDI (idx) are live across this point, and both are non-volatile in
+    // the x64 ABI, so a compiled C++ callee preserves them for us -- no manual save/restore.
+    // RAX is dead here (the replayed LEA overwrites it). RSP is 16-byte aligned at path B
+    // (entry+8, then PUSH RDI, then SUB RSP,0x20), so SUB RSP,0x20 keeps the CALL aligned.
+    unsigned char stub[96] = {};
+    size_t off = 0;
+    uint64_t logFnAddr = (uint64_t)(uintptr_t)&LogResourceEntryFallbackPathB;
+
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xD9; // mov rcx, rbx   (arg1 = param_1)
+    stub[off++] = 0x48; stub[off++] = 0x89; stub[off++] = 0xFA; // mov rdx, rdi   (arg2 = idx)
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x20; // sub rsp, 0x20
+    stub[off++] = 0x48; stub[off++] = 0xB8;                     // mov rax, logFnAddr
+    memcpy(stub + off, &logFnAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0;                     // call rax
+    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xC4; stub[off++] = 0x20; // add rsp, 0x20
+
+    // Replay the two original instructions verbatim, then resume after them.
+    stub[off++] = 0x48; stub[off++] = 0x8D; stub[off++] = 0x47; stub[off++] = 0x01; // lea rax, [rdi+1]
+    stub[off++] = 0x48; stub[off++] = 0xC1; stub[off++] = 0xE0; stub[off++] = 0x04; // shl rax, 4
+
+    stub[off++] = 0xE9; // jmp rel32 -> resumeAddr
+    size_t jmpResumeOperand = off; off += 4;
+
+    size_t stubLen = off;
+    uintptr_t caveBase = (uintptr_t)cave;
+
+    int32_t jmpResumeRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpResumeOperand + 4));
+    memcpy(stub + jmpResumeOperand, &jmpResumeRel, 4);
+
+    unsigned char patch[8];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90;
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 8);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 8, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 8);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_resourceEntryFallbackHookInstalled = true;
+    LogDebug("InstallResourceEntryFallbackGuardHook: installed successfully");
+    return true;
+}
+
 static bool InstallSection2SizeGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr,
                                            unsigned long long emptyPathAddr) {
     if (g_section2SizeGuardHookInstalled) return true;
@@ -4344,6 +5058,18 @@ static void SafeBehaviorScriptBlockCopy(void* dest, const void* src, size_t size
             (unsigned long long)g_behaviorScriptCopyGuardFaultCount + 1);
         LogDebug(msg);
         ++g_behaviorScriptCopyGuardFaultCount;
+
+        // FIRST fault only. This is the moment the hypothesis is testable: a behaviour-script
+        // block has just failed to load, which is the earliest in-process signal that some
+        // creature's resource data has gone bad -- and it fired ~1 second before both
+        // KH1_BehaviorScriptInterpreter crashes. Checking here, rather than at the next
+        // spawn_enemy call, matters because the process may not survive to see another call.
+        //
+        // Deliberately once: these faults arrive in bursts (8 in one second was observed) and a
+        // per-fault dump would bury the answer in its own output.
+        if (g_behaviorScriptCopyGuardFaultCount == 1) {
+            LogSpawnedEntitySlotIntegrity("BehaviorScriptCopyGuard first fault");
+        }
     }
 }
 
@@ -4574,6 +5300,7 @@ static int64_t CallVelocityBlendNeighborSafe(int64_t param_1, int64_t param_2) {
             "VelocityBlendNeighborGuard: exception walking neighbor entities, reporting 'no neighbor' for this entity/frame (skipsSoFar=%llu)",
             (unsigned long long)g_velocityBlendNeighborGuardSkipCount + 1);
         LogDebug(msg);
+        NoteFirstGuardFault("VelocityBlendNeighborGuard");
         ++g_velocityBlendNeighborGuardSkipCount;
         return 0;
     }
@@ -5094,6 +5821,7 @@ static void CallSkeletonBlendSafe(int64_t param_1, uint64_t* param_2, float para
             "SkeletonBlendCallGuard: exception during per-entity animation update, skipping this entity this frame (skipsSoFar=%llu)",
             (unsigned long long)g_skeletonBlendCallGuardSkipCount + 1);
         LogDebug(msg);
+        NoteFirstGuardFault("SkeletonBlendCallGuard");
         ++g_skeletonBlendCallGuardSkipCount;
     }
 }
@@ -5382,6 +6110,8 @@ static const luaL_Reg kh1_native_lib[] = {
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
     {"spawn_enemy", reinterpret_cast<void*>(l_spawn_enemy)},
+    {"quiet_spawned_entities", reinterpret_cast<void*>(l_quiet_spawned_entities)},
+    {"census_live_entities", reinterpret_cast<void*>(l_census_live_entities)},
     {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
     {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
     {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},

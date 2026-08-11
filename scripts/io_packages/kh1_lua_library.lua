@@ -933,6 +933,19 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         return false, "in cutscene", "cutscene"
     end
 
+    --[[Don't spawn in the Gummi ship. There is no field for a creature to exist
+    in there, and a spawn that survives into the transition out of it hits the
+    2026-08-11 root cause: the engine's room-unload release wipes the species
+    resource blob while our creature is still live, after which anything that
+    walks that creature reads a wiped blob. A live crash was reproduced doing
+    exactly this -- entering the Gummi ship with a spawned Heartless on screen.
+
+    is_in_gummi_garage's name understates it: per its own comment it returns
+    true for the whole Gummi ship, not just the garage, which is what we want.]]
+    if is_in_gummi_garage() then
+        return false, "in gummi ship", "gummi"
+    end
+
     if x == nil or y == nil or z == nil then
         local pos = get_sora_pos()
         x = x or pos["X"]
@@ -961,7 +974,8 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         fnc_status_effect_handle_capture_hook, fnc_status_effect_handle_record_hook,
         fnc_text_slot_fresh_resolve_hook, text_slot_table_base, resource_handle_bucket_table,
         fnc_behavior_script_copy_guard_hook, fnc_joint_remap_setup_guard_hook,
-        fnc_release_species_slot_run, fnc_velocity_blend_neighbor_guard_hook)
+        fnc_release_species_slot_run, fnc_velocity_blend_neighbor_guard_hook,
+        fnc_resource_entry_fallback_hook, fnc_resource_entry_lookup_counter_hook)
 end
 
 -- Pending spawn_enemy requests
@@ -976,14 +990,23 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
     actually drive it, the same convention open_text_box/update_text_boxes
     uses.
 
-    Ignored outright (never queued) if a cutscene is already playing --
-    callers that want it to happen once the cutscene ends should re-request
-    it themselves rather than have this silently wait out an unknown-length
-    cutscene.]]
+    Ignored outright (never queued) if a cutscene is already playing, or if the
+    player is in the Gummi ship -- callers that want it to happen afterwards
+    should re-request it themselves rather than have this silently wait out an
+    unknown-length cutscene or Gummi route.]]
 
     if ReadInt(inCutscene) ~= 0 then
         if callback then
             callback(false, "spawn_enemy: ignored, player is in a cutscene")
+        end
+        return
+    end
+
+    -- See spawn_enemy_attempt's own Gummi comment for why this is refused
+    -- rather than queued.
+    if is_in_gummi_garage() then
+        if callback then
+            callback(false, "spawn_enemy: ignored, player is in the Gummi ship")
         end
         return
     end
@@ -999,10 +1022,51 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
     }
 end
 
+--[[LIVE ENTITY CENSUS -- RAN ONCE, ANSWERED ITS QUESTION, THEN REMOVED (2026-08-11).
+
+It existed to test an assumption inherited from a code comment and never verified: that the
+engine has retired every creature from the old room by the time it evicts species slots. It
+answered decisively -- during a cutscene the pool still held ~20 native entities alongside
+ours, so the assumption is FALSE and our creatures are NOT special for merely being alive.
+The native function kh1_native.census_live_entities is still exported if it is ever needed
+again.
+
+REMOVED BECAUSE IT FROZE THE GAME, and the mistake is worth recording:
+  - The 0.25s throttle is PER LUA STATE. Every top-level script gets its own state and its
+    own copy of this module, so with two scripts installed it fired at ~8Hz, not 4Hz.
+  - Each call walked up to 128 entities making two SEH-wrapped foreign calls each
+    (fnc_iterate_live_entities + fnc_resolve_resource_handle), so ~2000 guarded calls/sec,
+    on the game's main thread, plus a synchronous open/write/close of the log per line.
+  - Worst of all it walked the entity pool DURING a transition, i.e. exactly while the engine
+    was mutating it -- something nothing in this project had ever done before.
+
+Same shape as InstallBucketMemoryWatcherThread and InstallFreezeWatchdogThread before it: a
+sampler that is cheap in isolation becomes a hazard at the moment it is most interesting.
+If a future census is needed, sample on demand (one call at a chosen instant) rather than on
+a timer, and never during teardown.]]
+
 local function update_spawn_enemy()
     --[[Drives every pending spawn_enemy request one step forward. Call this
     every frame from your own script's _OnFrame -- see spawn_enemy's comment
-    for why this can't happen automatically.]]
+    for why this can't happen automatically.
+
+    Also drives the live-entity census above while that diagnostic is in place.
+
+    TRIED AND REVERTED 2026-08-11 -- do not re-add without a new idea:
+    this used to clear the per-frame tick bit on every creature we spawned on
+    the rising edge of `inCutscene` (kh1_native.quiet_spawned_entities), to stop
+    their behaviour scripts running through a room transition. It WORKED
+    mechanically -- the bit flipped, confirmed in kh1_native.log -- and the game
+    still crashed in the same second. Bit 0x10000 gates an entity's OWN tick; it
+    does not remove the entity from the world, so other creatures still walk it
+    as a NEIGHBOUR and still read its corrupted data. The crash that followed
+    came through exactly that path (VelocityBlendNeighborGuard: "exception
+    walking neighbor entities"). Quieting the wrong half of the problem.
+
+    The native function is left in place but is no longer called, per this
+    project's convention for tried-but-unproven fixes. A real fix needs the
+    engine's own despawn/retire path, not a flag flip.]]
+
     for id, req in pairs(pending_spawn_requests) do
         -- 4th value is the short refusal code (see SPAWN_FAILURE_MESSAGES); it
         -- is nil on success and on the still-loading paths.
@@ -1016,6 +1080,15 @@ local function update_spawn_enemy()
                 pending_spawn_requests[id] = nil
                 if req.callback then
                     req.callback(false, "spawn_enemy: ignored, player entered a cutscene while this request was pending")
+                end
+            elseif stillLoading == "gummi" then
+                -- Boarded the Gummi ship after this request was queued. Same
+                -- reasoning as the cutscene case: drop it rather than hold it
+                -- across an unknown-length Gummi route and land a spawn on the
+                -- way out.
+                pending_spawn_requests[id] = nil
+                if req.callback then
+                    req.callback(false, "spawn_enemy: ignored, player boarded the Gummi ship while this request was pending")
                 end
             elseif os.clock() >= req.deadline then
                 pending_spawn_requests[id] = nil

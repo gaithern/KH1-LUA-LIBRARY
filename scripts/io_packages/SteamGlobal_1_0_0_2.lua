@@ -405,6 +405,21 @@ fnc_joint_remap_setup_guard_hook = 0x2A0350
 -- in-band failure result, unlike most sites here. See
 -- InstallVelocityBlendNeighborGuardHook (dllmain.cpp) for the full writeup.
 fnc_velocity_blend_neighbor_guard_hook = 0x2B5AF0
+-- PATH B entry inside fnc_resource_entry_lookup_with_fallback (0x1DD650). Path B is the silent
+-- fallback that returns a 16-byte slice of the HEADER OBJECT ITSELF as if it were a resource
+-- table entry; callers then read its +4/+8 as resource handles, which is the documented source
+-- of the deterministic float-shaped bogus handles behind crash sites #6/#7/#8/#10/#11.
+-- DIAGNOSTIC ONLY -- the hook logs which of path B's three triggers fired (magic absent /
+-- blob handle unresolvable / *blob == 0), the one thing never verified live, and does not alter
+-- the path taken. Hooked at path B rather than the function entry because the function itself is
+-- a hot lookup. See InstallResourceEntryFallbackGuardHook (dllmain.cpp).
+-- Bytes at this address: 48 8D 47 01 (lea rax,[rdi+1]) 48 C1 E0 04 (shl rax,4).
+fnc_resource_entry_fallback_hook = 0x1DD6AB
+-- ENTRY of the same function. Counts calls, so "path B fired 0 times" can be distinguished from
+-- "this function never ran" -- the first path-B session logged zero hits and it was not possible
+-- to tell which. Bytes here: 48 89 5C 24 08 (mov [rsp+8], rbx), exactly 5, so the JMP replaces
+-- one whole instruction. DIAGNOSTIC ONLY.
+fnc_resource_entry_lookup_counter_hook = 0x1DD650
 -- Status-effect floating-text stale-pointer fix (2026-08-05) -- properly re-derives the value
 -- instead of guarding a bad read. Three coordinated hook points inside
 -- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own
