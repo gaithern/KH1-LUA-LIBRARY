@@ -517,6 +517,8 @@ static bool InstallSection2SizeGuardHook(unsigned long long hookAddr, unsigned l
                                            unsigned long long emptyPathAddr);
 static bool InstallResolveHandleBucketGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr);
+static bool InstallBehaviorScriptCopyGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
+static bool InstallJointRemapSetupGuardHook(unsigned long long hookAddr);
 static uint64_t g_textSlotTableBase = 0;
 static uint64_t g_resolveHandleFnAddrForTextSlot = 0;
 static bool InstallTextSlotHandleCaptureHook(unsigned long long hookAddr, unsigned long long resumeAddr);
@@ -641,6 +643,17 @@ extern "C" int l_spawn_enemy(void* L) {
     // same degrade-gracefully convention as the other hook RVAs above; unlike those, this isn't a
     // code hook at all, just a plain data address a background thread reads/writes directly.
     unsigned long long resourceHandleBucketTableRva = (unsigned long long)p_lua_tointegerx(L, 40, nullptr);
+    // Entry point of the memcpy call inside KH1_BehaviorScriptInterpreter's
+    // class-0/sub-op-0xA handler (see InstallBehaviorScriptCopyGuardHook's own
+    // comment) -- fixes crash site #6, a resolved-but-invalid handle used as a
+    // memcpy source with zero validation. Optional, same degrade-gracefully
+    // convention as the other hook RVAs above.
+    unsigned long long behaviorScriptCopyGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 41, nullptr);
+    // Entry point of FUN_1402a0350 (see InstallJointRemapSetupGuardHook's own
+    // comment) -- fixes crash site #7, a null deref inside a joint/bone
+    // remap-table builder reached on a fresh motion transition. Optional,
+    // same degrade-gracefully convention as the other hook RVAs above.
+    unsigned long long jointRemapSetupGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 42, nullptr);
 
     if (!modelPath || !motionPath) {
         p_lua_pushboolean(L, 0);
@@ -781,6 +794,16 @@ extern "C" int l_spawn_enemy(void* L) {
     // matching this file's existing convention for a tried-and-reverted approach -- do
     // not re-enable without a real fix for what to actually validate.
     (void)resourceHandleBucketTableRva;
+    if (behaviorScriptCopyGuardHookFnRva != 0) {
+        if (!InstallBehaviorScriptCopyGuardHook(base + behaviorScriptCopyGuardHookFnRva, base + behaviorScriptCopyGuardHookFnRva + 5)) {
+            LogDebug("spawn_enemy: InstallBehaviorScriptCopyGuardHook failed to install -- proceeding without it");
+        }
+    }
+    if (jointRemapSetupGuardHookFnRva != 0) {
+        if (!InstallJointRemapSetupGuardHook(base + jointRemapSetupGuardHookFnRva)) {
+            LogDebug("spawn_enemy: InstallJointRemapSetupGuardHook failed to install -- proceeding without it");
+        }
+    }
     if (textSlotTableBaseRva != 0) {
         g_textSlotTableBase = base + textSlotTableBaseRva;
     }
@@ -2817,6 +2840,234 @@ static bool InstallBucketMemoryWatcherThread(unsigned long long bucketTableAddr)
     CloseHandle(hThread); // fire-and-forget -- the thread outlives this handle
     g_bucketWatcherThreadInstalled = true;
     LogDebug("InstallBucketMemoryWatcherThread: installed successfully");
+    return true;
+}
+
+// --- BEHAVIOR-SCRIPT RESOLVED-BLOCK COPY GUARD HOOK (2026-08-06) ---
+// KH1_BehaviorScriptInterpreter (Steam RVA 0x2cc620, the .bd AI-script bytecode VM run
+// once per active creature per frame) has an opcode handler (class 0/sub-op 0xA --
+// "load a block via a resolved resource handle") that resolves a handle then feeds the
+// raw result straight into memcpy as the SOURCE with zero validation -- unlike a
+// sibling opcode in the very same function (class 0/sub-op 3, RVA 0x2cc6e7) which
+// explicitly checks the resolve result for null before using it.
+//
+// Live-crashed 2026-08-06 after 8 rapid spawn_enemy calls (heavy churn, several
+// simultaneously-alive Heartless each running their own behavior script every frame):
+// the memcpy source was non-null -- not caught by even a null check -- but genuinely
+// unmapped memory, roughly 27MB below the exe's own module base that session.
+// Root-caused via the game's own CrashDump.dmp (Python `minidump` + manual
+// disassembly against the on-disk exe, cross-referenced with Ghidra once its MCP
+// connection came back). This is crash site #6 in
+// project_spawn_enemy_cold_spawn_crash_containment.md, and is exactly the "third
+// case" (a bucket pointing at real, once-valid memory the OS later freed) that file
+// has documented as open since 2026-08-05 -- the same gap two earlier attempts (a
+// reverted per-call VirtualQuery check, and this same day's failed
+// InstallBucketMemoryWatcherThread) both tried and failed to close from different
+// angles.
+//
+// Unlike those two attempts, this doesn't try to validate a handle/bucket ahead of
+// time -- it wraps the actual risky operation (the memcpy itself) in a real compiled
+// __try/__except, the same technique already proven safe in this file (see
+// InstallSkeletonBlendCallGuardHook). SEH costs nothing on the success path -- no
+// VirtualQuery, no per-call kernel transition -- and only pays a cost when the copy
+// genuinely faults, avoiding the exact contention/freeze risk that sank the
+// VirtualQuery-based attempts. This replaces a single 5-byte CALL instruction (the
+// call to the memcpy import thunk at RVA 0x2ccfed) with a CALL to a compiled wrapper
+// that does the same copy inside __try/__except; RCX/RDX/R8 are already loaded with
+// dest/src/size by the untouched instructions immediately before this call site,
+// matching the x64 calling convention exactly, so no trampoline/register-shuffling is
+// needed -- just a normal call, then falls through to the same resume point (RVA
+// 0x2ccff2) the original memcpy's return would have reached. RSI/RDI/RBX (needed by
+// the resumed code right after) are non-volatile in the x64 ABI, so any compliant
+// compiled function -- including this wrapper -- preserves them automatically.
+static bool g_behaviorScriptCopyGuardHookInstalled = false;
+static volatile uint64_t g_behaviorScriptCopyGuardFaultCount = 0;
+
+static void SafeBehaviorScriptBlockCopy(void* dest, const void* src, size_t size) {
+    __try {
+        memcpy(dest, src, size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "BehaviorScriptCopyGuard: memcpy from a resolved-but-invalid handle faulted -- "
+            "skipped, destination left unwritten (faultsSoFar=%llu)",
+            (unsigned long long)g_behaviorScriptCopyGuardFaultCount + 1);
+        LogDebug(msg);
+        ++g_behaviorScriptCopyGuardFaultCount;
+    }
+}
+
+static bool InstallBehaviorScriptCopyGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
+    if (g_behaviorScriptCopyGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    static const unsigned char expected[5] = { 0xE8, 0x04, 0x80, 0x0B, 0x00 }; // call <memcpy thunk>
+    if (memcmp(hookPtr, expected, 5) != 0) {
+        LogDebug("InstallBehaviorScriptCopyGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!cave) {
+        LogDebug("InstallBehaviorScriptCopyGuardHook: failed to allocate a nearby code cave");
+        return false;
+    }
+
+    unsigned char stub[32] = {};
+    size_t off = 0;
+    uint64_t wrapperAddr = (uint64_t)(uintptr_t)&SafeBehaviorScriptBlockCopy;
+    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, wrapperAddr
+    memcpy(stub + off, &wrapperAddr, 8); off += 8;
+    stub[off++] = 0xFF; stub[off++] = 0xD0; // call rax
+    stub[off++] = 0xE9; // jmp rel32 -> resumeAddr
+    size_t jmpOperand = off; off += 4;
+    size_t stubLen = off;
+
+    uintptr_t caveBase = (uintptr_t)cave;
+    int32_t jmpRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpOperand + 4));
+    memcpy(stub + jmpOperand, &jmpRel, 4);
+
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    memcpy(cave, stub, stubLen);
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 5);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 5);
+    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
+
+    ResumeThreads(threads);
+
+    g_behaviorScriptCopyGuardHookInstalled = true;
+    LogDebug("InstallBehaviorScriptCopyGuardHook: installed successfully");
+    return true;
+}
+
+// --- JOINT/MOTION-BLEND SETUP GUARD HOOK (2026-08-06) ---
+// While retesting InstallBehaviorScriptCopyGuardHook above (crash site #6), heavy
+// spawn_enemy churn crashed the game again -- a DIFFERENT, unrelated function this
+// time, confirming the bucket-exhaustion "return 0" fix (2026-08-05) surfaces as null
+// derefs in many scattered, previously-never-hit places across the animation/skeleton
+// system, not just one. Root-caused via the game's own CrashDump.dmp: FUN_140394080
+// (Steam RVA 0x394080, likely a joint/bone remap-table builder run when an entity's
+// animation first transitions to a fresh motion -- calls fnc_resolve_resource_handle
+// 30+ times with essentially no null-checking anywhere in it) dereferenced a null
+// param_2[1] (RVA 0x3941e0, `CMP dword ptr [RAX+0x10],R12D` with RAX=0) -- the null
+// most likely originates from an upstream resolve failure in a field this function
+// assumes is always populated by the time it runs.
+//
+// FUN_140394080 has exactly one caller, FUN_1402a0350 (Steam RVA 0x2a0350) -- itself
+// called from 5+ distinct sites across 3 different functions plus indirect
+// function-pointer-table references (matching the same "shared choke point, not worth
+// hooking every caller individually" shape as InstallSkeletonBlendCallGuardHook
+// above), and internally either takes a "blend in progress" branch or, on a cold/
+// fresh transition (`*(float*)(param_1+0x170) <= 0.0`), calls FUN_140394080 directly
+// -- exactly the path that crashed. Rather than trace the exact upstream resolve that
+// produced the null (would only fix this one field) or patch inside
+// FUN_140394080/FUN_140393b30 individually (whack-a-mole, same conclusion as the
+// skeleton-blend precedent above), this wraps FUN_1402a0350's own entry in a real
+// __try/__except using the SAME two-trampoline technique as
+// InstallSkeletonBlendCallGuardHook -- catches a crash anywhere in this function's
+// whole call tree (both the cold-transition and blend-in-progress branches) at once,
+// including causes not yet individually identified.
+static bool g_jointRemapSetupGuardHookInstalled = false;
+static volatile uint64_t g_jointRemapSetupGuardSkipCount = 0;
+
+typedef void (*JointRemapSetupOriginalFn)(int64_t, int64_t, uint64_t, uint32_t, float);
+static JointRemapSetupOriginalFn g_jointRemapSetupOriginalTrampoline = nullptr;
+
+// Tail-jumped into with the exact register/stack state (RCX/RDX/R8/R9/stack-XMM) the
+// real function's 5+ callers set up -- same signature as the real function (matching
+// Ghidra's own decompiled signature shape: two pointers, a qword, a dword, a stack
+// float), so the compiler-generated prologue sees a normal call-entry stack.
+static void CallJointRemapSetupSafe(int64_t param_1, int64_t param_2, uint64_t param_3, uint32_t param_4, float param_5) {
+    __try {
+        g_jointRemapSetupOriginalTrampoline(param_1, param_2, param_3, param_4, param_5);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "JointRemapSetupGuard: exception during motion-transition setup, skipping for this entity/frame (skipsSoFar=%llu)",
+            (unsigned long long)g_jointRemapSetupGuardSkipCount + 1);
+        LogDebug(msg);
+        ++g_jointRemapSetupGuardSkipCount;
+    }
+}
+
+static bool InstallJointRemapSetupGuardHook(unsigned long long hookAddr) {
+    if (g_jointRemapSetupGuardHookInstalled) return true;
+
+    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
+    // mov r11,rsp; push rbx; push r14
+    static const unsigned char expected[6] = { 0x4C, 0x8B, 0xDC, 0x53, 0x41, 0x56 };
+    if (memcmp(hookPtr, expected, 6) != 0) {
+        LogDebug("InstallJointRemapSetupGuardHook: unexpected original bytes at hook address, aborting");
+        return false;
+    }
+
+    void* replayCave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!replayCave) {
+        LogDebug("InstallJointRemapSetupGuardHook: failed to allocate replay code cave");
+        return false;
+    }
+    {
+        unsigned char stub[16] = {};
+        size_t off = 0;
+        memcpy(stub + off, expected, 6); off += 6; // replay original 6 bytes
+        stub[off++] = 0xE9; // jmp rel32 -> hookAddr+6 (rest of the real function body)
+        size_t jmpOperand = off; off += 4;
+        size_t stubLen = off;
+        uintptr_t caveBase = (uintptr_t)replayCave;
+        int32_t jmpRel = (int32_t)((int64_t)(hookAddr + 6) - (int64_t)(caveBase + jmpOperand + 4));
+        memcpy(stub + jmpOperand, &jmpRel, 4);
+        memcpy(replayCave, stub, stubLen);
+        FlushInstructionCache(GetCurrentProcess(), replayCave, stubLen);
+    }
+    g_jointRemapSetupOriginalTrampoline = (JointRemapSetupOriginalFn)(uintptr_t)replayCave;
+
+    void* redirectCave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
+    if (!redirectCave) {
+        LogDebug("InstallJointRemapSetupGuardHook: failed to allocate redirect code cave");
+        return false;
+    }
+    {
+        unsigned char stub[16] = {};
+        size_t off = 0;
+        uint64_t wrapperAddr = (uint64_t)(uintptr_t)&CallJointRemapSetupSafe;
+        stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, wrapperAddr
+        memcpy(stub + off, &wrapperAddr, 8); off += 8;
+        stub[off++] = 0xFF; stub[off++] = 0xE0; // jmp rax
+        size_t stubLen = off;
+        memcpy(redirectCave, stub, stubLen);
+        FlushInstructionCache(GetCurrentProcess(), redirectCave, stubLen);
+    }
+
+    unsigned char patch[6];
+    patch[0] = 0xE9;
+    int32_t hookRel = (int32_t)((int64_t)(uintptr_t)redirectCave - (int64_t)(hookAddr + 5));
+    memcpy(patch + 1, &hookRel, 4);
+    patch[5] = 0x90; // nop, pad the 6th original byte
+
+    std::vector<HANDLE> threads = SuspendOtherThreads();
+
+    DWORD oldProtect = 0;
+    VirtualProtect((void*)(uintptr_t)hookAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy((void*)(uintptr_t)hookAddr, patch, 6);
+    VirtualProtect((void*)(uintptr_t)hookAddr, 6, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 6);
+
+    ResumeThreads(threads);
+
+    g_jointRemapSetupGuardHookInstalled = true;
+    LogDebug("InstallJointRemapSetupGuardHook: installed successfully");
     return true;
 }
 

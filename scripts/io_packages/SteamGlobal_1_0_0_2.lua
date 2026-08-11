@@ -377,6 +377,21 @@ fnc_resolve_resource_handle_impl_bucket_check = 0x38AF5C
 -- once-valid memory the OS later freed) -- a per-call VirtualQuery check was tried and reverted
 -- the same day for freezing the game; this sidesteps that by checking rarely, off the hot thread.
 resource_handle_bucket_table = 0x2EE3980
+-- CALL instruction (memcpy import thunk) inside KH1_BehaviorScriptInterpreter's
+-- class-0/sub-op-0xA opcode handler ("load block via resolved handle"). Resolves a
+-- handle then feeds the raw result straight into memcpy as the source with zero
+-- validation -- crash site #6, live-crashed 2026-08-06 after heavy spawn_enemy churn.
+-- See InstallBehaviorScriptCopyGuardHook (dllmain.cpp) for the full writeup.
+fnc_behavior_script_copy_guard_hook = 0x2CCFED
+-- Entry of FUN_1402a0350 -- a joint/bone remap-table setup dispatcher, reached on a
+-- creature's first motion transition, that either blends or (cold path) calls
+-- FUN_140394080 (30+ unchecked fnc_resolve_resource_handle calls). Crash site #7,
+-- live-crashed 2026-08-06 immediately after crash site #6 was fixed -- confirms the
+-- bucket-exhaustion "return 0" fix surfaces as null derefs scattered across the
+-- animation system, not just one site. Wrapped whole (not patched inline) since this
+-- function has 5+ callers plus indirect table references -- see
+-- InstallJointRemapSetupGuardHook (dllmain.cpp) for the full writeup.
+fnc_joint_remap_setup_guard_hook = 0x2A0350
 -- Status-effect floating-text stale-pointer fix (2026-08-05) -- properly re-derives the value
 -- instead of guarding a bad read. Three coordinated hook points inside
 -- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own
