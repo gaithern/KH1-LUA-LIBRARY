@@ -386,7 +386,8 @@ resource_handle_bucket_table = 0x2EE3980
 -- handle then feeds the raw result straight into memcpy as the source with zero
 -- validation -- crash site #6, live-crashed after heavy spawn_enemy churn.
 -- See InstallBehaviorScriptCopyGuardHook (dllmain.cpp) for the full writeup.
--- [HOOK TOGGLE: OFF] fnc_behavior_script_copy_guard_hook = 0x2CCFED
+-- [HOOK TOGGLE: ON] Re-enabled 2026-08-12: the unhooked baseline crashes here on room transitions.
+fnc_behavior_script_copy_guard_hook = 0x2CCFED
 -- Entry of FUN_1402a0350 -- a joint/bone remap-table setup dispatcher, reached on a
 -- creature's first motion transition, that either blends or (cold path) calls
 -- FUN_140394080 (30+ unchecked fnc_resolve_resource_handle calls). Crash site #7,
@@ -492,6 +493,9 @@ g_BossDefeatEffectStart = 0x233FDFC
 -- [HOOK TOGGLE: OFF] fnc_status_effect_handle_record_hook = 0x1E0198
 -- [HOOK TOGGLE: OFF] fnc_text_slot_fresh_resolve_hook = 0x1EBA78
 text_slot_table_base = 0x2678280
+-- Stamps owner=species and runLen into every slot of a run. The engine's room-unload sweep only
+-- releases blocks where owner==own index, so a load that skips this is never reclaimed.
+fnc_claim_species_slot_run = 0x286190
 -- Base of the shared 96-slot global entity pool (stride 0x4B0/1200 bytes) --
 -- Sora, party members, doors/chests/markers, and every
 -- fnc_spawn_world_gimmick_entity-constructed creature live in it. Confirmed

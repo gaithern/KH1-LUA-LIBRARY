@@ -205,7 +205,7 @@ static volatile unsigned char g_customTextActive = 0;
 static bool g_popupHookInstalled = false;
 
 // Finds executable memory near the target, since jmp/call have limited range.
-static void* AllocateNear(void* target, size_t size) {
+void* AllocateNear(void* target, size_t size) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     uintptr_t granularity = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
@@ -226,7 +226,7 @@ static void* AllocateNear(void* target, size_t size) {
 }
 
 // Pauses every other thread so bytes can be patched safely.
-static std::vector<HANDLE> SuspendOtherThreads() {
+std::vector<HANDLE> SuspendOtherThreads() {
     std::vector<HANDLE> handles;
     DWORD selfTid = GetCurrentThreadId();
     DWORD pid = GetCurrentProcessId();
@@ -255,7 +255,7 @@ static std::vector<HANDLE> SuspendOtherThreads() {
 
 // Opposite of above, resumes those threads
 // after the hook is installed.
-static void ResumeThreads(std::vector<HANDLE>& handles) {
+void ResumeThreads(std::vector<HANDLE>& handles) {
     for (HANDLE h : handles) {
         ResumeThread(h);
         CloseHandle(h);
@@ -870,6 +870,8 @@ static HMODULE FindLuaModule() {
 // Lua's require entry point: resolves the real Lua function pointers, then registers ours.
 extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     LogDebug("luaopen_kh1_native called");
+
+    InstallCrashDumpHandler();
 
     HMODULE hLua = FindLuaModule();
     if (hLua && !p_lua_gettop) {

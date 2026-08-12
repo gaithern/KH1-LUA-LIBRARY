@@ -257,6 +257,27 @@ static bool SpeciesRunStillIntact(unsigned long long base, unsigned long long lo
     return true;
 }
 
+// Every slot of a run must carry the SAME owner byte. A partly-claimed run means the tail slots
+// were never populated, so data living there is whatever the previous occupant left.
+// Uniform 0xFF occurs on healthy loaded runs, so only DISAGREEMENT is the defect -- not 0xFF itself.
+static bool RunOwnershipUniform(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                uint8_t species, int runLen, int* outBadSlot, uint8_t* outOwners) {
+    volatile uint8_t* ownerAt = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+        LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+    uint8_t first = *ownerAt;
+    bool uniform = true;
+    for (int k = 0; k < runLen; ++k) {
+        int slot = (int)species + k;
+        if (slot > RESOURCE_BLOB_MAX_SPECIES) break;
+        volatile uint8_t* owner = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+            LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+        uint8_t v = *owner;
+        if (outOwners && k < 16) outOwners[k] = v;
+        if (v != first && uniform) { uniform = false; if (outBadSlot) *outBadSlot = slot; }
+    }
+    return uniform;
+}
+
 // A reused slot must still be wholly ours. Only meaningful once state==6 -- while a load is in
 // flight the owner bytes are not written yet, so an intact run would look broken.
 static bool ReuseSlotIsSafe(unsigned long long base, unsigned long long loadedPtrTableRva,
@@ -404,7 +425,59 @@ static const uint8_t SPECIES_SLOT_UNCLAIMED_OWNER = 0xFF;
 // A creature claims a RUN of record+0x56 consecutive slots, so the WHOLE run must be free.
 // Scans TOP-DOWN: the engine tiles upward from slot 0, so allocating high avoids its path.
 static const int SPECIES_SLOT_ALLOC_MIN = 20;
-static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX) {
+// Slots that were already free when we entered this room. The engine only re-tiles slot runs at
+// ROOM LOAD, when everything referencing them has been torn down -- a run it releases MID-room may
+// still be pointed at (live-confirmed: a display slot held a pointer into species 53's blob after
+// its run was released, and loading over it crashed the game). owner==0xFF alone cannot tell the
+// two apart, so we only ever allocate runs that were free at room entry.
+static bool g_freeAtRoomEntry[SPECIES_SLOT_COUNT] = {};
+static bool g_roomEntrySnapshotValid = false;
+
+static void SnapshotFreeSlotsAtRoomEntry(unsigned long long base, unsigned long long loadedPtrTableRva) {
+    if (loadedPtrTableRva == 0) return;
+    int freeCount = 0;
+    for (int s = 0; s < SPECIES_SLOT_COUNT; ++s) {
+        bool isFree = false;
+        if (s <= SPECIES_SLOT_ALLOC_MAX) {
+            volatile uint8_t* ownerAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+                LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
+            isFree = (*ownerAddr == SPECIES_SLOT_UNCLAIMED_OWNER);
+        }
+        g_freeAtRoomEntry[s] = isFree;
+        if (isFree && s >= SPECIES_SLOT_ALLOC_MIN) ++freeCount;
+    }
+    g_roomEntrySnapshotValid = true;
+    char msg[144];
+    snprintf(msg, sizeof(msg),
+        "spawn_enemy: room-entry snapshot -- %d of %d slots in %d..%d were free and are allocatable",
+        freeCount, SPECIES_SLOT_ALLOC_MAX - SPECIES_SLOT_ALLOC_MIN + 1,
+        SPECIES_SLOT_ALLOC_MIN, SPECIES_SLOT_ALLOC_MAX);
+    LogDebug(msg);
+}
+
+// owner==0xFF is NOT sufficient to call a slot free: a loaded species can carry no owner stamp at
+// all (live-confirmed). Release wipes the blob but leaves state and the cached name, so a VALID
+// blob header is what separates "still live" from "released". Live-confirmed: slot 61 read
+// owner=0xFF/state=6/xa_ex_2110 with real data, was treated as free, and got loaded over.
+static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loadedPtrTableRva,
+                                 unsigned long long speciesResourceTableRva, int slot) {
+    if (speciesResourceTableRva == 0) return false;
+    volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+        LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+    if (*stateAddr != SPECIES_SLOT_STATE_READY) return false;
+    const char* name = (const char*)(uintptr_t)(base + loadedPtrTableRva +
+        LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
+    if (name[0] == '\0') return false;
+    // Section +4 is 128 on every valid header seen (ours and natives alike); a wiped blob reads 0.
+    int32_t sec4 = 0;
+    __try {
+        memcpy(&sec4, (const void*)(uintptr_t)(base + speciesResourceTableRva +
+               (unsigned long long)slot * RESOURCE_BLOB_SIZE + 4), sizeof(sec4));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return sec4 > 0;
+}
+
+static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, unsigned long long speciesResourceTableRva, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX) {
     if (slotRunLen < 1) slotRunLen = 1; // a signed-char <= 0 makes FUN_140286190 claim nothing
     // Highest start slot whose whole run still fits inside the allocatable range.
     int startAt = SPECIES_SLOT_ALLOC_MAX - slotRunLen + 1;
@@ -416,10 +489,16 @@ static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loade
             if (slot > RESOURCE_BLOB_MAX_SPECIES) { runFree = false; break; }
             if (speciesInUseByLiveEntity && speciesInUseByLiveEntity[slot]) { runFree = false; break; }
             if (IsSpeciesTriggeredThisSession((uint8_t)slot)) { runFree = false; break; }
+            // Only runs free since room entry -- a mid-room release may still be referenced.
+            if (g_roomEntrySnapshotValid && !g_freeAtRoomEntry[slot]) { runFree = false; break; }
             // owner == 0xFF: rejects run members, accepts engine-released slots.
             volatile uint8_t* ownerAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
                 LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
             if (*ownerAddr != SPECIES_SLOT_UNCLAIMED_OWNER) { runFree = false; break; }
+            // Unowned but still holding a live, loaded species -- loading over it clobbers live data.
+            if (SlotHoldsLiveSpecies(base, loadedPtrTableRva, speciesResourceTableRva, slot)) {
+                runFree = false; break;
+            }
         }
         if (runFree) {
             *outSpecies = (uint8_t)s;
@@ -431,17 +510,50 @@ static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loade
 
 // Picks a free run that also avoids the room's own records, walking past rejected candidates.
 // Returning only the first free run deadlocked spawning whenever that one run collided.
+// A text slot caches a raw pointer into the creature blob its text belongs to, so overwriting that
+// blob makes the next text layout read garbage. Live-confirmed: slot 13 pointed into species 53's
+// blob, our next load claimed 52..56 over it, and fnc_text_slot_layout_prepare crashed on approach
+// to a door. owner==0xFF is necessary but NOT sufficient -- the engine releases a run while the text
+// system still references it.
+static const uint64_t TEXT_SLOT_STRIDE = 0xE0;
+static const int TEXT_SLOT_COUNT = 256;
+
+static bool TryReadU64(uint64_t addr, uint64_t* out) {
+    __try { *out = *(volatile uint64_t*)(uintptr_t)addr; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool RunReferencedByTextSlot(unsigned long long base, unsigned long long textSlotTableRva,
+                                    unsigned long long speciesResourceTableRva,
+                                    int species, int slotRunLen, int* outTextSlot) {
+    if (textSlotTableRva == 0 || speciesResourceTableRva == 0) return false;
+    const uint64_t lo = base + speciesResourceTableRva + (uint64_t)species * RESOURCE_BLOB_SIZE;
+    const uint64_t hi = lo + (uint64_t)(slotRunLen < 1 ? 1 : slotRunLen) * RESOURCE_BLOB_SIZE;
+    const uint64_t tb = base + textSlotTableRva;
+    for (int i = 0; i < TEXT_SLOT_COUNT; ++i) {
+        // +0x98 and +0xA0 are the two cached data pointers the layout pass dereferences.
+        for (int off = 0x98; off <= 0xA0; off += 8) {
+            uint64_t p = 0;
+            if (!TryReadU64(tb + (uint64_t)i * TEXT_SLOT_STRIDE + off, &p)) continue;
+            if (p >= lo && p < hi) { if (outTextSlot) *outTextSlot = i; return true; }
+        }
+    }
+    return false;
+}
+
 static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned long long loadedPtrTableRva,
                                             const bool* speciesInUseByLiveEntity, int slotRunLen,
                                             const uint8_t* table, int32_t count,
                                             unsigned long long resolveFnAddr, const char* modelPath,
+                                            unsigned long long textSlotTableRva,
+                                            unsigned long long speciesResourceTableRva,
                                             uint8_t* outSpecies) {
     // Top-down: start at the highest allocatable slot and walk DOWN past rejected candidates.
     // See FindFreeLoadedSlot's comment for why the direction matters.
     int searchFrom = SPECIES_SLOT_ALLOC_MAX;
     uint8_t candidate = 0;
     int rejected = 0;
-    while (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesInUseByLiveEntity, slotRunLen,
+    while (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesResourceTableRva, speciesInUseByLiveEntity, slotRunLen,
                               &candidate, searchFrom)) {
         // Test the WHOLE run against the room's table: a long run otherwise swallows room-native slots
         // further along it, which the room then re-claims over a live creature.
@@ -453,6 +565,17 @@ static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned lo
                 runCollides = true;
                 break;
             }
+        }
+        int refSlot = -1;
+        if (!runCollides &&
+            RunReferencedByTextSlot(base, textSlotTableRva, speciesResourceTableRva,
+                                    (int)candidate, slotRunLen, &refSlot)) {
+            char msg[176];
+            snprintf(msg, sizeof(msg),
+                "spawn_enemy: skipping run %d..%d -- text slot %d still points into it",
+                (int)candidate, (int)candidate + slotRunLen - 1, refSlot);
+            LogDebug(msg);
+            runCollides = true;
         }
         if (!runCollides) {
             if (rejected > 0) {
@@ -632,6 +755,12 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long gameSpeedRva = (unsigned long long)p_lua_tointegerx(L, 27, nullptr);
     unsigned long long bossDefeatEffectRva = (unsigned long long)p_lua_tointegerx(L, 28, nullptr);
     unsigned long long bossDefeatEffectStartRva = (unsigned long long)p_lua_tointegerx(L, 29, nullptr);
+    // Text-slot table base -- see RunReferencedByTextSlot.
+    unsigned long long textSlotTableRva = (unsigned long long)p_lua_tointegerx(L, 30, nullptr);
+    // Engine's block-claim routine (owner=species + runLen into every slot of the run).
+    unsigned long long claimSlotRunFnRva = (unsigned long long)p_lua_tointegerx(L, 31, nullptr);
+    // Crash site #6: the behavior-script VM's unvalidated block-copy memcpy.
+    unsigned long long behaviorScriptCopyGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 32, nullptr);
 
 
 
@@ -653,6 +782,11 @@ extern "C" int l_spawn_enemy(void* L) {
     // Lua-supplied RVAs -- can read the slot table for the eviction test. Read-only use.
     g_slotMapBase = base;
     g_slotMapLoadedPtrTableRva = loadedPtrTableRva;
+    // Once-guarded internally; safe to call on every spawn.
+    if (behaviorScriptCopyGuardHookFnRva != 0) {
+        InstallBehaviorScriptCopyGuardHook(base + behaviorScriptCopyGuardHookFnRva,
+                                           base + behaviorScriptCopyGuardHookFnRva + 5);
+    }
     // Diagnostics-only; lets LogEntitySnapshot walk entity+0x134's shape descriptor.
     g_resolveHandleFnAddrForDiag = base + resolveHandleFnRva;
 
@@ -706,10 +840,12 @@ extern "C" int l_spawn_enemy(void* L) {
             g_triggeredLoadCount = 0;
             LogDebug("spawn_enemy: room changed -- triggered-load bookkeeping cleared "
                      "(slot runs are left to the engine's own room-load eviction)");
+            SnapshotFreeSlotsAtRoomEntry(base, loadedPtrTableRva);
             // A creature from the previous room cannot still be alive; stop re-reading its pointer.
             g_lastSpawnedEntityPtr = 0;
             g_lastSpawnedEntityId = 0;
         }
+        if (!g_roomEntrySnapshotValid) SnapshotFreeSlotsAtRoomEntry(base, loadedPtrTableRva);
         g_lastSpawnRoomWorld = curWorld;
         g_lastSpawnRoomArea = curArea;
         g_lastSpawnRoomSet = curSet;
@@ -827,7 +963,8 @@ extern "C" int l_spawn_enemy(void* L) {
     // Room-native collision is folded into slot selection; checking after it deadlocked spawning.
     } else if (FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
                                                templateSlotRunLen, oldTable, oldCount,
-                                               base + resolveHandleFnRva, modelPath, &species) ||
+                                               base + resolveHandleFnRva, modelPath,
+                                               textSlotTableRva, speciesResourceTableRva, &species) ||
                // No reclaim retry: releasing a run wipes its blob and the liveness test gating that
                // is unreliable, so refusing when the window is full is safer.
                false) {
@@ -979,6 +1116,26 @@ extern "C" int l_spawn_enemy(void* L) {
             }
         }
 
+        // Claim the run as a proper block BEFORE loading, the way the engine does. Its room-unload
+        // sweep only releases blocks whose owner == their own index; skipping this leaves the run
+        // unowned, so it is never reclaimed and other blocks tile straight over it.
+        if (claimSlotRunFnRva != 0) {
+            int claimLen = slotRunLen > 0 ? slotRunLen : 1;
+            unsigned long long claimArgs[2] = { (unsigned long long)species, (unsigned long long)claimLen };
+            unsigned long long claimResult = 0;
+            char cmsg[200];
+            if (SafeCall(base + claimSlotRunFnRva, claimArgs, 2, claimResult)) {
+                snprintf(cmsg, sizeof(cmsg),
+                    "spawn_enemy: claimed species=%d run of %d as a block (engine will release it at room unload)",
+                    species, claimLen);
+            } else {
+                snprintf(cmsg, sizeof(cmsg),
+                    "spawn_enemy: species-slot claim CRASHED for species=%d run %d -- continuing unclaimed; "
+                    "this run will not be reclaimed at room unload", species, claimLen);
+            }
+            LogDebug(cmsg);
+        }
+
         unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
         unsigned long long loadResult = 0;
         bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);
@@ -1031,6 +1188,36 @@ extern "C" int l_spawn_enemy(void* L) {
             p_lua_pushstring(L, "spawn_enemy: asset load still in progress -- call again next frame (this is normal for a creature's first load this session)");
             p_lua_pushboolean(L, 1);
             return 3;
+        }
+    }
+
+    // A run whose slots disagree on owner was only partly claimed: the unclaimed tail was never
+    // populated, so anything the asset stores there reads as the previous occupant's leftovers.
+    if (loadedPtrTableRva != 0 && species >= 0 && species <= RESOURCE_BLOB_MAX_SPECIES) {
+        volatile uint8_t* stateAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+            LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)species * LOADED_SPECIES_STRIDE);
+        if (*stateAddr == SPECIES_SLOT_STATE_READY) {
+            int runLen = LoadedSlotRunLen(base, loadedPtrTableRva, species);
+            int badSlot = -1;
+            uint8_t owners[16] = {};
+            if (!RunOwnershipUniform(base, loadedPtrTableRva, species, runLen, &badSlot, owners)) {
+                char od[128]; int n = 0;
+                for (int k = 0; k < runLen && k < 16 && n < (int)sizeof(od) - 8; ++k)
+                    n += snprintf(od + n, sizeof(od) - n, "%s0x%02X", k ? "," : "", owners[k]);
+                char msg[320];
+                snprintf(msg, sizeof(msg),
+                    "spawn_enemy: species=%d run of %d has MIXED ownership (slots %d..%d owners=%s, "
+                    "first mismatch at slot %d) -- the run was only partly claimed, so its tail holds "
+                    "stale data. Refusing to construct.",
+                    species, runLen, species, species + runLen - 1, od, badSlot);
+                LogDebug(msg);
+                *tablePtrAddr = oldTable;
+                *tableCountAddr = oldCount;
+                p_lua_pushboolean(L, 0);
+                p_lua_pushstring(L, "spawn_enemy: asset run only partly claimed -- refusing (retry may pick a different slot)");
+                p_lua_pushboolean(L, 1);
+                return 3;
+            }
         }
     }
 

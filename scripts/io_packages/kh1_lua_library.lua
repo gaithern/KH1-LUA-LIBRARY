@@ -960,7 +960,7 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         weight = known.weight
         template = known.template
     end
-    -- 29 positional args -- must stay in step with l_spawn_enemy's parameter reads.
+    -- 30 positional args -- must stay in step with l_spawn_enemy's parameter reads.
     return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount,
         fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, fnc_resolve_resource_handle,
         speciesResourceTable, model_path, motion_path, x, y, z,
@@ -968,7 +968,10 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         fnc_iterate_live_entities, charId, weight, template,
         entityPoolBase, soraPointer, g_SoraObjPtr, g_PartyMember1ObjectPtr, g_PartyMember2ObjPtr,
         resource_handle_bucket_table,
-        g_GameSpeed, g_BossDefeatEffect, g_BossDefeatEffectStart)
+        g_GameSpeed, g_BossDefeatEffect, g_BossDefeatEffectStart,
+        text_slot_table_base,
+        fnc_claim_species_slot_run,
+        fnc_behavior_script_copy_guard_hook)
 end
 
 -- Pending spawn_enemy requests

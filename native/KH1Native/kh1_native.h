@@ -2,6 +2,8 @@
 // Shared internals between dllmain.cpp and spawn_enemy.cpp. Defined in dllmain.cpp.
 
 #include <cstddef>
+#include <windows.h>
+#include <vector>
 
 // --- Lua C API pointers, resolved at luaopen time ---
 typedef int          (__cdecl* t_lua_gettop)(void* L);
@@ -36,6 +38,17 @@ void LogDebug(const char* msg);
 // Calls base-relative game code SEH-wrapped; false means it faulted.
 bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount,
               unsigned long long& outResult);
+
+// Writes a full-memory dump on the first game-code access violation (crash_dump.cpp).
+void InstallCrashDumpHandler();
+
+// Code-cave hook helpers (dllmain.cpp).
+void* AllocateNear(void* target, size_t size);
+std::vector<HANDLE> SuspendOtherThreads();
+void ResumeThreads(std::vector<HANDLE>& handles);
+
+// Crash site #6 guard: SEH-wraps the behavior-script VM's block-copy memcpy (script_guard.cpp).
+bool InstallBehaviorScriptCopyGuardHook(unsigned long long hookAddr, unsigned long long resumeAddr);
 
 // Enemy spawn (spawn_enemy.cpp).
 extern "C" int l_spawn_enemy(void* L);
