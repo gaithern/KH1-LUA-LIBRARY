@@ -1530,16 +1530,34 @@ static void LogEntitySnapshot(const char* when, uint64_t entity, uint32_t expect
     bool ok144 = TryReadU32(entity + 0x144, &v144);
     bool okFlags = TryReadU32(entity + 0x374, &flags374);
 
-    char msg[352];
+    // The four handle fields that fnc_link_model_resource_data_kind3 writes ONLY when their blob
+    // section is non-empty, and leaves completely untouched otherwise (no else branch, unlike
+    // +0x138/+0x1dc which fall back to mint(0)). Because the 96-slot entity pool is memset only on
+    // a slot's FIRST allocation, an unwritten field silently inherits the PREVIOUS occupant's
+    // handle. entity+0x134 is the one fnc_velocity_blend_neighbor_scan dereferences and the prime
+    // suspect for the 2026-08-11 20:36 crash. Logging these next to the header's field gates makes
+    // a stale value directly visible: gate == 0 in the header line and a handle here that is
+    // identical to an EARLIER spawn's value is the confirmation.
+    uint32_t h134 = 0, h140 = 0, h13c = 0, h68 = 0;
+    bool ok134 = TryReadU32(entity + 0x134, &h134);
+    bool ok140 = TryReadU32(entity + 0x140, &h140);
+    bool ok13c = TryReadU32(entity + 0x13c, &h13c);
+    bool ok68 = TryReadU32(entity + 0x68, &h68);
+
+    char msg[640];
     snprintf(msg, sizeof(msg),
         "spawn_enemy: %s entity=0x%llX readable(id,+138,+144,+374)=%d%d%d%d id=0x%X (expected 0x%X, "
-        "%s) +0x138=0x%08X +0x144=0x%08X +0x374=0x%08X perFrameTickBit0x10000=%s",
+        "%s) +0x138=0x%08X +0x144=0x%08X +0x374=0x%08X perFrameTickBit0x10000=%s | "
+        "stale-prone handles readable(134,140,13c,68)=%d%d%d%d "
+        "+0x134=0x%08X +0x140=0x%08X +0x13c=0x%08X +0x68=0x%08X",
         when, (unsigned long long)entity,
         (int)okId, (int)okH, (int)ok144, (int)okFlags,
         id, expectedId,
         (okId && id == expectedId) ? "MATCH" : "MISMATCH/unreadable -- entity slot was reused or freed",
         h138, v144, flags374,
-        okFlags ? ((flags374 & 0x10000) ? "SET (tick is processing it)" : "CLEAR (tick is SKIPPING it)") : "?");
+        okFlags ? ((flags374 & 0x10000) ? "SET (tick is processing it)" : "CLEAR (tick is SKIPPING it)") : "?",
+        (int)ok134, (int)ok140, (int)ok13c, (int)ok68,
+        h134, h140, h13c, h68);
     LogDebug(msg);
 }
 
@@ -1839,6 +1857,17 @@ extern "C" int l_spawn_enemy(void* L) {
     // told apart from the function never running -- see InstallResourceEntryLookupCounterHook.
     unsigned long long resourceEntryLookupCounterFnRva = (unsigned long long)p_lua_tointegerx(L, 46, nullptr);
 
+    // Boss-defeat / slow-motion state. Steam RVAs sourced from the community "Slowmode" script
+    // (KSX), which drives this effect by writing these three globals; cross-checked in Ghidra that
+    // the GAME itself writes them too, so they are real engine state and not script-only scratch:
+    // g_GameSpeed is a genuine timescale float, and g_BossDefeatEffectStart is written by
+    // fnc_01F_blur_on / fnc_0B8_rotate_blur (EVDL effect opcodes) among others.
+    // See the 2026-08-11 20:56 crash: a spawn landed inside the post-boss slowdown and the engine
+    // wiped the species blob out from under the live creature a few seconds later.
+    unsigned long long gameSpeedRva = (unsigned long long)p_lua_tointegerx(L, 47, nullptr);
+    unsigned long long bossDefeatEffectRva = (unsigned long long)p_lua_tointegerx(L, 48, nullptr);
+    unsigned long long bossDefeatEffectStartRva = (unsigned long long)p_lua_tointegerx(L, 49, nullptr);
+
     if (!modelPath || !motionPath) {
         return RefuseSpawn(L, "bad_args",
             "spawn_enemy: model_path/motion_path are required");
@@ -1863,6 +1892,69 @@ extern "C" int l_spawn_enemy(void* L) {
     // separates "never became visible" from "appeared briefly then was silently removed".
     if (g_lastSpawnedEntityPtr != 0) {
         LogEntitySnapshot("previous-spawn recheck:", g_lastSpawnedEntityPtr, g_lastSpawnedEntityId);
+    }
+
+    // ---- Boss-defeat / slow-motion refusal -------------------------------------------------
+    //
+    // WHY: the 2026-08-11 20:56 crash. A spawn completed cleanly at 20:56:08, and ~5s later the
+    // ENGINE released and wiped that species' resource blob while our creature was still live
+    // (blobHandle at header+0x14 zeroed, magic intact), sending
+    // fnc_resource_entry_lookup_with_fallback down path B 20x and killing the game in
+    // fnc_text_slot_layout_prepare. Every previous sighting of that engine wipe was at a ROOM
+    // TRANSITION; this one had none -- the trigger was a boss-defeat/battle-end cleanup. The real
+    // fix is still to remove our tracked entities when the engine tears down, and it must now cover
+    // battle-end as well as room change. This is harm reduction at the demonstrated trigger, not
+    // that fix.
+    //
+    // Refusing here is cheap: the caller retries every frame (the crash log shows dozens of
+    // retries per second through exactly this window), so a spawn merely lands a moment later
+    // instead of inside the teardown.
+    //
+    // DELIBERATELY FAIL-OPEN, and gated on g_GameSpeed ONLY. This file has twice shipped a
+    // validator built on an invariant that was inferred rather than observed, and twice broken the
+    // whole feature. g_GameSpeed has a known normal value (1.0) and a known slowed value (0.1), so
+    // "positively below normal" is a real observation. The other two bytes have NO observed normal
+    // value yet, so they are LOGGED ONLY and gate nothing. If a read fails, or the value looks
+    // normal, we proceed exactly as before -- a missed window costs one caught exception, a false
+    // positive costs the user the entire feature.
+    if (gameSpeedRva != 0) {
+        uint32_t rawSpeed = 0, effect = 0, effectStart = 0;
+        bool okSpeed = TryReadU32(base + gameSpeedRva, &rawSpeed);
+        bool okEffect = (bossDefeatEffectRva != 0) && TryReadU32(base + bossDefeatEffectRva, &effect);
+        bool okStart = (bossDefeatEffectStartRva != 0) && TryReadU32(base + bossDefeatEffectStartRva, &effectStart);
+
+        float gameSpeed = 1.0f;
+        if (okSpeed) memcpy(&gameSpeed, &rawSpeed, sizeof(gameSpeed));
+
+        // Treat only a genuinely sub-normal, finite timescale as "slowed". NaN/garbage compares
+        // false here and is therefore treated as normal, which is the fail-open direction.
+        const bool slowed = okSpeed && (gameSpeed > 0.0f) && (gameSpeed < 0.9f);
+
+        // Log on the first call ever (to capture the baseline these thresholds should be judged
+        // against) and on every abnormal reading. Not on every normal call -- the caller polls
+        // each frame and that would bury the spawn diagnostics, which is a failure mode this
+        // file has hit before.
+        static bool s_loggedSpeedBaseline = false;
+        if (!s_loggedSpeedBaseline || slowed) {
+            s_loggedSpeedBaseline = true;
+            char spdMsg[320];
+            snprintf(spdMsg, sizeof(spdMsg),
+                "spawn_enemy: engine state readable(speed,effect,start)=%d%d%d g_GameSpeed=%f "
+                "(raw=0x%08X) bossDefeatEffect=%u bossDefeatEffectStart=%u -- slowed=%d "
+                "(only g_GameSpeed gates; the other two are diagnostic only)",
+                (int)okSpeed, (int)okEffect, (int)okStart, (double)gameSpeed, rawSpeed,
+                (unsigned)(effect & 0xFF), (unsigned)(effectStart & 0xFF), (int)slowed);
+            LogDebug(spdMsg);
+        }
+
+        if (slowed) {
+            // Nothing has been allocated or published yet, so returning here is a true no-op --
+            // no table swap to roll back, no phantom placement record. Keep it that way if this
+            // block ever moves.
+            return RefuseSpawn(L, "boss_defeat_slowdown",
+                "spawn_enemy: the game is in a boss-defeat/slow-motion sequence right now -- refusing "
+                "so the spawn does not land while the engine is tearing down battle resources; retry shortly");
+        }
     }
 
     // Room-change slot reclamation -- see ReclaimOwnSlotRuns' own comment for why a room change is
@@ -2618,7 +2710,20 @@ extern "C" int l_spawn_enemy(void* L) {
             (unsigned long long)(RESOURCE_BLOB_MAX_SPECIES + 1 - species) *
             (unsigned long long)RESOURCE_BLOB_SIZE;
 
-        int32_t sec[5] = {};
+        // NINE dwords (+4..+0x24), not five. Reason (2026-08-11 20:36 crash): our spawns are
+        // kind==3 entities, so the constructor path they actually take is
+        // fnc_link_model_resource_data's DEFAULT branch -> fnc_link_model_resource_data_kind3
+        // (Steam 0x140287e40), which reads header entries all the way out to +0x24. The five
+        // dwords logged before this change could not even express the gate for entity+0x134 --
+        // the field implicated in that crash -- because that gate is (*(+0x18) - *(+0x14)).
+        //
+        // *** THE SANITY CHECK BELOW DELIBERATELY STILL COVERS ONLY THE FIRST FIVE. ***
+        // The non-negative/in-bounds/non-decreasing invariant was live-verified for +4..+0x14
+        // only. Nothing has ever observed whether +0x18..+0x24 obey it, and this file's history
+        // is emphatic on the cost of guessing: a validator built on an inferred invariant has
+        // already blocked all spawning once. The four new entries are LOGGED ONLY. Tighten this
+        // later if, and only if, real data says they are monotonic too.
+        int32_t sec[9] = {};
         bool readOk = false;
         __try {
             memcpy(sec, (const void*)(uintptr_t)(blobAddr + 4), sizeof(sec));
@@ -2647,11 +2752,24 @@ extern "C" int l_spawn_enemy(void* L) {
         // on every attempt means the next repro shows what a genuinely bad one looks like
         // side by side with the good ones, instead of another guess.
         if (readOk) {
-            char hdrMsg[256];
+            // Also log the DERIVED section sizes, because those -- not the raw offsets -- are what
+            // fnc_link_model_resource_data_kind3 actually gates each entity field on. A size of 0
+            // means that field is NEVER WRITTEN and silently keeps the previous pool occupant's
+            // handle (there is no else branch for these five, unlike +0x138/+0x1dc which fall back
+            // to mint(0)). entity+0x134 is the field implicated in the 20:36 crash via
+            // fnc_velocity_blend_neighbor_scan; +0x140 was already provably stale on 12/12 spawns.
+            char hdrMsg[512];
             snprintf(hdrMsg, sizeof(hdrMsg),
-                "spawn_enemy: species=%d blob header sections +4..+0x14 = %d, %d, %d, %d, %d "
-                "(recRunLen=%d, sane=%d)",
-                species, sec[0], sec[1], sec[2], sec[3], sec[4], blobRunLen, (int)headerSane);
+                "spawn_enemy: species=%d blob header sections +4..+0x24 = %d, %d, %d, %d, %d, %d, %d, %d, %d "
+                "(recRunLen=%d, sane=%d) | field gates: +0x68=%d +0x140=%d +0x13c=%d +0x134=%d +0x4a8=%d "
+                "(0 => field left STALE)",
+                species, sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7], sec[8],
+                blobRunLen, (int)headerSane,
+                sec[2] - sec[1],   // entity+0x68
+                sec[3] - sec[2],   // entity+0x140
+                sec[4] - sec[3],   // entity+0x13c
+                sec[5] - sec[4],   // entity+0x134  <-- the crash field
+                sec[8] - sec[7]);  // entity+0x4a8
             LogDebug(hdrMsg);
         }
 

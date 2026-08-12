@@ -348,4 +348,16 @@ g_pEVStringDataPtr = 0x23927C0
 fnc_display_message_anim_hook = 0x1B6FE3
 fnc_play_se2 = 0x1766F0
 fnc_display_message_anim_resume = 0x1B6FEC
-fnc_display_message_anim_call_target = 0x174400
+fnc_display_message_anim_call_target = 0x174400-- Boss-defeat / slow-motion engine state (2026-08-11). Used by spawn_enemy to refuse while the
+-- game is in the post-boss slowdown -- see the SteamGlobal_1_0_0_2.lua entry for the full crash
+-- story (the 20:56 crash was a spawn whose species blob the engine wiped during battle-end
+-- teardown, with NO room transition involved).
+-- RVAs from the community "Slowmode" script (KSX). Unlike most EGS twins in this project these
+-- were NOT taken on trust: verified against the EGS Ghidra database, where the xref shape matches
+-- the Steam build exactly -- g_GameSpeed has 13 xrefs (1 write / 12 reads) in both, and
+-- g_BossDefeatEffectStart has 1 read / 6 writes in both, including the two EVDL blur opcodes.
+-- ONLY g_GameSpeed gates the refusal; the other two are logged for diagnosis. The gate is
+-- fail-open and read-only, so a wrong address costs at most a spurious refusal, never a crash.
+g_GameSpeed = 0x23405CC
+g_BossDefeatEffect = 0x23405E8
+g_BossDefeatEffectStart = 0x23407FC

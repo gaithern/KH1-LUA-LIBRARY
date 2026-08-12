@@ -420,6 +420,21 @@ fnc_resource_entry_fallback_hook = 0x1DD6AB
 -- to tell which. Bytes here: 48 89 5C 24 08 (mov [rsp+8], rbx), exactly 5, so the JMP replaces
 -- one whole instruction. DIAGNOSTIC ONLY.
 fnc_resource_entry_lookup_counter_hook = 0x1DD650
+-- Boss-defeat / slow-motion engine state (2026-08-11). Used by spawn_enemy to refuse while the
+-- game is in the post-boss slowdown: the 20:56 crash was a spawn that completed cleanly and then
+-- had its species blob wiped by the engine's battle-end teardown ~5s later, killing the game in
+-- fnc_text_slot_layout_prepare. Unlike every earlier sighting of that wipe, there was NO room
+-- transition -- battle-end fires the same release path.
+-- RVAs from the community "Slowmode" script (KSX), which drives the effect by writing these.
+-- Confirmed in Ghidra that the game itself writes them too, so they are real engine state:
+-- g_GameSpeed is a genuine timescale float (1.0 normal, 0.1 during the effect) read by
+-- fnc_get_number_of_seconds_played among others, and g_BossDefeatEffectStart is written by
+-- fnc_01F_blur_on / fnc_0B8_rotate_blur (EVDL effect opcodes).
+-- ONLY g_GameSpeed gates the refusal; the other two are logged for diagnosis until a real normal
+-- value has been observed for them. See the gate in l_spawn_enemy (dllmain.cpp).
+g_GameSpeed = 0x233FBCC
+g_BossDefeatEffect = 0x233FBE8
+g_BossDefeatEffectStart = 0x233FDFC
 -- Status-effect floating-text stale-pointer fix (2026-08-05) -- properly re-derives the value
 -- instead of guarding a bad read. Three coordinated hook points inside
 -- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own
