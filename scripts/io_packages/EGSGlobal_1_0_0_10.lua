@@ -323,7 +323,7 @@ fnc_iterate_live_entities = 0x28F990
 -- InstallBucketMemoryWatcherThread still runs here and still prevents dereferencing genuinely-freed
 -- memory (resets it to -1 instead), but a bucket that's merely EXHAUSTED (not freed) still resolves
 -- to a raw -1 pointer on this build with nothing downstream to catch it -- weaker than Steam until
--- the guard hook itself is ported. 2026-08-05.
+-- the guard hook itself is ported..
 resource_handle_bucket_table = 0x2EE4730
 
 fnc_show_item_message = 0x2712A0
@@ -348,7 +348,7 @@ g_pEVStringDataPtr = 0x23927C0
 fnc_display_message_anim_hook = 0x1B6FE3
 fnc_play_se2 = 0x1766F0
 fnc_display_message_anim_resume = 0x1B6FEC
-fnc_display_message_anim_call_target = 0x174400-- Boss-defeat / slow-motion engine state (2026-08-11). Used by spawn_enemy to refuse while the
+fnc_display_message_anim_call_target = 0x174400-- Boss-defeat / slow-motion engine state. Used by spawn_enemy to refuse while the
 -- game is in the post-boss slowdown -- see the SteamGlobal_1_0_0_2.lua entry for the full crash
 -- story (the 20:56 crash was a spawn whose species blob the engine wiped during battle-end
 -- teardown, with NO room transition involved).

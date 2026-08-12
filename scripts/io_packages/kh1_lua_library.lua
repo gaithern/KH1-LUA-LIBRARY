@@ -886,7 +886,7 @@ local SPAWN_FAILURE_MESSAGES = {
     no_creature_data  = "spawn_enemy: no offline data for this creature (missing from kh1_creature_data.lua)",
     hook_install_fail = "spawn_enemy: the safety hooks failed to install -- refusing rather than spawn unprotected",
     slot_collision    = "spawn_enemy: that creature's slot is already used by a different creature in this room",
-    -- NOT "only a restart reclaims them" (the wording before 2026-08-11). On-demand reclamation
+    -- NOT "only a restart reclaims them" (the wording before). On-demand reclamation
     -- is enabled again, and it has already run by the time this refusal is produced, so this
     -- means "nothing reclaimable right now", not "nothing ever". Slots come back as spawned
     -- creatures are defeated and on room changes. Unlike handles_full above, which really is
@@ -935,7 +935,7 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
 
     --[[Don't spawn in the Gummi ship. There is no field for a creature to exist
     in there, and a spawn that survives into the transition out of it hits the
-    2026-08-11 root cause: the engine's room-unload release wipes the species
+ root cause: the engine's room-unload release wipes the species
     resource blob while our creature is still live, after which anything that
     walks that creature reads a wiped blob. A live crash was reproduced doing
     exactly this -- entering the Gummi ship with a spawned Heartless on screen.
@@ -960,22 +960,14 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         weight = known.weight
         template = known.template
     end
+    -- 29 positional args -- must stay in step with l_spawn_enemy's parameter reads.
     return kh1_native.spawn_enemy(fnc_spawn_world_gimmick_entity, placementTablePtr, placementTableCount,
         fnc_load_gimmick_assets, loadedSpeciesPtrTable, fnc_mint_resource_handle, fnc_resolve_resource_handle,
         speciesResourceTable, model_path, motion_path, x, y, z,
         g_WorldNumber, g_AreaNumber, g_SetNumber,
-        fnc_async_load_job_callback, fnc_velocity_blend_util, fnc_iterate_live_entities,
-        fnc_party_ability_index_resolve_call, charId, weight, template,
-        fnc_skeleton_handle_deref_hook, fnc_skeleton_blend_call_hook,
-        fnc_keyframe_list_entry_hook, entityPoolBase, soraPointer,
-        g_SoraObjPtr, g_PartyMember1ObjectPtr, g_PartyMember2ObjPtr,
-        fnc_keyframe_list_lookup_param_hook, fnc_anim_blend_advance_diag_hook,
-        fnc_link_model_resource_data_section2_check, fnc_resolve_resource_handle_impl_bucket_check,
-        fnc_status_effect_handle_capture_hook, fnc_status_effect_handle_record_hook,
-        fnc_text_slot_fresh_resolve_hook, text_slot_table_base, resource_handle_bucket_table,
-        fnc_behavior_script_copy_guard_hook, fnc_joint_remap_setup_guard_hook,
-        fnc_release_species_slot_run, fnc_velocity_blend_neighbor_guard_hook,
-        fnc_resource_entry_fallback_hook, fnc_resource_entry_lookup_counter_hook,
+        fnc_iterate_live_entities, charId, weight, template,
+        entityPoolBase, soraPointer, g_SoraObjPtr, g_PartyMember1ObjectPtr, g_PartyMember2ObjPtr,
+        resource_handle_bucket_table,
         g_GameSpeed, g_BossDefeatEffect, g_BossDefeatEffectStart)
 end
 
@@ -1023,7 +1015,7 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
     }
 end
 
---[[LIVE ENTITY CENSUS -- RAN ONCE, ANSWERED ITS QUESTION, THEN REMOVED (2026-08-11).
+--[[LIVE ENTITY CENSUS -- RAN ONCE, ANSWERED ITS QUESTION, THEN REMOVED.
 
 It existed to test an assumption inherited from a code comment and never verified: that the
 engine has retired every creature from the old room by the time it evicts species slots. It
@@ -1053,7 +1045,7 @@ local function update_spawn_enemy()
 
     Also drives the live-entity census above while that diagnostic is in place.
 
-    TRIED AND REVERTED 2026-08-11 -- do not re-add without a new idea:
+    TRIED AND REVERTED -- do not re-add without a new idea:
     this used to clear the per-frame tick bit on every creature we spawned on
     the rising edge of `inCutscene` (kh1_native.quiet_spawned_entities), to stop
     their behaviour scripts running through a room transition. It WORKED
