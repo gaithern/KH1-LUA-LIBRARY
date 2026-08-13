@@ -27,45 +27,6 @@ static const int ENTITY_POS_Z_OFFSET = 0x18;
 static const int ENTITY_KIND_OFFSET = 0x6;
 // Sora, party and every constructed creature are kind==3; room furniture uses other values.
 static const uint8_t ENTITY_KIND_ACTOR = 3;
-static const float MIN_SPAWN_DISTANCE_FROM_SORA = 100.0f; // live-tuned (was 500, then 100)
-
-// Refuse if another actor is already at the spawn point -- two entities in the same place is a
-// known crash. Sora and party members are excluded since they are also kind==3.
-static bool AnyEnemyTooCloseToSora(unsigned long long base, unsigned long long entityPoolBaseRva,
-                                     unsigned long long soraPointerRva, unsigned long long soraObjPtrRva,
-                                     unsigned long long partyMember1PtrRva, unsigned long long partyMember2PtrRva,
-                                     float minDistance) {
-    if (entityPoolBaseRva == 0 || soraPointerRva == 0) return false;
-    unsigned long long soraEntityPtr = *(unsigned long long*)(uintptr_t)(base + soraPointerRva);
-    if (soraEntityPtr == 0) return false;
-    float soraX = *(float*)(uintptr_t)(soraEntityPtr + ENTITY_POS_X_OFFSET);
-    float soraY = *(float*)(uintptr_t)(soraEntityPtr + ENTITY_POS_Y_OFFSET);
-    float soraZ = *(float*)(uintptr_t)(soraEntityPtr + ENTITY_POS_Z_OFFSET);
-
-    unsigned long long excluded[3] = { soraEntityPtr, 0, 0 };
-    if (soraObjPtrRva != 0) excluded[0] = *(unsigned long long*)(uintptr_t)(base + soraObjPtrRva);
-    if (partyMember1PtrRva != 0) excluded[1] = *(unsigned long long*)(uintptr_t)(base + partyMember1PtrRva);
-    if (partyMember2PtrRva != 0) excluded[2] = *(unsigned long long*)(uintptr_t)(base + partyMember2PtrRva);
-
-    unsigned long long poolBase = base + entityPoolBaseRva;
-    float minDistSq = minDistance * minDistance;
-    for (int i = 0; i < ENTITY_POOL_COUNT; ++i) {
-        unsigned long long slot = poolBase + (unsigned long long)i * ENTITY_POOL_STRIDE;
-        if (slot == soraEntityPtr || slot == excluded[0] || slot == excluded[1] || slot == excluded[2]) continue;
-        uint32_t flags = *(volatile uint32_t*)(uintptr_t)(slot + ENTITY_OCCUPIED_FLAG_OFFSET);
-        if ((flags & 1) == 0) continue;
-        uint8_t kind = *(volatile uint8_t*)(uintptr_t)(slot + ENTITY_KIND_OFFSET);
-        if (kind != ENTITY_KIND_ACTOR) continue;
-        float x = *(float*)(uintptr_t)(slot + ENTITY_POS_X_OFFSET);
-        float y = *(float*)(uintptr_t)(slot + ENTITY_POS_Y_OFFSET);
-        float z = *(float*)(uintptr_t)(slot + ENTITY_POS_Z_OFFSET);
-        float dx = x - soraX, dy = y - soraY, dz = z - soraZ;
-        if ((dx * dx + dy * dy + dz * dz) < minDistSq) {
-            return true;
-        }
-    }
-    return false;
-}
 
 // Per-species asset-load state. State byte (+3) climbs as a load progresses; cached filename
 // (+4) distinguishes reuse from collision.
@@ -793,11 +754,6 @@ extern "C" int l_spawn_enemy(void* L) {
     long long luaWeight = (long long)p_lua_tointegerx(L, 19, nullptr);
     size_t luaTemplateLen = 0;
     const char* luaTemplateRecord = p_lua_tolstring(L, 20, &luaTemplateLen);
-    unsigned long long entityPoolBaseRva = (unsigned long long)p_lua_tointegerx(L, 21, nullptr);
-    unsigned long long soraPointerRva = (unsigned long long)p_lua_tointegerx(L, 22, nullptr);
-    unsigned long long soraObjPtrRva = (unsigned long long)p_lua_tointegerx(L, 23, nullptr);
-    unsigned long long partyMember1PtrRva = (unsigned long long)p_lua_tointegerx(L, 24, nullptr);
-    unsigned long long partyMember2PtrRva = (unsigned long long)p_lua_tointegerx(L, 25, nullptr);
     unsigned long long resourceHandleBucketTableRva = (unsigned long long)p_lua_tointegerx(L, 26, nullptr);
 
     // ENTRY of the same function (Steam 0x1DD650). Counts calls so a zero path-B count can be
@@ -937,14 +893,6 @@ extern "C" int l_spawn_enemy(void* L) {
     if (!oldTable || oldCount <= 0 || oldCount > 4096) {
         return RefuseSpawn(L, "table_invalid",
             "spawn_enemy: placement table not valid right now (wrong room state?)");
-    }
-
-    // Refuse if another enemy already occupies the spawn point; Sora and party are excluded.
-    if (AnyEnemyTooCloseToSora(base, entityPoolBaseRva, soraPointerRva, soraObjPtrRva,
-                                 partyMember1PtrRva, partyMember2PtrRva, MIN_SPAWN_DISTANCE_FROM_SORA)) {
-        LogDebug("spawn_enemy: refusing -- another enemy is already too close to Sora's position");
-        return RefuseSpawn(L, "too_close",
-            "spawn_enemy: another enemy is already too close to Sora -- refusing to avoid spawning on top of it");
     }
 
     // species (the local slot number) is derived below: reuse an

@@ -49,7 +49,6 @@ local SPAWN_FAILURE_MESSAGES = {
     unconfigured      = "spawn_enemy: this game build is missing an address this feature needs",
     handles_full      = "spawn_enemy: too many distinct resources loaded this session -- restart the game to clear them",
     table_invalid     = "spawn_enemy: the room isn't in a spawnable state right now -- try again in a moment",
-    too_close         = "spawn_enemy: another enemy is already too close to Sora -- refusing to spawn on top of it",
     no_creature_data  = "spawn_enemy: no offline data for this creature (missing from kh1_lua_library/creature_data.lua)",
     hook_install_fail = "spawn_enemy: the safety hooks failed to install -- refusing rather than spawn unprotected",
     slot_collision    = "spawn_enemy: that creature's slot is already used by a different creature in this room",
