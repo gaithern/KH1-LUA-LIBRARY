@@ -1,5 +1,5 @@
 #pragma once
-// Shared internals between dllmain.cpp and spawn_enemy.cpp. Defined in dllmain.cpp.
+// Shared internals between dllmain.cpp and the packages/ sources. Defined in dllmain.cpp.
 
 #include <cstddef>
 
@@ -37,5 +37,5 @@ void LogDebug(const char* msg);
 bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount,
               unsigned long long& outResult);
 
-// Enemy spawn (spawn_enemy.cpp).
+// Enemy spawn (packages/spawn_enemy.cpp).
 extern "C" int l_spawn_enemy(void* L);

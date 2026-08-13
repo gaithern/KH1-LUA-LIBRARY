@@ -82,7 +82,7 @@ static const int LOADED_SPECIES_MODEL_NAME_SIZE = 0x20;
 static const int SPECIES_SLOT_COUNT = 256; // species/slot index is a uint8_t (record+0x55) -- the full addressable range
 
 // species (record+0x55) is a room-local slot index, not a creature id; char-id/weight/template
-// come from kh1_creature_data.lua. Resource blob is 256KB per slot, species 0..64.
+// come from kh1_lua_library/creature_data.lua. Resource blob is 256KB per slot, species 0..64.
 static const size_t RESOURCE_BLOB_SIZE = 0x40000;
 static const int RESOURCE_BLOB_MAX_SPECIES = 0x40;
 
@@ -952,10 +952,10 @@ extern "C" int l_spawn_enemy(void* L) {
     uint8_t species = 0;
     bool needsLoad = false;
 
-    // kh1_creature_data.lua is the only source of char-id/weight/template.
+    // kh1_lua_library/creature_data.lua is the only source of char-id/weight/template.
     if (luaCharId == 0 || !luaTemplateRecord || luaTemplateLen != PLACEMENT_RECORD_SIZE) {
         return RefuseSpawn(L, "no_creature_data",
-            "spawn_enemy: no offline fallback data for this creature (missing from kh1_creature_data.lua)");
+            "spawn_enemy: no offline fallback data for this creature (missing from kh1_lua_library/creature_data.lua)");
     }
     const uint8_t* templateRec = (const uint8_t*)luaTemplateRecord;
     uint16_t charId = (uint16_t)luaCharId;
