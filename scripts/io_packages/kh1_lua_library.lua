@@ -15,19 +15,11 @@
     possible, but some additional memory addresses may need to added.
 --]]
 
--- kh1_native.dll (see native/KH1Native in this repo) is a native Lua module
--- that bridges into raw game function calls -- something the OpenKH Lua host
--- itself has no primitive for. Functions in the Advanced section that need to
--- call into game code (rather than just read/write memory) go through it.
+-- Native module (native/KH1Native) that lets Lua call real game functions.
 local kh1_native = require("kh1_native")
 
--- Per-creature char-id/weight/template-record data extracted offline from
--- every room's own .ard file -- see kh1_creature_data.lua's own header and
--- the heartless field-spawn investigation memory ("Session 21") for how this
--- was derived and validated. Lets spawn_enemy's fallback path work for any
--- creature immediately, without ever needing to visit its native room live
--- first (the old auto-learn-on-native-visit mechanism in dllmain.cpp still
--- exists as a fallback for anything missing here).
+-- Per-creature char-id/weight/template data extracted offline from room .ard
+-- files, so spawn_enemy works without visiting the creature's native room.
 local kh1_creature_data = require("kh1_creature_data")
 
 -- ########### --
@@ -35,8 +27,7 @@ local kh1_creature_data = require("kh1_creature_data")
 -- ########### --
 
 local function GetKHSCII(INPUT)
-    --[[Converts text to KHSCII, the game's proprietary
-    text encoding.]]
+    -- Converts text to KHSCII, the game's proprietary text encoding.
     local _charTable = {
         [' '] =  0x01,
         ['\n'] =  0x02,
@@ -485,13 +476,8 @@ local function set_spell_effectiveness(spell, value)
 end
 
 local function set_spell_cost(spell, value)
-    --[[ Sets a spells costs.  Defines what valid costs are below.
-     15 = 1/2 CP
-     30 =   1 CP
-    100 =   1 MP
-    200 =   2 MP
-    300 =   3 MP
-    Costs outside this range behave in unexepected ways.]]
+    --[[ Sets a spell's cost. Valid values: 15 = 1/2 CP, 30 = 1 CP,
+    100/200/300 = 1/2/3 MP. Anything else behaves unexpectedly.]]
     local possible_magic_costs = {15,30,100,200,300}
     if possible_magic_costs[value] then
         local memory_location = nil
@@ -626,8 +612,7 @@ local function force_combo_master(on)
 end
 
 local function allow_summon_anywhere(on)
-    --[[ Credits to KSX, ASM target that allows summons 
-    to be used outside of combat.]]
+    -- Credits to KSX, ASM target that allows summons outside of combat.
     if on then
         WriteByte(summonanywhere1, 0x72)
         WriteByte(summonanywhere2, 0x72)
@@ -650,7 +635,7 @@ end
 
 local function allow_air_items(on)
     --[[ Credits to KSX, ASM target that allows using items in mid air.
-    Currently messes with spells in mid air too.]]
+    Currently affects mid air spells too.]]
     if on then
         WriteByte(airitems1, 0x73)
         WriteByte(airitems2, 0x73)
@@ -668,8 +653,7 @@ local function multiply_summon_time(mult)
 end
 
 local function partyActorRVA(z)
-    --[[ Helper function for getting RVA values for Sora, Donald,
-    or Goofy entity/actor pointers]]
+    -- Gets the RVA of the Sora, Donald, or Goofy entity/actor pointer
     if z == 1 then return soraPointer end
     if z == 2 then return donaldPointer end
     return goofyPointer
@@ -678,8 +662,7 @@ end
 local promptBodyRingPos = {0, 0, 0}
 
 local function ClampKHSCII(khscii, maxBytes)
-    --[[ Helper function which clamps KHSCII data to not be too long
-    for level up prompts]]
+    -- Clamps KHSCII data so it isn't too long for level up prompts
     if #khscii <= maxBytes then
         return khscii
     end
@@ -692,10 +675,8 @@ local function ClampKHSCII(khscii, maxBytes)
 end
 
 local function show_prompt(input_title, input_party, duration, colour)
-    --[[ Credits to Topaz.  Show custom text in the level up box.
-    This has been slightly rewritten to use actual exe functions
-    in order to use the in game box queue, to have more prompts
-    on screen than 1.]]
+    --[[ Credits to Topaz. Shows custom text in the level up box, using the
+    game's own box queue so more than one can be on screen at a time.]]
     if colour == nil then
         colour = 0
     end
@@ -757,9 +738,8 @@ local function show_prompt(input_title, input_party, duration, colour)
 end
 
 local function is_pressed(button_array, only)
-    --[[Returns true if the buttons passed in button_array
-    are pressed.  If only is true, then returns true if 
-    only those are pressed]]
+    --[[Returns true if the buttons in button_array are pressed. If only is
+    true, returns true only when no other buttons are pressed.]]
     if only == nil then only = false end
     local input_bits = merge_tables(merge_tables(merge_tables(ReadBits(inputAddress), ReadBits(inputAddress+1)), ReadBits(inputAddress+2)), ReadBits(inputAddress+3))
     local bitmap = {"Select", "L3", "R3", "Start", "DPad U", "DPad R", "DPad D", "DPad L",
@@ -794,8 +774,7 @@ local function is_pressed(button_array, only)
 end
 
 local function is_in_gummi_garage()
-    --[[ Need to fix, actually returns if in Gummi ship,
-    not just Gummi garage]]
+    -- Needs a rename: returns true for the whole Gummi ship, not just the garage
     return ReadInt(inGummi) > 0
 end
 
@@ -824,9 +803,8 @@ local function spawn_prize(item_id)
 end
 
 local function show_custom_item_popup(text)
-    --[[ Uses the in game function to force a map prize pickup box.
-    Injects bytes to read from injected memory for text, so we
-    can have custom text.]]
+    --[[ Uses the in game function to force a map prize pickup box, with
+    injected bytes/memory so the text can be custom.]]
     kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
     kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
     kh1_native.set_custom_popup_text(GetKHSCII(text))
@@ -868,15 +846,8 @@ end
 -- ########################## --
 
 --[[Human text for each short refusal code kh1_native.spawn_enemy returns.
-
-These sentences are deliberately written HERE, in Lua, rather than being taken
-from the long message the native side also returns. That long message is not
-reliably readable: a string pushed from native and then read back through Lua's
-own string library (string.format/tostring/json.encode) comes back empty or
-truncated mid-word -- measured at 236 empty out of 319 failure lines in
-KH1-CROWDCONTROL's log, with the SAME message arriving intact on some calls and
-blank on others. Anything shown to a user must therefore originate in Lua; the
-native side only supplies a short code used as a table key below.]]
+Written here in Lua because long native-pushed strings often arrive empty
+or truncated -- only the short code survives the boundary reliably.]]
 local SPAWN_FAILURE_MESSAGES = {
     bad_args          = "spawn_enemy: model_path/motion_path are required",
     unconfigured      = "spawn_enemy: this game build is missing an address this feature needs",
@@ -886,11 +857,7 @@ local SPAWN_FAILURE_MESSAGES = {
     no_creature_data  = "spawn_enemy: no offline data for this creature (missing from kh1_creature_data.lua)",
     hook_install_fail = "spawn_enemy: the safety hooks failed to install -- refusing rather than spawn unprotected",
     slot_collision    = "spawn_enemy: that creature's slot is already used by a different creature in this room",
-    -- NOT "only a restart reclaims them" (the wording before). On-demand reclamation
-    -- is enabled again, and it has already run by the time this refusal is produced, so this
-    -- means "nothing reclaimable right now", not "nothing ever". Slots come back as spawned
-    -- creatures are defeated and on room changes. Unlike handles_full above, which really is
-    -- restart-only -- nothing in the game ever frees a resource-handle bucket.
+    -- Temporary, unlike handles_full above: slots come back on defeats/room changes.
     slots_full        = "spawn_enemy: no creature slots free right now -- each creature type claims several. They come back as spawned enemies are defeated, or when you change rooms.",
     alloc_fail        = "spawn_enemy: out of memory building the placement table",
     run_slot_taken    = "spawn_enemy: this creature needs several consecutive slots and one of them is already in use",
@@ -898,20 +865,14 @@ local SPAWN_FAILURE_MESSAGES = {
     blob_invalid      = "spawn_enemy: this creature's resource data isn't valid in this room right now -- try again after re-entering the room",
     ctor_threw        = "spawn_enemy: the game's own constructor threw an exception",
     ctor_refused      = "spawn_enemy: the room's concurrent-enemy budget is full right now -- try again after some are defeated",
-    -- Not a failure to fix -- a deliberate per-room block (see g_spawnRoomBlacklist in
-    -- native/KH1Native/dllmain.cpp). Worded so a viewer reads it as "not here" rather than
-    -- "something broke", since it will never succeed on retry in that room.
+    -- Deliberate per-room block (g_spawnRoomBlacklist in dllmain.cpp), not a bug.
     room_blacklisted  = "spawn_enemy: enemy spawning is turned off in this room",
 }
 
 local function describe_spawn_failure(code, native_message)
-    --[[Turns the native refusal into text that is safe to display. Falls back
-    progressively, because `code` is itself a native-pushed string and so is not
-    guaranteed to survive either -- it is short, which is what the surviving
-    values in this environment have in common, but that is an observation rather
-    than a guarantee.]]
-    -- slots_full carries its numbers in the code ("slots_full/<needed>/<longest free run>"),
-    -- because the short code survives the native/Lua boundary more reliably than the message.
+    --[[Turns a native refusal code into displayable text, falling back
+    progressively since `code` itself may not survive the boundary.]]
+    -- slots_full carries its numbers in the code: "slots_full/<needed>/<longest free run>".
     if code then
         local needed, longest = code:match("^slots_full/(%d+)/(%d+)$")
         if needed then
@@ -930,28 +891,16 @@ local function describe_spawn_failure(code, native_message)
 end
 
 local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
-    --[[Single-attempt primitive behind spawn_enemy. Spawns a Heartless (or
-    other placement-table-driven entity) at an arbitrary world position via
-    kh1_native.spawn_enemy. x/y/z all default to Sora's own live position
-    (get_sora_pos()) when omitted -- pass explicit coordinates only if you
-    want it somewhere other than on top of Sora. Can return stillLoading if
-    the asset isn't ready yet, or if a cutscene is currently playing --
-    callers should go through spawn_enemy instead of calling this directly.]]
+    --[[Single-attempt primitive behind spawn_enemy; x/y/z default to Sora's
+    position. Can return stillLoading -- use spawn_enemy instead of this.]]
 
     -- Don't spawn mid-cutscene
     if ReadInt(inCutscene) ~= 0 then
         return false, "in cutscene", "cutscene"
     end
 
-    --[[Don't spawn in the Gummi ship. There is no field for a creature to exist
-    in there, and a spawn that survives into the transition out of it hits the
- root cause: the engine's room-unload release wipes the species
-    resource blob while our creature is still live, after which anything that
-    walks that creature reads a wiped blob. A live crash was reproduced doing
-    exactly this -- entering the Gummi ship with a spawned Heartless on screen.
-
-    is_in_gummi_garage's name understates it: per its own comment it returns
-    true for the whole Gummi ship, not just the garage, which is what we want.]]
+    --[[Don't spawn in the Gummi ship -- a creature surviving the transition out
+    reads a wiped resource blob and crashes (reproduced live).]]
     if is_in_gummi_garage() then
         return false, "in gummi ship", "gummi"
     end
@@ -989,17 +938,8 @@ local pending_spawn_requests = {}
 local next_spawn_request_id = 1
 
 local function spawn_enemy(model_path, motion_path, x, y, z, callback)
-    --[[Spawns a Heartless (or other placement-table-driven entity), handling
-    the fallback-spawn case where the asset load hasn't finished yet. Queues
-    a request and returns immediately; call update_spawn_enemy() every frame
-    from your own script's _OnFrame (harmless/no-op if nothing is pending) to
-    actually drive it, the same convention open_text_box/update_text_boxes
-    uses.
-
-    Ignored outright (never queued) if a cutscene is already playing, or if the
-    player is in the Gummi ship -- callers that want it to happen afterwards
-    should re-request it themselves rather than have this silently wait out an
-    unknown-length cutscene or Gummi route.]]
+    --[[Queues an enemy spawn and returns immediately; call update_spawn_enemy()
+    every frame from _OnFrame to drive it. Ignored during cutscenes/Gummi ship.]]
 
     if ReadInt(inCutscene) ~= 0 then
         if callback then
@@ -1028,70 +968,26 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
     }
 end
 
---[[LIVE ENTITY CENSUS -- RAN ONCE, ANSWERED ITS QUESTION, THEN REMOVED.
-
-It existed to test an assumption inherited from a code comment and never verified: that the
-engine has retired every creature from the old room by the time it evicts species slots. It
-answered decisively -- during a cutscene the pool still held ~20 native entities alongside
-ours, so the assumption is FALSE and our creatures are NOT special for merely being alive.
-The native function kh1_native.census_live_entities is still exported if it is ever needed
-again.
-
-REMOVED BECAUSE IT FROZE THE GAME, and the mistake is worth recording:
-  - The 0.25s throttle is PER LUA STATE. Every top-level script gets its own state and its
-    own copy of this module, so with two scripts installed it fired at ~8Hz, not 4Hz.
-  - Each call walked up to 128 entities making two SEH-wrapped foreign calls each
-    (fnc_iterate_live_entities + fnc_resolve_resource_handle), so ~2000 guarded calls/sec,
-    on the game's main thread, plus a synchronous open/write/close of the log per line.
-  - Worst of all it walked the entity pool DURING a transition, i.e. exactly while the engine
-    was mutating it -- something nothing in this project had ever done before.
-
-Same shape as InstallBucketMemoryWatcherThread and InstallFreezeWatchdogThread before it: a
-sampler that is cheap in isolation becomes a hazard at the moment it is most interesting.
-If a future census is needed, sample on demand (one call at a chosen instant) rather than on
-a timer, and never during teardown.]]
+--[[Live entity census (kh1_native.census_live_entities, still exported) was run
+once and removed: it proved the engine does NOT retire old-room creatures before
+evicting species slots, but polling it on a timer froze the game.]]
 
 local function update_spawn_enemy()
     --[[Drives every pending spawn_enemy request one step forward. Call this
-    every frame from your own script's _OnFrame -- see spawn_enemy's comment
-    for why this can't happen automatically.
-
-    Also drives the live-entity census above while that diagnostic is in place.
-
-    TRIED AND REVERTED -- do not re-add without a new idea:
-    this used to clear the per-frame tick bit on every creature we spawned on
-    the rising edge of `inCutscene` (kh1_native.quiet_spawned_entities), to stop
-    their behaviour scripts running through a room transition. It WORKED
-    mechanically -- the bit flipped, confirmed in kh1_native.log -- and the game
-    still crashed in the same second. Bit 0x10000 gates an entity's OWN tick; it
-    does not remove the entity from the world, so other creatures still walk it
-    as a NEIGHBOUR and still read its corrupted data. The crash that followed
-    came through exactly that path (VelocityBlendNeighborGuard: "exception
-    walking neighbor entities"). Quieting the wrong half of the problem.
-
-    The native function is left in place but is no longer called, per this
-    project's convention for tried-but-unproven fixes. A real fix needs the
-    engine's own despawn/retire path, not a flag flip.]]
+    every frame from your own script's _OnFrame.]]
 
     for id, req in pairs(pending_spawn_requests) do
-        -- 4th value is the short refusal code (see SPAWN_FAILURE_MESSAGES); it
-        -- is nil on success and on the still-loading paths.
+        -- 4th value is the short refusal code (see SPAWN_FAILURE_MESSAGES).
         local ok, result, stillLoading, code = spawn_enemy_attempt(req.model_path, req.motion_path, req.x, req.y, req.z)
         if stillLoading then
             if stillLoading == "cutscene" then
-                -- A cutscene started after this request was already queued
-                -- (spawn_enemy's own upfront check only catches one already
-                -- playing at request time) -- drop it rather than wait out
-                -- an unknown-length cutscene.
+                -- Cutscene started after queueing -- drop rather than wait it out.
                 pending_spawn_requests[id] = nil
                 if req.callback then
                     req.callback(false, "spawn_enemy: ignored, player entered a cutscene while this request was pending")
                 end
             elseif stillLoading == "gummi" then
-                -- Boarded the Gummi ship after this request was queued. Same
-                -- reasoning as the cutscene case: drop it rather than hold it
-                -- across an unknown-length Gummi route and land a spawn on the
-                -- way out.
+                -- Boarded the Gummi ship after queueing -- same reasoning as above.
                 pending_spawn_requests[id] = nil
                 if req.callback then
                     req.callback(false, "spawn_enemy: ignored, player boarded the Gummi ship while this request was pending")
@@ -1110,10 +1006,8 @@ local function update_spawn_enemy()
                     -- result is the spawned entity's pointer.
                     req.callback(true, result)
                 else
-                    -- Hand callers Lua-authored text rather than the native
-                    -- message, which frequently arrives empty or truncated --
-                    -- see SPAWN_FAILURE_MESSAGES. The raw native message is
-                    -- still passed third for anyone who wants it.
+                    -- Lua-authored text (see SPAWN_FAILURE_MESSAGES); the raw
+                    -- native message is still passed third.
                     req.callback(false, describe_spawn_failure(code, result), result)
                 end
             end
@@ -1147,9 +1041,8 @@ local function set_text_box_size(window_id, width, height)
 end
 
 local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
-    --[[ Opens text box.  Normally text boxes uses a reference to
-    predefined text, so we have to inject ASM and text memory in order
-    to use custom text.]]
+    --[[ Opens a text box. Boxes normally reference predefined text, so ASM
+    and text memory are injected to allow custom text.]]
     window_id = window_id or 1
     if style ~= nil then
         set_text_box_style(window_id, style)
@@ -1182,13 +1075,11 @@ local function close_text_box(window_id)
     return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
 end
 
---[[ If the script is refreshed, clean up any
-open boxes]]
+-- If the script is refreshed, clean up any open boxes
 kh1_native.close_pending_text_box()
 
 local function update_text_boxes()
---[[ Handles the timing mechanism for open text
-boxes.]]
+    -- Handles the timing mechanism for open text boxes.
     local now = os.clock()
     local current_world = get_world()
     local current_room = get_room()

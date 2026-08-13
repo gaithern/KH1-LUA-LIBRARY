@@ -88,7 +88,6 @@ static const int RESOURCE_BLOB_MAX_SPECIES = 0x40;
 
 // Debugging aid: entity id of the most recent spawn_enemy call to reach the
 // constructor, for an external CE hook to target. Not read in this DLL.
-static volatile uint32_t g_lastSpawnAttemptId = 0;
 
 // Placement record tagged before it is handed to fnc_load_gimmick_assets.
 static volatile uint64_t g_lastQueuedGimmickRecordPtr = 0;
@@ -188,11 +187,8 @@ static void RecordTriggeredLoad(unsigned long long base, unsigned long long load
 // Last room we spawned in -- used only to detect a room change.
 static int32_t g_lastSpawnRoomWorld = -1;
 static int32_t g_lastSpawnRoomArea = -1;
-// Nothing in the engine ever clears a creature block's ownership. It reclaims purely by EVICTION --
-// the next room's loader tiles from slot 0 and overwrites what it needs, leaving the rest stale --
-// so our runs stay marked occupied forever and the window exhausts. Releasing them ourselves at room
-// change is safe: our entities are destroyed by then. fnc_release_species_slot_run also wipes the
-// blob, which a hand-rolled reset would miss.
+// The engine never clears block ownership -- it reclaims by eviction only, so our runs would stay
+// occupied forever. We release them ourselves at room change, once our entities are destroyed.
 static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned long long entityIterFnRva,
                                            unsigned long long resolveHandleFnRva,
                                            unsigned long long speciesResourceTableRva,
@@ -204,12 +200,8 @@ static void ReleaseOurTriggeredRuns(unsigned long long base, unsigned long long 
                                     unsigned long long resolveHandleFnRva,
                                     unsigned long long speciesResourceTableRva) {
     if (releaseSlotRunFnRva == 0 || loadedPtrTableRva == 0 || g_triggeredLoadCount == 0) return;
-    // Room-change detection is LAZY -- it fires on the first spawn_enemy call in the new room, by
-    // which point a creature from the old room may still be alive. Releasing a block out from under
-    // one hangs the game: fnc_blob_command_list_walk_and_patch (0x1401D8073) re-reads the same tag
-    // forever when it is not 0/1/2/0x11/0x8000, and stale blob bytes are exactly that.
-    // Live-confirmed 2026-08-13: released species 30 while entity 0 still referenced it -> spin at
-    // exe+0x1D8078 with R14 in blob slot 30 and tag 9.
+    // Room-change detection is LAZY, so a creature from the old room may still be alive. Releasing
+    // a block out from under one hangs the game in fnc_blob_command_list_walk_and_patch.
     bool inUse[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
     MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva,
                                    speciesResourceTableRva, inUse);
@@ -245,9 +237,6 @@ static void ReleaseOurTriggeredRuns(unsigned long long base, unsigned long long 
 static int32_t g_lastSpawnRoomSet = -1;
 static bool g_lastSpawnRoomValid = false;
 
-
-
-
 // Our own record of slots we loaded. Unlike the live-entity scan it does not depend on handle
 // resolution, which fails exactly when handles start going bad.
 static bool IsSpeciesTriggeredThisSession(uint8_t species) {
@@ -280,12 +269,8 @@ static const char* InternPath(const char* s) {
 static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loadedPtrTableRva,
                                  unsigned long long speciesResourceTableRva, int slot);
 
-// Finds a slot genuinely holding this model. The cached name and state are NEVER cleared when a room
-// stops using a slot, so a run MEMBER keeps the name of whatever was last a start there -- matching
-// on name alone returned those stale labels, and the reuse gate then rejected them, dropping a
-// perfectly reusable creature into the fresh-load path and a slots_full refusal.
-// SlotHoldsLiveSpecies additionally requires a valid blob header, which only a real run start has.
-// Also bounded to the real 64-entry table; this used to scan 256 and read past its end.
+// Finds a slot genuinely holding this model. Cached names are never cleared, so the name alone is
+// stale -- SlotHoldsLiveSpecies also requires a valid blob header, which only a real run start has.
 static bool FindLoadedSlotByFilename(unsigned long long base, unsigned long long loadedPtrTableRva,
                                      unsigned long long speciesResourceTableRva,
                                      const char* modelPath, uint8_t* outSpecies) {
@@ -308,14 +293,8 @@ static int LoadedSlotRunLen(unsigned long long base, unsigned long long loadedPt
     return runLen < 1 ? 1 : runLen;
 }
 
-// Is every slot of this run still owned by that species?
-// Still a live run start, with nothing else having claimed part of its run since.
-//
-// Ownership is deliberately NOT part of this. A loaded species routinely carries owner==0xFF
-// ("loaded, unowned" -- observed on many slots across many dumps), so the old `owner == species`
-// test rejected reusable creatures outright and sent them to the fresh-load path, where they then
-// failed for want of free slots. What actually invalidates a reuse is another asset having loaded
-// over part of the run, and a slot with a valid blob header IS such an asset's start.
+// Still a live run start, with nothing else having claimed part of its run since. Ownership is
+// deliberately not tested: loaded species routinely carry owner==0xFF, which rejected valid reuses.
 static bool SpeciesRunStillIntact(unsigned long long base, unsigned long long loadedPtrTableRva,
                                   unsigned long long speciesResourceTableRva,
                                   uint8_t species, int runLen) {
@@ -326,9 +305,8 @@ static bool SpeciesRunStillIntact(unsigned long long base, unsigned long long lo
     return true;
 }
 
-// Every slot of a run must carry the SAME owner byte. A partly-claimed run means the tail slots
-// were never populated, so data living there is whatever the previous occupant left.
-// Uniform 0xFF occurs on healthy loaded runs, so only DISAGREEMENT is the defect -- not 0xFF itself.
+// Every slot of a run must carry the SAME owner byte; disagreement means a partly-claimed run whose
+// tail still holds the previous occupant's data. Uniform 0xFF is healthy, not a defect.
 static bool RunOwnershipUniform(unsigned long long base, unsigned long long loadedPtrTableRva,
                                 uint8_t species, int runLen, int* outBadSlot, uint8_t* outOwners) {
     volatile uint8_t* ownerAt = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
@@ -484,67 +462,15 @@ static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned lon
     }
 }
 
-// Allocation window is 30..49.
-//
-// 50..63 is ENGINE SCRATCH and must be avoided. fnc_release_species_slot_run returns the blob base,
-// so subsystems call it purely to grab that buffer; all 18 call sites cover 50-51, 52-55, 52-59,
-// 52-63, 54-55, 56-59, 60-63. Crucially they fire MID-ROOM, not just at transitions (approaching a
-// door triggers fnc_1BD_load_next_map_texture), so a creature there is clobbered while still alive.
-// Proof: slot 56's bytes are byte-identical (sha 55425c83) across three dumps hours apart in which
-// the slot table claimed three DIFFERENT creature models -- our data was replaced by the same fixed
-// atlas every time. Being clobbered in 30..49 is harmless by contrast: only the next room's loader
-// tiles there, and our entities are destroyed by then.
+// Upper bound of the allocation window. 50..63 is ENGINE SCRATCH -- subsystems grab those blobs
+// MID-ROOM (texture loads near doors), so a creature placed there is clobbered while still alive.
 static const int SPECIES_SLOT_ALLOC_MAX = 49;
 
-// owner == 0xFF is the engine's own unclaimed test. State and run-length bytes are both
-// unreliable: run members keep state==0, and released slots keep a stale run length.
-static const uint8_t SPECIES_SLOT_UNCLAIMED_OWNER = 0xFF;
-
-// A creature claims a RUN of record+0x56 consecutive slots, so the WHOLE run must be free.
-// Scans TOP-DOWN: the engine tiles upward from slot 0, so allocating high stays out of its way
-// while still letting us drop lower when the upper end is full.
-//
-// No hardcoded floor. The low slots usually hold Sora + party (measured 0-11 xa_ex_0010,
-// 12-20 xa_ex_0040, 21-29 xa_ex_0050) but the roster VARIES -- guest members, and rooms without
-// Donald/Goofy -- so a fixed floor either wastes space or is wrong. BuildSlotOccupancy already
-// rejects anything actually resident, which is the real protection; unlike 50..63 there is no
-// evidence of anything grabbing low slots MID-ROOM, so being tiled over at the next room load is
-// harmless (our entities are gone by then).
+// No hardcoded floor: the low slots usually hold Sora + party, but that roster varies, and the
+// availability map already rejects anything actually resident. Allocation scans TOP-DOWN.
 static const int SPECIES_SLOT_ALLOC_MIN = 0;
-// Slots that were already free when we entered this room. The engine only re-tiles slot runs at
-// ROOM LOAD, when everything referencing them has been torn down -- a run it releases MID-room may
-// still be pointed at (live-confirmed: a display slot held a pointer into species 53's blob after
-// its run was released, and loading over it crashed the game). owner==0xFF alone cannot tell the
-// two apart, so we only ever allocate runs that were free at room entry.
-static bool g_freeAtRoomEntry[SPECIES_SLOT_COUNT] = {};
-static bool g_roomEntrySnapshotValid = false;
-
-static void SnapshotFreeSlotsAtRoomEntry(unsigned long long base, unsigned long long loadedPtrTableRva) {
-    if (loadedPtrTableRva == 0) return;
-    int freeCount = 0;
-    for (int s = 0; s < SPECIES_SLOT_COUNT; ++s) {
-        bool isFree = false;
-        if (s <= SPECIES_SLOT_ALLOC_MAX) {
-            volatile uint8_t* ownerAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
-                LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
-            isFree = (*ownerAddr == SPECIES_SLOT_UNCLAIMED_OWNER);
-        }
-        g_freeAtRoomEntry[s] = isFree;
-        if (isFree && s >= SPECIES_SLOT_ALLOC_MIN) ++freeCount;
-    }
-    g_roomEntrySnapshotValid = true;
-    char msg[144];
-    snprintf(msg, sizeof(msg),
-        "spawn_enemy: room-entry snapshot -- %d of %d slots in %d..%d were free and are allocatable",
-        freeCount, SPECIES_SLOT_ALLOC_MAX - SPECIES_SLOT_ALLOC_MIN + 1,
-        SPECIES_SLOT_ALLOC_MIN, SPECIES_SLOT_ALLOC_MAX);
-    LogDebug(msg);
-}
-
-// owner==0xFF is NOT sufficient to call a slot free: a loaded species can carry no owner stamp at
-// all (live-confirmed). Release wipes the blob but leaves state and the cached name, so a VALID
-// blob header is what separates "still live" from "released". Live-confirmed: slot 61 read
-// owner=0xFF/state=6/xa_ex_2110 with real data, was treated as free, and got loaded over.
+// owner==0xFF is NOT sufficient to call a slot free. Release wipes the blob but leaves state and
+// the cached name, so a VALID blob header is what separates "still live" from "released".
 static const int32_t BLOB_HEADER_FIRST_SECTION = 128;   // blob+4 on every valid header observed
 
 static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loadedPtrTableRva,
@@ -566,12 +492,8 @@ static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loa
     return sec4 == BLOB_HEADER_FIRST_SECTION;
 }
 
-// Marks every slot a live species occupies, SPAN included. Run members of an unowned run carry
-// owner=0xFF, state=0 and no cached name -- indistinguishable from free when judged one slot at a
-// time. Live-confirmed: species 55 held 55..59 unowned, slots 56..59 looked free, and allocating
-// species 56 there loaded straight over it.
-// The room's placement table is an AUTHORED list of every creature this room can place, each record
-// carrying its species index (+0x55) and run length (+0x56). That is the room's own reserved set.
+// Marks the room's own reserved set: the placement table authors every creature this room can
+// place, each record carrying its species index (+0x55) and run length (+0x56).
 static void MarkRoomRosterSlots(const uint8_t* table, int32_t count, bool* roster) {
     if (!table || count <= 0) return;
     for (int32_t i = 0; i < count; ++i) {
@@ -585,13 +507,8 @@ static void MarkRoomRosterSlots(const uint8_t* table, int32_t count, bool* roste
 
 // ============================================================================================
 // SLOT AVAILABILITY -- THE SINGLE SOURCE OF TRUTH. Every "can we use this slot?" decision goes
-// through ComputeSlotAvailability/RunIsAvailable.
-//
-// DO NOT add owner / state / cached-model-name tests anywhere else. The engine never clears any of
-// those when a room stops using a slot -- it reclaims by EVICTION, overwriting only what the next
-// room needs -- so they record history, not occupancy. Two separate checks built on them had to be
-// removed on 2026-08-13 after each independently rejected slots this map correctly frees:
-// the g_freeAtRoomEntry gate, and a post-selection "slot is CLAIMED by a different creature" test.
+// through ComputeSlotAvailability/RunIsAvailable. DO NOT add owner / state / cached-model-name
+// tests elsewhere: the engine never clears those, so they record history, not occupancy.
 // ============================================================================================
 static const char* const WHY_ROOM_ROSTER = "in this room's placement roster";
 static const char* const WHY_LIVE_ENTITY = "a live entity references it";
@@ -621,15 +538,8 @@ static void ComputeSlotAvailability(unsigned long long base, unsigned long long 
         if (IsSpeciesTriggeredThisSession((uint8_t)s))    take(s, WHY_OUR_LOAD);
     }
 
-    // Expand anything taken to its whole run -- a creature's blob spans runLen slots, so loading
-    // over any one of them corrupts it.
-    //
-    // TRUNCATE the span at the next run start. A slot with a valid blob header IS a start, so
-    // another creature's blob physically cannot span it (that slot's base would be mid-blob and
-    // read arbitrary bytes, not 128). A runLen reaching past one is therefore stale. Without this,
-    // a leftover run whose head happens to overlap the roster dragged slots beyond the next start
-    // with it -- live: slot 42 (runLen 5) overlapped roster entry 39-43 and held 44-46 hostage,
-    // reported as "3 run-span" while the viewer correctly showed them reclaimable.
+    // Expand anything taken to its whole run, since a creature's blob spans runLen slots. TRUNCATE
+    // the span at the next run start -- a runLen reaching past another start is stale.
     for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
         if (!SlotHoldsLiveSpecies(base, loadedPtrTableRva, speciesResourceTableRva, s)) continue;
         int end = s + LoadedSlotRunLen(base, loadedPtrTableRva, (uint8_t)s);
@@ -705,13 +615,8 @@ static int CountUnavailableSlots(const SlotAvailability& av, char* detail, size_
     return taken;
 }
 
-// Picks a free run that also avoids the room's own records, walking past rejected candidates.
-// Returning only the first free run deadlocked spawning whenever that one run collided.
-// A text slot caches a raw pointer into the creature blob its text belongs to, so overwriting that
-// blob makes the next text layout read garbage. Live-confirmed: slot 13 pointed into species 53's
-// blob, our next load claimed 52..56 over it, and fnc_text_slot_layout_prepare crashed on approach
-// to a door. owner==0xFF is necessary but NOT sufficient -- the engine releases a run while the text
-// system still references it.
+// A text slot caches a raw pointer into the creature blob its text belongs to, so loading over that
+// blob makes the next text layout read garbage -- the engine releases runs the text system still uses.
 static const uint64_t TEXT_SLOT_STRIDE = 0xE0;
 static const int TEXT_SLOT_COUNT = 256;
 
@@ -738,6 +643,8 @@ static bool RunReferencedByTextSlot(unsigned long long base, unsigned long long 
     return false;
 }
 
+// Picks a free run that also avoids the room's own records and any text-slot reference, walking
+// past rejected candidates -- returning only the first free run deadlocked spawning.
 static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned long long loadedPtrTableRva,
                                             const bool* speciesInUseByLiveEntity, int slotRunLen,
                                             const uint8_t* table, int32_t count,
@@ -801,51 +708,8 @@ static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned lo
     return false;
 }
 
-// Tracked spawns: entity pointer + id + species/run, recorded at post-construct.
-static unsigned long long g_slotMapBase = 0;
-static unsigned long long g_slotMapLoadedPtrTableRva = 0;
-
-// Defined further down with the entity-snapshot helpers; needed here for the liveness check.
-static bool TryReadU32(uint64_t addr, uint32_t* out);
-
-struct SpawnedEntityRecord {
-    unsigned long long entityPtr;
-    uint32_t id;
-    uint8_t species;
-    uint8_t runLen;
-    // Consecutive dead observations before acting, so a transient tick gap is ignored.
-    uint8_t deadObservations;
-    char modelPath[LOADED_SPECIES_MODEL_NAME_SIZE + 1];
-};
-static const int MAX_TRACKED_SPAWNS = 16;
-static SpawnedEntityRecord g_trackedSpawns[MAX_TRACKED_SPAWNS];
-static int g_trackedSpawnCount = 0;
-
-static void RecordSpawnedEntity(unsigned long long entityPtr, uint32_t id, uint8_t species,
-                                uint8_t runLen, const char* modelPath) {
-    // Ring buffer -- only the most recent spawns can plausibly still be alive (measured lifetime
-    // is ~20s), so overwriting the oldest loses nothing this test needs.
-    SpawnedEntityRecord& rec = g_trackedSpawns[g_trackedSpawnCount % MAX_TRACKED_SPAWNS];
-    rec.entityPtr = entityPtr;
-    rec.id = id;
-    rec.species = species;
-    rec.runLen = runLen;
-    rec.deadObservations = 0;
-    strncpy_s(rec.modelPath, modelPath, _TRUNCATE);
-    ++g_trackedSpawnCount;
-}
-
-
-
-
-
-
 // Live address of the 64-entry bucket table, stashed for the headroom check.
 static volatile uint64_t g_resourceHandleBucketTableAddr = 0;
-
-// Most recent spawn, re-read after construction to confirm it survived.
-static uint64_t g_lastSpawnedEntityPtr = 0;
-static uint32_t g_lastSpawnedEntityId = 0;
 
 static bool TryReadU32(uint64_t addr, uint32_t* out) {
     __try {
@@ -856,11 +720,6 @@ static bool TryReadU32(uint64_t addr, uint32_t* out) {
         return false;
     }
 }
-
-// Resolve-function address, stashed for diagnostics.
-static uint64_t g_resolveHandleFnAddrForDiag = 0;
-
-
 
 static void LogEntitySnapshot(const char* when, uint64_t entity, uint32_t expectedId) {
     if (entity == 0) return;
@@ -898,9 +757,6 @@ static void LogEntitySnapshot(const char* when, uint64_t entity, uint32_t expect
 
     LogDebug(msg);
 }
-
-
-
 
 // Every refusal returns a short machine-readable code plus a message, so Lua can react to the
 // reason rather than parse prose.
@@ -943,7 +799,6 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long partyMember2PtrRva = (unsigned long long)p_lua_tointegerx(L, 25, nullptr);
     unsigned long long resourceHandleBucketTableRva = (unsigned long long)p_lua_tointegerx(L, 26, nullptr);
 
-
     // ENTRY of the same function (Steam 0x1DD650). Counts calls so a zero path-B count can be
     // told apart from the function never running -- see InstallResourceEntryLookupCounterHook.
 
@@ -958,8 +813,6 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long claimSlotRunFnRva = (unsigned long long)p_lua_tointegerx(L, 31, nullptr);
     // Engine's block-release routine (owner=0xFF + flags=0 + blob wipe), used at room change.
     unsigned long long releaseSlotRunFnRva = (unsigned long long)p_lua_tointegerx(L, 32, nullptr);
-
-
 
     if (!modelPath || !motionPath) {
         return RefuseSpawn(L, "bad_args",
@@ -976,11 +829,6 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
 
     // Stashed so the guard hooks -- which run on the game's own thread with no access to these
-    // Lua-supplied RVAs -- can read the slot table for the eviction test. Read-only use.
-    g_slotMapBase = base;
-    g_slotMapLoadedPtrTableRva = loadedPtrTableRva;
-    // Diagnostics-only; lets LogEntitySnapshot walk entity+0x134's shape descriptor.
-    g_resolveHandleFnAddrForDiag = base + resolveHandleFnRva;
 
     // Re-read the previous spawn: an unreadable or mismatched id means its pool slot was recycled.
 
@@ -1034,12 +882,8 @@ extern "C" int l_spawn_enemy(void* L) {
                                     entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva);
             g_triggeredLoadCount = 0;
             LogDebug("spawn_enemy: room changed -- triggered-load bookkeeping cleared");
-            SnapshotFreeSlotsAtRoomEntry(base, loadedPtrTableRva);
             // A creature from the previous room cannot still be alive; stop re-reading its pointer.
-            g_lastSpawnedEntityPtr = 0;
-            g_lastSpawnedEntityId = 0;
         }
-        if (!g_roomEntrySnapshotValid) SnapshotFreeSlotsAtRoomEntry(base, loadedPtrTableRva);
         g_lastSpawnRoomWorld = curWorld;
         g_lastSpawnRoomArea = curArea;
         g_lastSpawnRoomSet = curSet;
@@ -1170,8 +1014,7 @@ extern "C" int l_spawn_enemy(void* L) {
         needsLoad = true;
     } else {
         // Capacity limit, not a bug. Counted through the SAME availability map the search used, so
-        // the number always agrees with why the search failed (an owner-based count here previously
-        // reported figures that matched neither).
+        // the number always agrees with why the search failed.
         SlotAvailability av;
         ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
                                 oldTable, oldCount, speciesInUseByLiveEntity, av);
@@ -1185,7 +1028,6 @@ extern "C" int l_spawn_enemy(void* L) {
             SPECIES_SLOT_ALLOC_MAX - SPECIES_SLOT_ALLOC_MIN + 1, detail);
         LogDebug(msg);
 
-
         // Carry the numbers in the CODE, not the message: the reason code is what reliably survives
         // the native/Lua boundary (see the note above SPAWN_FAILURE_MESSAGES).
         char code[48];
@@ -1193,13 +1035,8 @@ extern "C" int l_spawn_enemy(void* L) {
         return RefuseSpawn(L, code,
             "spawn_enemy: no creature slots free right now -- each creature type claims several. They come back as spawned enemies are defeated, or when you change rooms.");
     }
-    // NO post-selection "slot is CLAIMED by a different creature" check here.
-    // It refused on owner!=0xFF && state!=0 && cached-name mismatch -- which is exactly what a STALE
-    // block looks like, since the engine never clears ownership, state or the cached name when a room
-    // stops using a slot. That is the very thing roster-based occupancy is meant to hand back, so the
-    // check rejected almost every slot the allocator legitimately chose (live: "slot 38 is CLAIMED
-    // (owner=38) ... doesn't match xa_ex_2021.mdls"). It is also redundant: anything reaching here is
-    // already outside this room's roster, unreferenced by live entities, and not triggered by us.
+    // NO post-selection "slot is CLAIMED by a different creature" check here: it read stale blocks
+    // as claimed and rejected nearly every valid slot. Availability is settled by the map above.
 
     size_t newSize = (size_t)(oldCount + 1) * PLACEMENT_RECORD_SIZE;
     uint8_t* newTable = (uint8_t*)VirtualAlloc(nullptr, newSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -1282,10 +1119,8 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug(msg);
         }
         if (slotRunLen > 1) {
-            // Re-verify immediately before the destructive load, through the SAME availability map
-            // the search used. Built from oldTable so it is the room's OWN roster, excluding the
-            // record we just spliced for ourselves. (An owner-based test here rejected exactly the
-            // reclaimable stale slots the map hands out.)
+            // Re-verify immediately before the destructive load. Built from oldTable so it is the
+            // room's OWN roster, excluding the record we just spliced for ourselves.
             SlotAvailability av;
             ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
                                     oldTable, oldCount, speciesInUseByLiveEntity, av);
@@ -1305,9 +1140,8 @@ extern "C" int l_spawn_enemy(void* L) {
             }
         }
 
-        // Claim the run as a proper block BEFORE loading, the way the engine does. Its room-unload
-        // sweep only releases blocks whose owner == their own index; skipping this leaves the run
-        // unowned, so it is never reclaimed and other blocks tile straight over it.
+        // Claim the run as a block BEFORE loading, the way the engine does -- its room-unload sweep
+        // only releases blocks whose owner == their own index, so an unclaimed run is never reclaimed.
         if (claimSlotRunFnRva != 0) {
             int claimLen = slotRunLen > 0 ? slotRunLen : 1;
             unsigned long long claimArgs[2] = { (unsigned long long)species, (unsigned long long)claimLen };
@@ -1510,7 +1344,6 @@ extern "C" int l_spawn_enemy(void* L) {
         LogDebug(diagMsg);
     }
 
-    g_lastSpawnAttemptId = newId;
     bool ok = SafeCall(spawnFnAddr, args, 1, result);
 
     if (!ok) {
@@ -1538,14 +1371,6 @@ extern "C" int l_spawn_enemy(void* L) {
 
     // Snapshot the new entity immediately so a success-but-nothing-appeared report can be pinned.
     LogEntitySnapshot("post-construct:", (uint64_t)result, (uint32_t)newId);
-    g_lastSpawnedEntityPtr = (uint64_t)result;
-    g_lastSpawnedEntityId = (uint32_t)newId;
-
-    // Remember which species slot this creature was built from, and what model that slot held at
-    // the time, so the eviction test can later detect the slot being reused underneath it.
-    RecordSpawnedEntity((uint64_t)result, (uint32_t)newId, (uint8_t)species,
-                        (uint8_t)LoadedSlotRunLen(base, loadedPtrTableRva, (uint8_t)species),
-                        modelPath);
 
     p_lua_pushboolean(L, 1);
     p_lua_pushinteger(L, (long long)result);

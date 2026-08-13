@@ -303,219 +303,29 @@ UK_Word = 0x2E1AC60
 
 fnc_spawn_prize = 0x2BFF00
 fnc_update_widget_queue = 0x2AB8E0
-
 fnc_spawn_world_gimmick_entity = 0x290D60
 placementTablePtr = 0x296B630
 placementTableCount = 0x296B628
 g_WorldNumber = 0x233FE84
 g_AreaNumber = 0x233FE8C
 g_SetNumber = 0x233FE90
--- [HOOK TOGGLE: OFF] fnc_async_load_job_callback = 0x286420
--- [HOOK TOGGLE: OFF] fnc_velocity_blend_util = 0x2B5E50
 fnc_iterate_live_entities = 0x291B20
--- [HOOK TOGGLE: OFF] fnc_party_ability_index_resolve_call = 0x1D62F2
 fnc_load_gimmick_assets = 0x285EE0
--- The game's own release routine for a run of species slots: (species, runLen) -> sets each slot's
--- owner byte to the 0xFF unclaimed sentinel and wipes the matching resource-blob range. Used by
--- spawn_enemy to hand back slots on a room change so a session stops running out of them.
 fnc_release_species_slot_run = 0x2858E0
 loadedSpeciesPtrTable = 0x2869E18
 fnc_mint_resource_handle = 0x38AD90
 fnc_resolve_resource_handle = 0x38ADC0
 speciesResourceTable = 0xD2ADA0
--- CALL-to-fnc_resolve_resource_handle inside the engine's own skeleton/bone
--- animation-blend code (see InstallSkeletonHandleGuardHook's comment in
--- dllmain.cpp) -- confirmed live via two real crash repros
--- (Darkball, Search Ghost). Steam-only for now: EGS's equivalent function
--- wasn't found (fuzzy-match against the EGS Ghidra project came back empty)
--- -- spawn_enemy degrades gracefully (no guard, same crash risk as before)
--- on any build where this isn't set, so leaving it unset on EGS is safe,
--- just unprotected.
--- [HOOK TOGGLE: OFF] fnc_skeleton_handle_deref_hook = 0x3900F7
--- Entry of the whole per-entity animation/skeleton-blend update function
--- (see InstallSkeletonBlendCallGuardHook's comment in dllmain.cpp) --
--- confirmed live via a THIRD crash repro (Bouncywild) at a
--- different instruction inside the same call tree, after the hook above
--- fixed the first one. Steam-only, same reasoning as the address above.
--- [HOOK TOGGLE: OFF] fnc_skeleton_blend_call_hook = 0x391C70
--- CALL-to-fnc_resolve_resource_handle inside the keyframe/blend-list
--- lookup helper (see InstallKeyframeListEntryGuardHook's comment in
--- dllmain.cpp) -- this was the FIRST crash site found this session,
--- confirmed live TWICE (small-garbage handle, then later a literal NULL
--- handle), in a different call tree from the two hooks above. Steam-only,
--- same reasoning as the addresses above.
--- [HOOK TOGGLE: OFF] fnc_keyframe_list_entry_hook = 0x3946BF
--- fnc_keyframe_list_lookup's own entry point ("MOV ECX,[RCX+0x3C]" + "MOV ESI,EDX", 5 bytes) --
--- see InstallKeyframeListEntryParamGuardHook's comment in dllmain.cpp. CRASH SITE #6, confirmed
--- live via WER minidump: fault reading param_1+0x3C when the caller
--- (fnc_entity_animation_blend_advance) passes an invalid record pointer (observed as literal -1).
--- This is upstream of (and NOT covered by) fnc_keyframe_list_entry_hook above. Steam-only for now,
--- same reasoning as the other animation-subsystem hook addresses in this file.
--- [HOOK TOGGLE: OFF] fnc_keyframe_list_lookup_param_hook = 0x3946A5
--- Diagnostic-only tap inside fnc_entity_animation_blend_advance (RVA 0x29FB30), right after it
--- computes the value that (when bad) becomes crash site #6's -1. Logs entity+0x1D0/+0x1D4/+0x168
--- to kh1_native.log whenever that computed value is -1, to capture the live field values behind
--- the still-unconfirmed root cause. See InstallAnimBlendAdvanceDiagHook's comment in dllmain.cpp.
--- Does not change behavior..
--- [HOOK TOGGLE: OFF] fnc_anim_blend_advance_diag_hook = 0x29FB80
--- Section-2 size check inside fnc_link_model_resource_data ("MOV EAX,[RBP+0xC]" / "SUB EAX,ECX" /
--- "TEST EAX,EAX" / "JLE", 9 bytes) -- REAL FIX for crash site #6's root cause, not another catch
--- hook. Corrects the game's own "section has data" check from "size > 0" to "size >= 0x34" (the
--- minimum needed to safely read the dword at section+0x30 that becomes entity+0x1D4). See
--- InstallSection2SizeGuardHook's comment in dllmain.cpp..
--- [HOOK TOGGLE: OFF] fnc_link_model_resource_data_section2_check = 0x288593
--- fnc_resolve_resource_handle_impl's bucket-index lookup ("SHR RAX,0x19" through "OR RAX,RCX",
--- 17 bytes) -- THE master fix, not another per-call-site guard. The shared 64-bucket
--- resource-handle table is never freed and can be exhausted by heavy Crowd Control spawn_enemy
--- churn; once exhausted, ANY caller of fnc_resolve_resource_handle anywhere in the game can get
--- back a raw -1 "pointer". This corrects the lookup itself so it returns 0 (the same "no data"
--- sentinel already handled everywhere) instead. See InstallResolveHandleBucketGuardHook's comment
--- in dllmain.cpp..
--- [HOOK TOGGLE: OFF] fnc_resolve_resource_handle_impl_bucket_check = 0x38AF5C
--- Base of the 64-entry resource-handle bucket table itself (g_apResourceHandleBuckets in Ghidra).
--- Used by InstallBucketMemoryWatcherThread (dllmain.cpp) -- a background thread, independent of
--- the hot-path fix above, that periodically VirtualQuery's each claimed bucket and proactively
--- resets any whose backing memory was freed back to the -1 "unclaimed" sentinel, so the hot-path
--- guard hook (which already treats -1 as "return 0") catches it with zero added per-call cost.
--- Closes the one gap the hot-path fix's own comment left open (a bucket pointing at real,
--- once-valid memory the OS later freed) -- a per-call VirtualQuery check was tried and reverted
--- the same day for freezing the game; this sidesteps that by checking rarely, off the hot thread.
 resource_handle_bucket_table = 0x2EE3980
--- CALL instruction (memcpy import thunk) inside KH1_BehaviorScriptInterpreter's
--- class-0/sub-op-0xA opcode handler ("load block via resolved handle"). Resolves a
--- handle then feeds the raw result straight into memcpy as the source with zero
--- validation -- crash site #6, live-crashed after heavy spawn_enemy churn.
--- Full writeup: project_spawn_enemy_cold_spawn_crash_containment.md (crash site #6).
--- [NOT A TOGGLE -- NO IMPLEMENTATION EXISTS] There is no InstallBehaviorScriptCopyGuardHook in the
--- DLL; it was deleted in 2d3fd64. Restored and re-enabled 2026-08-12, it logged ZERO faults across a
--- full session while crashes continued at 0x3900FC / 0x1D6230 / 0x390138, so it was removed again.
--- Uncommenting this line alone does nothing. Recover the code from 2d3fd64^ first if ever needed.
--- fnc_behavior_script_copy_guard_hook = 0x2CCFED
--- Entry of FUN_1402a0350 -- a joint/bone remap-table setup dispatcher, reached on a
--- creature's first motion transition, that either blends or (cold path) calls
--- FUN_140394080 (30+ unchecked fnc_resolve_resource_handle calls). Crash site #7,
--- live-crashed immediately after crash site #6 was fixed -- confirms the
--- bucket-exhaustion "return 0" fix surfaces as null derefs scattered across the
--- animation system, not just one site. Wrapped whole (not patched inline) since this
--- function has 5+ callers plus indirect table references -- see
--- InstallJointRemapSetupGuardHook (dllmain.cpp) for the full writeup.
--- [HOOK TOGGLE: OFF] fnc_joint_remap_setup_guard_hook = 0x2A0350
--- Entry of fnc_velocity_blend_neighbor_UNGUARDED -- walks every other live entity looking
--- for one to blend velocity against, chaining through fnc_resolve_resource_handle results
--- with FOUR unguarded dereferences in a single loop. Crash site #4: known since
---, live-crashed twice at the identical instruction (RVA 0x2B5BF0) six days
--- apart, and the top remaining crash site as of. Wrapped whole rather than
--- patched inline -- its own "no neighbor found" return (0, param_2 untouched) is a clean,
--- in-band failure result, unlike most sites here. See
--- InstallVelocityBlendNeighborGuardHook (dllmain.cpp) for the full writeup.
--- [HOOK TOGGLE: OFF] fnc_velocity_blend_neighbor_guard_hook = 0x2B5AF0
--- PATH B entry inside fnc_resource_entry_lookup_with_fallback (0x1DD650). Path B is the silent
--- fallback that returns a 16-byte slice of the HEADER OBJECT ITSELF as if it were a resource
--- table entry; callers then read its +4/+8 as resource handles, which is the documented source
--- of the deterministic float-shaped bogus handles behind crash sites #6/#7/#8/#10/#11.
--- DIAGNOSTIC ONLY -- the hook logs which of path B's three triggers fired (magic absent /
--- blob handle unresolvable / *blob == 0), the one thing never verified live, and does not alter
--- the path taken. Hooked at path B rather than the function entry because the function itself is
--- a hot lookup. See InstallResourceEntryFallbackGuardHook (dllmain.cpp).
--- Bytes at this address: 48 8D 47 01 (lea rax,[rdi+1]) 48 C1 E0 04 (shl rax,4).
--- [HOOK TOGGLE: OFF] fnc_resource_entry_fallback_hook = 0x1DD6AB
--- ENTRY of the same function. Counts calls, so "path B fired 0 times" can be distinguished from
--- "this function never ran" -- the first path-B session logged zero hits and it was not possible
--- to tell which. Bytes here: 48 89 5C 24 08 (mov [rsp+8], rbx), exactly 5, so the JMP replaces
--- one whole instruction. DIAGNOSTIC ONLY.
--- [HOOK TOGGLE: OFF] fnc_resource_entry_lookup_counter_hook = 0x1DD650
--- Boss-defeat / slow-motion engine state. Used by spawn_enemy to refuse while the
--- game is in the post-boss slowdown: the 20:56 crash was a spawn that completed cleanly and then
--- had its species blob wiped by the engine's battle-end teardown ~5s later, killing the game in
--- fnc_text_slot_layout_prepare. Unlike every earlier sighting of that wipe, there was NO room
--- transition -- battle-end fires the same release path.
--- RVAs from the community "Slowmode" script (KSX), which drives the effect by writing these.
--- Confirmed in Ghidra that the game itself writes them too, so they are real engine state:
--- g_GameSpeed is a genuine timescale float (1.0 normal, 0.1 during the effect) read by
--- fnc_get_number_of_seconds_played among others, and g_BossDefeatEffectStart is written by
--- fnc_01F_blur_on / fnc_0B8_rotate_blur (EVDL effect opcodes).
--- ONLY g_GameSpeed gates the refusal; the other two are logged for diagnosis until a real normal
--- value has been observed for them. See the gate in l_spawn_enemy (dllmain.cpp).
--- fnc_entity_teardown -- the engine's own entity erase (reached normally via
--- fnc_entity_erase_by_id at 0x292370). spawn_enemy calls this DIRECTLY, by entity pointer, to
--- retire its own already-dead spawns before the engine can wipe the species blob underneath them.
--- Passing the pointer rather than the id is deliberate: the by-id front door resolves whatever
--- entity currently holds that id, and ids are reused after a room reload, so a native could
--- inherit a dead spawn's id.
--- *** KILL SWITCH: comment this line out to disable the eager teardown with no rebuild. ***
--- *** STAGE 2 DISABLED AGAIN after a live regression. ***
--- Stage 2 ran and the evacuation fired 3 times; the first two were harmless, but the third tore
--- down a creature that was only 3 SECONDS OLD and actively being fought, and a crash in
--- fnc_text_slot_layout_prepare (crash site #11 -- the TEXT/kill-popup path) followed immediately.
--- The user reported "random crash just killing a heartless - that's new".
--- Two problems to solve before re-arming:
---   1. A reentrancy bug in the hook (fixed in the DLL, but unproven): the engine's release routine
---      calls ITSELF with only one argument, so the inner call's runLen is garbage.
---   2. The evacuation is too aggressive -- it kills healthy creatures the player is fighting, and
---      doing that during death/EXP processing is a plausible new crash trigger in its own right.
--- *** RE-ENABLED for despawn_spawned_enemies -- a DIFFERENT consumer. ***
--- The regression that disabled this was the release PRE-HOOK's evacuation, which fired on any slot
--- release and so destroyed creatures mid-combat. That hook is currently toggled OFF
--- (fnc_release_species_slot_run_prehook, below), so this address no longer arms it.
--- What it arms now is despawn_spawned_enemies: teardown ONLY as a transition begins (cutscene-flag
--- rising edge or an actual room change), which is when the creature was going to be destroyed
--- anyway. That is the engine's own erase path -- the same one fnc_1AA_erase_all_enemies uses --
--- standing in for the EVDL script that would have owned the creature.
--- *** DISABLED AGAIN -- made REDUNDANT, not reverted for a fault. ***
--- despawn_spawned_enemies triggered on a cutscene-flag edge or a world/area/set change, to remove
--- our creatures before a transition. Both halves of that turned out to be unnecessary:
---   * on a real AREA CHANGE the game already walks the room's spawn list and erases our creatures
---     (the area's own EVDL script calls the erase opcode), so there was nothing for us to do; and
---   * the gummi-ship warp is NOT an area change, so this never fired for the one case that
---     actually froze -- and that case is now prevented at source by the battle-state gate in
---     1fmRandoBoardGummi.lua (KH1-RANDOMIZER), which simply does not offer the gummi option while
---     the game considers you in battle. Restoring the condition vanilla relies on beats removing
---     entities behind the game's back.
--- Left commented rather than deleted: uncommenting re-arms despawn_spawned_enemies AND
--- RetireDeadTrackedSpawns, if a transition ever turns up that the engine does not clean up itself.
--- fnc_entity_teardown = 0x292390
--- ENTRY of fnc_release_species_slot_run -- same address as fnc_release_species_slot_run above, but
--- a separate entry so the pre-hook has its OWN kill switch (disabling the hook must not also
--- disable our reclamation's normal use of that function).
--- The hook evacuates any of OUR still-live creatures out of a slot run the ENGINE is about to
--- release, BEFORE the blob is wiped. Live-confirmed: the engine released a run
--- 5s after we spawned into it while the creature was still alive, and the crash followed.
--- Hooking the callee (not its ~30 callers) is deliberate -- one hook covers every release path.
--- *** KILL SWITCH: comment this line out to disable the pre-hook with no rebuild. ***
--- [HOOK TOGGLE: OFF] fnc_release_species_slot_run_prehook = 0x2858E0
 g_GameSpeed = 0x233FBCC
 g_BossDefeatEffect = 0x233FBE8
 g_BossDefeatEffectStart = 0x233FDFC
--- Status-effect floating-text stale-pointer fix -- properly re-derives the value
--- instead of guarding a bad read. Three coordinated hook points inside
--- fnc_status_effect_activate_by_type / FUN_1401eba70, plus the shared 256-slot text table's own
--- base address (used to index our side table by slot). See
--- InstallTextSlotHandleCaptureHook/InstallTextSlotHandleRecordHook/InstallTextSlotFreshResolveHook
--- in dllmain.cpp for the full writeup.
--- [HOOK TOGGLE: OFF] fnc_status_effect_handle_capture_hook = 0x1E014D
--- [HOOK TOGGLE: OFF] fnc_status_effect_handle_record_hook = 0x1E0198
--- [HOOK TOGGLE: OFF] fnc_text_slot_fresh_resolve_hook = 0x1EBA78
 text_slot_table_base = 0x2678280
--- Stamps owner=species and runLen into every slot of a run. The engine's room-unload sweep only
--- releases blocks where owner==own index, so a load that skips this is never reclaimed.
 fnc_claim_species_slot_run = 0x286190
--- Base of the shared 96-slot global entity pool (stride 0x4B0/1200 bytes) --
--- Sora, party members, doors/chests/markers, and every
--- fnc_spawn_world_gimmick_entity-constructed creature live in it. Confirmed
--- live: soraPointer's resolved struct landed exactly on this
--- pool's slot-4 boundary. Used by AnyEntityTooCloseToSora in dllmain.cpp to
--- refuse spawn_enemy when something is already sitting on top of Sora.
 entityPoolBase = 0x2D372A0
--- Sora + up to 2 active party members' entity pointers (a contiguous
--- 3-pointer array, confirmed live -- g_SoraObjPtr's resolved
--- value matched soraPointer's exactly). Used by AnyEnemyTooCloseToSora to
--- exclude the whole party (not just Sora) from the "too close" check --
--- otherwise a party member following Sora around would always count as
--- an enemy nearby, since they share the same entity kind byte.
 g_SoraObjPtr = 0x2D37280
 g_PartyMember1ObjectPtr = 0x2D37288
 g_PartyMember2ObjPtr = 0x2D37290
-
 fnc_show_item_message = 0x273410
 fnc_item_popup_text_hook = 0x27358C
 fnc_item_popup_text_resume = 0x273594

@@ -155,7 +155,6 @@
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="crash_dump.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="spawn_enemy.cpp" />
     <ClCompile Include="pch.cpp">

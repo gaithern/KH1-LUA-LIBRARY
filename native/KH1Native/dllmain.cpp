@@ -871,8 +871,6 @@ static HMODULE FindLuaModule() {
 extern "C" __declspec(dllexport) int luaopen_kh1_native(void* L) {
     LogDebug("luaopen_kh1_native called");
 
-    InstallCrashDumpHandler();
-
     HMODULE hLua = FindLuaModule();
     if (hLua && !p_lua_gettop) {
         p_lua_gettop      = (t_lua_gettop)      GetProcAddress(hLua, "lua_gettop");

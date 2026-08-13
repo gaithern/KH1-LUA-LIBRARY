@@ -301,7 +301,6 @@ UK_Word = 0x2E1B660
 
 fnc_spawn_prize = 0x2BDD50
 fnc_update_widget_queue = 0x2A9750
-
 fnc_spawn_world_gimmick_entity = 0x28EBD0
 placementTablePtr = 0x296C030
 placementTableCount = 0x296C028
@@ -314,18 +313,7 @@ fnc_async_load_job_callback = 0x2842A0
 fnc_velocity_blend_util = 0x2B3CB0
 fnc_party_ability_index_resolve_call = 0x1D4192
 fnc_iterate_live_entities = 0x28F990
-
--- Base of the 64-entry resource-handle bucket table (DAT_142ee4730 in Ghidra -- confirmed via
--- decompiling this build's own fnc_resolve_resource_handle_impl at RVA 0x38B230, identical decode
--- formula to Steam). Only the data address is ported here; fnc_resolve_resource_handle_impl_bucket_check
--- (the hot-path exhaustion-guard HOOK this address's watcher thread is meant to complement -- see
--- SteamGlobal_1_0_0_2.lua's comment) has NOT been located/ported to EGS yet, so
--- InstallBucketMemoryWatcherThread still runs here and still prevents dereferencing genuinely-freed
--- memory (resets it to -1 instead), but a bucket that's merely EXHAUSTED (not freed) still resolves
--- to a raw -1 pointer on this build with nothing downstream to catch it -- weaker than Steam until
--- the guard hook itself is ported..
 resource_handle_bucket_table = 0x2EE4730
-
 fnc_show_item_message = 0x2712A0
 fnc_item_popup_text_hook = 0x27141C
 fnc_item_popup_text_resume = 0x271424
@@ -348,16 +336,19 @@ g_pEVStringDataPtr = 0x23927C0
 fnc_display_message_anim_hook = 0x1B6FE3
 fnc_play_se2 = 0x1766F0
 fnc_display_message_anim_resume = 0x1B6FEC
-fnc_display_message_anim_call_target = 0x174400-- Boss-defeat / slow-motion engine state. Used by spawn_enemy to refuse while the
--- game is in the post-boss slowdown -- see the SteamGlobal_1_0_0_2.lua entry for the full crash
--- story (the 20:56 crash was a spawn whose species blob the engine wiped during battle-end
--- teardown, with NO room transition involved).
--- RVAs from the community "Slowmode" script (KSX). Unlike most EGS twins in this project these
--- were NOT taken on trust: verified against the EGS Ghidra database, where the xref shape matches
--- the Steam build exactly -- g_GameSpeed has 13 xrefs (1 write / 12 reads) in both, and
--- g_BossDefeatEffectStart has 1 read / 6 writes in both, including the two EVDL blur opcodes.
--- ONLY g_GameSpeed gates the refusal; the other two are logged for diagnosis. The gate is
--- fail-open and read-only, so a wrong address costs at most a spurious refusal, never a crash.
+fnc_display_message_anim_call_target = 0x174400
 g_GameSpeed = 0x23405CC
 g_BossDefeatEffect = 0x23405E8
 g_BossDefeatEffectStart = 0x23407FC
+fnc_apply_actor_status_effect = 0x2ABFD0
+fnc_release_species_slot_run  = 0x283760
+fnc_claim_species_slot_run    = 0x284010
+syscall_battle_check = 0x1AB26E
+g_WorldNumber = 0x2340E5C
+g_AreaNumber  = 0x2340EC4
+g_SetNumber   = 0x2340EC8
+g_SoraObjPtr            = 0x2D37C80
+g_PartyMember1ObjectPtr = 0x2D37C88
+g_PartyMember2ObjPtr    = 0x2D37C90
+entityPoolBase          = 0x2D37CA0
+text_slot_table_base = 0x2678C80

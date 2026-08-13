@@ -37,8 +37,5 @@ void LogDebug(const char* msg);
 bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount,
               unsigned long long& outResult);
 
-// Writes a full-memory dump on the first game-code access violation (crash_dump.cpp).
-void InstallCrashDumpHandler();
-
 // Enemy spawn (spawn_enemy.cpp).
 extern "C" int l_spawn_enemy(void* L);
