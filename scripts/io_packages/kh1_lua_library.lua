@@ -910,6 +910,16 @@ local function describe_spawn_failure(code, native_message)
     guaranteed to survive either -- it is short, which is what the surviving
     values in this environment have in common, but that is an observation rather
     than a guarantee.]]
+    -- slots_full carries its numbers in the code ("slots_full/<needed>/<longest free run>"),
+    -- because the short code survives the native/Lua boundary more reliably than the message.
+    if code then
+        local needed, longest = code:match("^slots_full/(%d+)/(%d+)$")
+        if needed then
+            return string.format(
+                "spawn_enemy: no creature slots free right now -- this creature needs %s "
+                .. "consecutive free slots, and we currently only have %s", needed, longest)
+        end
+    end
     local text = code and SPAWN_FAILURE_MESSAGES[code]
     if text then return text end
     if code and code ~= "" then
@@ -970,7 +980,8 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         resource_handle_bucket_table,
         g_GameSpeed, g_BossDefeatEffect, g_BossDefeatEffectStart,
         text_slot_table_base,
-        fnc_claim_species_slot_run)
+        fnc_claim_species_slot_run,
+        fnc_release_species_slot_run)
 end
 
 -- Pending spawn_enemy requests
