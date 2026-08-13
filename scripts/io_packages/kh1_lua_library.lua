@@ -817,6 +817,7 @@ local function sora_koed()
     return ReadByte(maxHP - 0x1) == 0
 end
 
+
 local function ko_sora()
     -- Triggers the in game functions to KO Sora.
     if not sora_koed() then
@@ -974,6 +975,7 @@ return {
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_enemy_spawns.spawn_enemy,
     update_spawn_enemy = kh1_enemy_spawns.update_spawn_enemy,
+    can_spawn_enemy = kh1_enemy_spawns.can_spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     open_text_box = open_text_box,

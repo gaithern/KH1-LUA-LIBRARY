@@ -66,6 +66,7 @@ rather than in the main library, and are required with a dotted path.
 local spawns = require("kh1_lua_library.enemy_spawns")
 spawns.spawn_enemy(model_path, motion_path, x, y, z, callback)
 spawns.update_spawn_enemy()   -- every frame, from your own _OnFrame
+spawns.can_spawn_enemy(model_path)  -- would it be refused? answers without spawning
 ```
 
 The `kh1_lua_library.lua` file and the `kh1_lua_library/` folder sit side by side on
@@ -99,6 +100,28 @@ spelling instead would break the `/Yu"pch.h"` precompiled-header match.
   custom text boxes, playing sound effects.
 - **Bit/byte helpers**: `ReadBit`/`WriteBit`/`ReadBits`, KHSCII string conversion
   (`GetKHSCII`), table utilities (`contains`, `get_index`, `merge_tables`).
+- **Readiness check**: `can_spawn_enemy()` — ask whether a spawn would work *before*
+  attempting it. See below.
+
+### `can_spawn_enemy`
+
+Answers "would `spawn_enemy` refuse right now?" without doing anything:
+
+```lua
+local verdict, code, message = kh1.can_spawn_enemy("xa_ex_2020.mdls")
+-- "ready" | "retry" (transient) | "unavailable" (needs a restart, or unsupported)
+```
+
+It runs the real `spawn_enemy` gates — they're shared functions in
+`packages/spawn_enemy.cpp`, not a reimplementation — but allocates nothing, triggers no
+asset load and constructs nothing, so it's safe to poll. Called with no model path it
+checks only the creature-independent gates and skips the per-creature slot search, which is
+much cheaper. A `"ready"` verdict is not a guarantee: refusals that only surface mid-flight
+(`blob_invalid`, `ctor_threw`, the room's concurrent-enemy budget) can still come back from
+the real call.
+
+`code` is the same short refusal code `spawn_enemy` itself returns (and now passes to its
+callback as a fourth argument), so both paths can share one mapping table.
 
 Anything that needs to call into real game code (rather than just read/write memory) is
 routed through `kh1_native.dll` via `require("kh1_native")`.

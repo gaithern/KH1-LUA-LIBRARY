@@ -128,17 +128,48 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         fnc_release_species_slot_run)
 end
 
+-- Would spawn_enemy refuse right now? Returns "ready"/"retry"/"unavailable", code, message
+-- without spawning. No model_path = cheap gates-only check. See the README.
+local function can_spawn_enemy(model_path)
+    -- Cheap Lua-side gates first, matching spawn_enemy's own front door.
+    if ReadInt(inCutscene) ~= 0 then
+        return "retry", "cutscene", "a cutscene is playing"
+    end
+    if lib().is_in_gummi_garage() then
+        return "retry", "gummi", "the player is in the Gummi ship"
+    end
+
+    local charId, template = 0, nil
+    local known = model_path and kh1_creature_data[model_path]
+    if known then
+        charId = known.charId
+        template = known.template
+    end
+
+    -- 20 positional args -- must stay in step with l_spawn_enemy_precheck's parameter reads.
+    return kh1_native.spawn_enemy_precheck(
+        model_path, charId, template,
+        g_GameSpeed, g_BossDefeatEffect, g_BossDefeatEffectStart,
+        g_WorldNumber, g_AreaNumber, g_SetNumber,
+        resource_handle_bucket_table,
+        placementTablePtr, placementTableCount,
+        loadedSpeciesPtrTable, speciesResourceTable,
+        fnc_iterate_live_entities, fnc_resolve_resource_handle,
+        text_slot_table_base,
+        fnc_mint_resource_handle, fnc_load_gimmick_assets,
+        model_path == nil and 1 or 0)
+end
+
 -- Pending spawn_enemy requests
 local pending_spawn_requests = {}
 local next_spawn_request_id = 1
 
+-- Queues a spawn; drive it with update_spawn_enemy() every frame. Ignored in cutscenes/Gummi.
+-- callback(ok, message, raw_native_message, code) -- code is the short refusal code, nil on success.
 local function spawn_enemy(model_path, motion_path, x, y, z, callback)
-    --[[Queues an enemy spawn and returns immediately; call update_spawn_enemy()
-    every frame from _OnFrame to drive it. Ignored during cutscenes/Gummi ship.]]
-
     if ReadInt(inCutscene) ~= 0 then
         if callback then
-            callback(false, "spawn_enemy: ignored, player is in a cutscene")
+            callback(false, "spawn_enemy: ignored, player is in a cutscene", nil, "cutscene")
         end
         return
     end
@@ -147,7 +178,7 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
     -- rather than queued.
     if lib().is_in_gummi_garage() then
         if callback then
-            callback(false, "spawn_enemy: ignored, player is in the Gummi ship")
+            callback(false, "spawn_enemy: ignored, player is in the Gummi ship", nil, "gummi")
         end
         return
     end
@@ -179,18 +210,20 @@ local function update_spawn_enemy()
                 -- Cutscene started after queueing -- drop rather than wait it out.
                 pending_spawn_requests[id] = nil
                 if req.callback then
-                    req.callback(false, "spawn_enemy: ignored, player entered a cutscene while this request was pending")
+                    req.callback(false, "spawn_enemy: ignored, player entered a cutscene while this request was pending",
+                                 nil, "cutscene")
                 end
             elseif stillLoading == "gummi" then
                 -- Boarded the Gummi ship after queueing -- same reasoning as above.
                 pending_spawn_requests[id] = nil
                 if req.callback then
-                    req.callback(false, "spawn_enemy: ignored, player boarded the Gummi ship while this request was pending")
+                    req.callback(false, "spawn_enemy: ignored, player boarded the Gummi ship while this request was pending",
+                                 nil, "gummi")
                 end
             elseif os.clock() >= req.deadline then
                 pending_spawn_requests[id] = nil
                 if req.callback then
-                    req.callback(false, "spawn_enemy: timed out waiting for asset load")
+                    req.callback(false, "spawn_enemy: timed out waiting for asset load", nil, "timeout")
                 end
             end
             -- else: still within budget, leave it queued for next frame.
@@ -201,9 +234,9 @@ local function update_spawn_enemy()
                     -- result is the spawned entity's pointer.
                     req.callback(true, result)
                 else
-                    -- Lua-authored text (see SPAWN_FAILURE_MESSAGES); the raw
-                    -- native message is still passed third.
-                    req.callback(false, describe_spawn_failure(code, result), result)
+                    -- Lua-authored text (see SPAWN_FAILURE_MESSAGES); the raw native
+                    -- message is still passed third, the short code fourth.
+                    req.callback(false, describe_spawn_failure(code, result), result, code)
                 end
             end
         end
@@ -213,4 +246,5 @@ end
 return {
     spawn_enemy = spawn_enemy,
     update_spawn_enemy = update_spawn_enemy,
+    can_spawn_enemy = can_spawn_enemy,
 }

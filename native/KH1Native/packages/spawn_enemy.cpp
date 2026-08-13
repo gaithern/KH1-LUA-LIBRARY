@@ -720,6 +720,85 @@ static void LogEntitySnapshot(const char* when, uint64_t entity, uint32_t expect
     LogDebug(msg);
 }
 
+// SPAWN GATES -- read-only refusal checks shared by l_spawn_enemy and l_spawn_enemy_precheck so
+// the two can't drift. Anything with a side effect stays inline in l_spawn_enemy.
+
+// Post-boss slow-motion. g_GameSpeed is 1.0 normally, 0.1 during the effect. Fails OPEN: an
+// unreadable or NaN value reads as normal speed and never blocks a spawn.
+static bool GateBossDefeatSlowdown(unsigned long long base, unsigned long long gameSpeedRva,
+                                   unsigned long long bossDefeatEffectRva,
+                                   unsigned long long bossDefeatEffectStartRva,
+                                   bool logging) {
+    if (gameSpeedRva == 0) return false;
+    uint32_t rawSpeed = 0, effect = 0, effectStart = 0;
+    bool okSpeed = TryReadU32(base + gameSpeedRva, &rawSpeed);
+    bool okEffect = (bossDefeatEffectRva != 0) && TryReadU32(base + bossDefeatEffectRva, &effect);
+    bool okStart = (bossDefeatEffectStartRva != 0) && TryReadU32(base + bossDefeatEffectStartRva, &effectStart);
+
+    float gameSpeed = 1.0f;
+    if (okSpeed) memcpy(&gameSpeed, &rawSpeed, sizeof(gameSpeed));
+
+    // Treat only a genuinely sub-normal, finite timescale as "slowed". NaN/garbage compares
+    // false here and is therefore treated as normal, which is the fail-open direction.
+    const bool slowed = okSpeed && (gameSpeed > 0.0f) && (gameSpeed < 0.9f);
+
+    // Baseline reading plus every abnormal one -- not every call. The precheck passes
+    // logging=false so polling can't flood the log while a slowdown lasts.
+    static bool s_loggedSpeedBaseline = false;
+    if (logging && (!s_loggedSpeedBaseline || slowed)) {
+        s_loggedSpeedBaseline = true;
+        char spdMsg[320];
+        snprintf(spdMsg, sizeof(spdMsg),
+            "spawn_enemy: engine state readable(speed,effect,start)=%d%d%d g_GameSpeed=%f "
+            "(raw=0x%08X) bossDefeatEffect=%u bossDefeatEffectStart=%u -- slowed=%d "
+            "(only g_GameSpeed gates; the other two are diagnostic only)",
+            (int)okSpeed, (int)okEffect, (int)okStart, (double)gameSpeed, rawSpeed,
+            (unsigned)(effect & 0xFF), (unsigned)(effectStart & 0xFF), (int)slowed);
+        LogDebug(spdMsg);
+    }
+    return slowed;
+}
+
+// Matches world+area only -- Set is the evdl variant suffix, not a distinct room.
+static const BlacklistedRoomRange* GateRoomBlacklisted(int32_t curWorld, int32_t curArea) {
+    for (size_t i = 0; i < sizeof(g_spawnRoomBlacklist) / sizeof(g_spawnRoomBlacklist[0]); ++i) {
+        const BlacklistedRoomRange& r = g_spawnRoomBlacklist[i];
+        if (curWorld == r.world && curArea >= r.areaMin && curArea <= r.areaMax) return &r;
+    }
+    return nullptr;
+}
+
+static const int kHandleBucketCount = 64;
+static const int kHandleBucketSafeHeadroom = 6; // refuse once fewer than this many remain free
+
+// Counts claimed (non-(-1)) buckets; -1 means "not configured", never "full". Also stashes the
+// table address for LogResolveHandleBucketGuard, which can't be handed it from its code cave.
+static int GateCountClaimedHandleBuckets(unsigned long long base, unsigned long long rva) {
+    if (rva == 0) return -1;
+    volatile int64_t* bucketTable = (volatile int64_t*)(uintptr_t)(base + rva);
+    g_resourceHandleBucketTableAddr = (uint64_t)(uintptr_t)bucketTable;
+    int claimed = 0;
+    for (int i = 0; i < kHandleBucketCount; ++i) {
+        if (bucketTable[i] != -1) ++claimed;
+    }
+    return claimed;
+}
+
+static bool HandleBucketsFull(int claimed) {
+    return claimed >= 0 && claimed >= kHandleBucketCount - kHandleBucketSafeHeadroom;
+}
+
+// A null pointer or an out-of-range count means the room isn't in a spawnable state right now.
+static bool GatePlacementTableValid(unsigned long long base, unsigned long long tablePtrRva,
+                                    unsigned long long tableCountRva,
+                                    uint8_t** outTable, int32_t* outCount) {
+    uint8_t* table = *(uint8_t**)(uintptr_t)(base + tablePtrRva);
+    int32_t count = *(int32_t*)(uintptr_t)(base + tableCountRva);
+    if (outTable) *outTable = table;
+    if (outCount) *outCount = count;
+    return table != nullptr && count > 0 && count <= 4096;
+}
+
 // Every refusal returns a short machine-readable code plus a message, so Lua can react to the
 // reason rather than parse prose.
 static int RefuseSpawn(void* L, const char* code, const char* message) {
@@ -728,6 +807,143 @@ static int RefuseSpawn(void* L, const char* code, const char* message) {
     p_lua_pushboolean(L, 0);
     p_lua_pushstring(L, code);
     return 4;
+}
+
+// "retry" clears on its own (room change, a defeat); "unavailable" needs a restart or is
+// unsupported for this creature/build.
+static int PrecheckVerdict(void* L, const char* verdict, const char* code, const char* message) {
+    p_lua_pushstring(L, verdict);
+    p_lua_pushstring(L, code);
+    p_lua_pushstring(L, message);
+    return 3;
+}
+
+// Read-only "would spawn_enemy refuse right now?" -- allocates nothing, loads nothing, constructs
+// nothing. Returns verdict ("ready"/"retry"/"unavailable"), short code, message. See the README.
+extern "C" int l_spawn_enemy_precheck(void* L) {
+    const char* modelPath = p_lua_tolstring(L, 1, nullptr);
+    long long luaCharId = (long long)p_lua_tointegerx(L, 2, nullptr);
+    size_t luaTemplateLen = 0;
+    const char* luaTemplateRecord = p_lua_tolstring(L, 3, &luaTemplateLen);
+    unsigned long long gameSpeedRva = (unsigned long long)p_lua_tointegerx(L, 4, nullptr);
+    unsigned long long bossDefeatEffectRva = (unsigned long long)p_lua_tointegerx(L, 5, nullptr);
+    unsigned long long bossDefeatEffectStartRva = (unsigned long long)p_lua_tointegerx(L, 6, nullptr);
+    unsigned long long worldNumRva = (unsigned long long)p_lua_tointegerx(L, 7, nullptr);
+    unsigned long long areaNumRva = (unsigned long long)p_lua_tointegerx(L, 8, nullptr);
+    unsigned long long setNumRva = (unsigned long long)p_lua_tointegerx(L, 9, nullptr);
+    unsigned long long resourceHandleBucketTableRva = (unsigned long long)p_lua_tointegerx(L, 10, nullptr);
+    unsigned long long tablePtrRva = (unsigned long long)p_lua_tointegerx(L, 11, nullptr);
+    unsigned long long tableCountRva = (unsigned long long)p_lua_tointegerx(L, 12, nullptr);
+    unsigned long long loadedPtrTableRva = (unsigned long long)p_lua_tointegerx(L, 13, nullptr);
+    unsigned long long speciesResourceTableRva = (unsigned long long)p_lua_tointegerx(L, 14, nullptr);
+    unsigned long long entityIterFnRva = (unsigned long long)p_lua_tointegerx(L, 15, nullptr);
+    unsigned long long resolveHandleFnRva = (unsigned long long)p_lua_tointegerx(L, 16, nullptr);
+    unsigned long long textSlotTableRva = (unsigned long long)p_lua_tointegerx(L, 17, nullptr);
+    unsigned long long mintHandleFnRva = (unsigned long long)p_lua_tointegerx(L, 18, nullptr);
+    unsigned long long loadAssetsFnRva = (unsigned long long)p_lua_tointegerx(L, 19, nullptr);
+    // Shallow: creature-independent gates only, skipping the slot walk (a SafeCall per live
+    // entity). Cheap enough to poll on a timer.
+    const bool shallowOnly = p_lua_tointegerx(L, 20, nullptr) != 0;
+
+    if (!modelPath && !shallowOnly) {
+        return PrecheckVerdict(L, "unavailable", "bad_args", "spawn_enemy: model_path is required");
+    }
+    // NOT InternPath'd: nothing here outlives the call, and interning burns a fixed-pool slot.
+    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
+
+    if (resolveHandleFnRva == 0 || loadedPtrTableRva == 0 || mintHandleFnRva == 0 ||
+        loadAssetsFnRva == 0 || tablePtrRva == 0 || tableCountRva == 0) {
+        return PrecheckVerdict(L, "unavailable", "unconfigured",
+            "spawn_enemy: this game build is missing an address this feature needs");
+    }
+
+    // logging=false -- this runs on every effect request.
+    if (GateBossDefeatSlowdown(base, gameSpeedRva, bossDefeatEffectRva, bossDefeatEffectStartRva, false)) {
+        return PrecheckVerdict(L, "retry", "boss_defeat_slowdown",
+            "the game is in a boss-defeat/slow-motion sequence -- it will be spawnable again shortly");
+    }
+
+    // No room-change bookkeeping here: that path releases our runs and rewrites g_lastSpawnRoom*,
+    // which a speculative check must never do.
+    if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
+        int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
+        int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
+        const BlacklistedRoomRange* blocked = GateRoomBlacklisted(curWorld, curArea);
+        if (blocked) {
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                "enemy spawning is turned off in this room (%s) -- it will work again elsewhere", blocked->label);
+            return PrecheckVerdict(L, "retry", "room_blacklisted", msg);
+        }
+    }
+
+    // Session-lifetime, unlike everything else here: buckets are not reclaimed on a room change.
+    {
+        int claimed = GateCountClaimedHandleBuckets(base, resourceHandleBucketTableRva);
+        if (HandleBucketsFull(claimed)) {
+            char msg[200];
+            snprintf(msg, sizeof(msg),
+                "too many distinct resources loaded this session (%d/%d resource handles claimed) "
+                "-- enemy spawning needs a game restart to recover", claimed, kHandleBucketCount);
+            return PrecheckVerdict(L, "unavailable", "handles_full", msg);
+        }
+    }
+
+    uint8_t* roomTable = nullptr;
+    int32_t roomCount = 0;
+    if (!GatePlacementTableValid(base, tablePtrRva, tableCountRva, &roomTable, &roomCount)) {
+        return PrecheckVerdict(L, "retry", "table_invalid",
+            "the room isn't in a spawnable state right now -- try again in a moment");
+    }
+
+    // Everything past here is creature-specific, which is exactly what shallow mode skips.
+    if (shallowOnly) {
+        return PrecheckVerdict(L, "ready", "", "");
+    }
+
+    if (luaCharId == 0 || !luaTemplateRecord || luaTemplateLen != PLACEMENT_RECORD_SIZE) {
+        return PrecheckVerdict(L, "unavailable", "no_creature_data",
+            "no offline data for this creature (missing from kh1_lua_library/creature_data.lua)");
+    }
+    const uint8_t* templateRec = (const uint8_t*)luaTemplateRecord;
+    int templateSlotRunLen = (int)(int8_t)templateRec[0x56];
+    if (templateSlotRunLen < 1) templateSlotRunLen = 1;
+
+    // Mirrors l_spawn_enemy: a creature already in a reusable slot needs no free run, so checking
+    // only for a free run would refuse spawns that would have succeeded.
+    bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
+    MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva,
+                                   speciesResourceTableRva, speciesInUseByLiveEntity);
+    uint8_t species = 0;
+    if ((FindTriggeredLoad(modelPath, &species) &&
+         ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: our own triggered load")) ||
+        (FindLoadedSlotByFilename(base, loadedPtrTableRva, speciesResourceTableRva, modelPath, &species) &&
+         ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: loaded-slot filename scan"))) {
+        if (RoomHasNativeSpecies(roomTable, roomCount, species, base + resolveHandleFnRva, modelPath)) {
+            return PrecheckVerdict(L, "retry", "slot_collision",
+                "that creature's slot is in use by a different creature native to this room -- try another room");
+        }
+        return PrecheckVerdict(L, "ready", "", "");
+    }
+
+    if (FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
+                                        templateSlotRunLen, roomTable, roomCount,
+                                        base + resolveHandleFnRva, modelPath,
+                                        textSlotTableRva, speciesResourceTableRva, &species)) {
+        return PrecheckVerdict(L, "ready", "", "");
+    }
+
+    SlotAvailability av;
+    ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
+                            roomTable, roomCount, speciesInUseByLiveEntity, av);
+    char msg[240];
+    snprintf(msg, sizeof(msg),
+        "no creature slots free right now -- this creature needs %d consecutive free slots and "
+        "only %d are free. They come back as spawned enemies are defeated, or on a room change.",
+        templateSlotRunLen, LongestFreeRun(av));
+    char code[48];
+    snprintf(code, sizeof(code), "slots_full/%d/%d", templateSlotRunLen, LongestFreeRun(av));
+    return PrecheckVerdict(L, "retry", code, msg);
 }
 
 extern "C" int l_spawn_enemy(void* L) {
@@ -789,41 +1005,12 @@ extern "C" int l_spawn_enemy(void* L) {
 
     // Re-read the previous spawn: an unreadable or mismatched id means its pool slot was recycled.
 
-    // Refuse during the post-boss slow-motion: g_GameSpeed is 1.0 normally, 0.1 during the effect.
-    // Fails open -- an unreadable or normal-looking value never blocks a spawn.
-    if (gameSpeedRva != 0) {
-        uint32_t rawSpeed = 0, effect = 0, effectStart = 0;
-        bool okSpeed = TryReadU32(base + gameSpeedRva, &rawSpeed);
-        bool okEffect = (bossDefeatEffectRva != 0) && TryReadU32(base + bossDefeatEffectRva, &effect);
-        bool okStart = (bossDefeatEffectStartRva != 0) && TryReadU32(base + bossDefeatEffectStartRva, &effectStart);
-
-        float gameSpeed = 1.0f;
-        if (okSpeed) memcpy(&gameSpeed, &rawSpeed, sizeof(gameSpeed));
-
-        // Treat only a genuinely sub-normal, finite timescale as "slowed". NaN/garbage compares
-        // false here and is therefore treated as normal, which is the fail-open direction.
-        const bool slowed = okSpeed && (gameSpeed > 0.0f) && (gameSpeed < 0.9f);
-
-        // Log the first reading (the baseline) and every abnormal one -- not every call.
-        static bool s_loggedSpeedBaseline = false;
-        if (!s_loggedSpeedBaseline || slowed) {
-            s_loggedSpeedBaseline = true;
-            char spdMsg[320];
-            snprintf(spdMsg, sizeof(spdMsg),
-                "spawn_enemy: engine state readable(speed,effect,start)=%d%d%d g_GameSpeed=%f "
-                "(raw=0x%08X) bossDefeatEffect=%u bossDefeatEffectStart=%u -- slowed=%d "
-                "(only g_GameSpeed gates; the other two are diagnostic only)",
-                (int)okSpeed, (int)okEffect, (int)okStart, (double)gameSpeed, rawSpeed,
-                (unsigned)(effect & 0xFF), (unsigned)(effectStart & 0xFF), (int)slowed);
-            LogDebug(spdMsg);
-        }
-
-        if (slowed) {
-            // Nothing is allocated or published yet, so returning here is a true no-op.
-            return RefuseSpawn(L, "boss_defeat_slowdown",
-                "spawn_enemy: the game is in a boss-defeat/slow-motion sequence right now -- refusing "
-                "so the spawn does not land while the engine is tearing down battle resources; retry shortly");
-        }
+    // Refuse during the post-boss slow-motion. Nothing is allocated or published yet, so
+    // returning here is a true no-op.
+    if (GateBossDefeatSlowdown(base, gameSpeedRva, bossDefeatEffectRva, bossDefeatEffectStartRva, true)) {
+        return RefuseSpawn(L, "boss_defeat_slowdown",
+            "spawn_enemy: the game is in a boss-defeat/slow-motion sequence right now -- refusing "
+            "so the spawn does not land while the engine is tearing down battle resources; retry shortly");
     }
 
     // On a room change only clear our triggered-load bookkeeping -- the engine re-tiles slots, so a
@@ -846,39 +1033,27 @@ extern "C" int l_spawn_enemy(void* L) {
         g_lastSpawnRoomSet = curSet;
         g_lastSpawnRoomValid = true;
 
-        // Matches world+area only -- Set is the evdl variant suffix, not a distinct room.
-        for (size_t i = 0; i < sizeof(g_spawnRoomBlacklist) / sizeof(g_spawnRoomBlacklist[0]); ++i) {
-            const BlacklistedRoomRange& r = g_spawnRoomBlacklist[i];
-            if (curWorld == r.world && curArea >= r.areaMin && curArea <= r.areaMax) {
-                char msg[224];
-                snprintf(msg, sizeof(msg),
-                    "spawn_enemy: refusing -- room %d/%d/%d is blacklisted (%s covers areas %d..%d): %s",
-                    curWorld, curArea, curSet, r.label, r.areaMin, r.areaMax, r.why);
-                LogDebug(msg);
-                return RefuseSpawn(L, "room_blacklisted",
-                    "spawn_enemy: enemy spawning is disabled in this room");
-            }
+        const BlacklistedRoomRange* blocked = GateRoomBlacklisted(curWorld, curArea);
+        if (blocked) {
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                "spawn_enemy: refusing -- room %d/%d/%d is blacklisted (%s covers areas %d..%d): %s",
+                curWorld, curArea, curSet, blocked->label, blocked->areaMin, blocked->areaMax, blocked->why);
+            LogDebug(msg);
+            return RefuseSpawn(L, "room_blacklisted",
+                "spawn_enemy: enemy spawning is disabled in this room");
         }
     }
 
     // Refuse once the 64-entry resource-handle bucket table is nearly full. Read-only count of
     // non-(-1) entries; only stops spawn_enemy's own churn exhausting it, not other gameplay.
-    if (resourceHandleBucketTableRva != 0) {
-        const int kBucketCount = 64;
-        const int kBucketSafeHeadroom = 6; // refuse once fewer than this many buckets remain free
-        volatile int64_t* bucketTable = (volatile int64_t*)(uintptr_t)(base + resourceHandleBucketTableRva);
-        // Stash it for LogResolveHandleBucketGuard, which runs from a code cave with no way to be
-        // handed this address itself but badly needs it to report real table fullness on a hit.
-        g_resourceHandleBucketTableAddr = (uint64_t)(uintptr_t)bucketTable;
-        int claimed = 0;
-        for (int i = 0; i < kBucketCount; ++i) {
-            if (bucketTable[i] != -1) ++claimed;
-        }
-        if (claimed >= kBucketCount - kBucketSafeHeadroom) {
+    {
+        int claimed = GateCountClaimedHandleBuckets(base, resourceHandleBucketTableRva);
+        if (HandleBucketsFull(claimed)) {
             char msg[160];
             snprintf(msg, sizeof(msg),
                 "spawn_enemy: refusing -- resource-handle bucket table nearly full (%d/%d claimed), spawning more risks a downstream crash",
-                claimed, kBucketCount);
+                claimed, kHandleBucketCount);
             LogDebug(msg);
             return RefuseSpawn(L, "handles_full",
                 "spawn_enemy: too many distinct resources loaded this session (bucket table nearly full) -- refusing to risk a crash");
@@ -888,9 +1063,9 @@ extern "C" int l_spawn_enemy(void* L) {
     uint8_t** tablePtrAddr = (uint8_t**)(uintptr_t)(base + tablePtrRva);
     int32_t* tableCountAddr = (int32_t*)(uintptr_t)(base + tableCountRva);
 
-    uint8_t* oldTable = *tablePtrAddr;
-    int32_t oldCount = *tableCountAddr;
-    if (!oldTable || oldCount <= 0 || oldCount > 4096) {
+    uint8_t* oldTable = nullptr;
+    int32_t oldCount = 0;
+    if (!GatePlacementTableValid(base, tablePtrRva, tableCountRva, &oldTable, &oldCount)) {
         return RefuseSpawn(L, "table_invalid",
             "spawn_enemy: placement table not valid right now (wrong room state?)");
     }
