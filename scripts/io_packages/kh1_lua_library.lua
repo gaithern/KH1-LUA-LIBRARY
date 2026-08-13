@@ -970,8 +970,7 @@ local function spawn_enemy_attempt(model_path, motion_path, x, y, z)
         resource_handle_bucket_table,
         g_GameSpeed, g_BossDefeatEffect, g_BossDefeatEffectStart,
         text_slot_table_base,
-        fnc_claim_species_slot_run,
-        fnc_behavior_script_copy_guard_hook)
+        fnc_claim_species_slot_run)
 end
 
 -- Pending spawn_enemy requests

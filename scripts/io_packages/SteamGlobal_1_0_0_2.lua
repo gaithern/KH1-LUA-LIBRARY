@@ -385,9 +385,12 @@ resource_handle_bucket_table = 0x2EE3980
 -- class-0/sub-op-0xA opcode handler ("load block via resolved handle"). Resolves a
 -- handle then feeds the raw result straight into memcpy as the source with zero
 -- validation -- crash site #6, live-crashed after heavy spawn_enemy churn.
--- See InstallBehaviorScriptCopyGuardHook (dllmain.cpp) for the full writeup.
--- [HOOK TOGGLE: ON] Re-enabled 2026-08-12: the unhooked baseline crashes here on room transitions.
-fnc_behavior_script_copy_guard_hook = 0x2CCFED
+-- Full writeup: project_spawn_enemy_cold_spawn_crash_containment.md (crash site #6).
+-- [NOT A TOGGLE -- NO IMPLEMENTATION EXISTS] There is no InstallBehaviorScriptCopyGuardHook in the
+-- DLL; it was deleted in 2d3fd64. Restored and re-enabled 2026-08-12, it logged ZERO faults across a
+-- full session while crashes continued at 0x3900FC / 0x1D6230 / 0x390138, so it was removed again.
+-- Uncommenting this line alone does nothing. Recover the code from 2d3fd64^ first if ever needed.
+-- fnc_behavior_script_copy_guard_hook = 0x2CCFED
 -- Entry of FUN_1402a0350 -- a joint/bone remap-table setup dispatcher, reached on a
 -- creature's first motion transition, that either blends or (cold path) calls
 -- FUN_140394080 (30+ unchecked fnc_resolve_resource_handle calls). Crash site #7,

@@ -459,6 +459,8 @@ static void SnapshotFreeSlotsAtRoomEntry(unsigned long long base, unsigned long 
 // all (live-confirmed). Release wipes the blob but leaves state and the cached name, so a VALID
 // blob header is what separates "still live" from "released". Live-confirmed: slot 61 read
 // owner=0xFF/state=6/xa_ex_2110 with real data, was treated as free, and got loaded over.
+static const int32_t BLOB_HEADER_FIRST_SECTION = 128;   // blob+4 on every valid header observed
+
 static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loadedPtrTableRva,
                                  unsigned long long speciesResourceTableRva, int slot) {
     if (speciesResourceTableRva == 0) return false;
@@ -468,16 +470,36 @@ static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loa
     const char* name = (const char*)(uintptr_t)(base + loadedPtrTableRva +
         LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
     if (name[0] == '\0') return false;
-    // Section +4 is 128 on every valid header seen (ours and natives alike); a wiped blob reads 0.
+    // Section +4 is exactly 128 on every valid header seen, ours and natives alike. A released slot
+    // reads 0 or leftover garbage -- testing ">0" instead wrongly locks out reusable slots.
     int32_t sec4 = 0;
     __try {
         memcpy(&sec4, (const void*)(uintptr_t)(base + speciesResourceTableRva +
                (unsigned long long)slot * RESOURCE_BLOB_SIZE + 4), sizeof(sec4));
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return sec4 > 0;
+    return sec4 == BLOB_HEADER_FIRST_SECTION;
+}
+
+// Marks every slot a live species occupies, SPAN included. Run members of an unowned run carry
+// owner=0xFF, state=0 and no cached name -- indistinguishable from free when judged one slot at a
+// time. Live-confirmed: species 55 held 55..59 unowned, slots 56..59 looked free, and allocating
+// species 56 there loaded straight over it.
+static void BuildSlotOccupancy(unsigned long long base, unsigned long long loadedPtrTableRva,
+                               unsigned long long speciesResourceTableRva, bool* occupied) {
+    for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) occupied[s] = false;
+    for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
+        volatile uint8_t* ownerAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+            LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
+        if (*ownerAddr != SPECIES_SLOT_UNCLAIMED_OWNER) occupied[s] = true;   // owned: primary or member
+        if (!SlotHoldsLiveSpecies(base, loadedPtrTableRva, speciesResourceTableRva, s)) continue;
+        int runLen = LoadedSlotRunLen(base, loadedPtrTableRva, (uint8_t)s);
+        for (int k = 0; k < runLen && s + k <= RESOURCE_BLOB_MAX_SPECIES; ++k) occupied[s + k] = true;
+    }
 }
 
 static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, unsigned long long speciesResourceTableRva, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX) {
+    bool occupied[SPECIES_SLOT_COUNT] = {};
+    BuildSlotOccupancy(base, loadedPtrTableRva, speciesResourceTableRva, occupied);
     if (slotRunLen < 1) slotRunLen = 1; // a signed-char <= 0 makes FUN_140286190 claim nothing
     // Highest start slot whose whole run still fits inside the allocatable range.
     int startAt = SPECIES_SLOT_ALLOC_MAX - slotRunLen + 1;
@@ -491,14 +513,8 @@ static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loade
             if (IsSpeciesTriggeredThisSession((uint8_t)slot)) { runFree = false; break; }
             // Only runs free since room entry -- a mid-room release may still be referenced.
             if (g_roomEntrySnapshotValid && !g_freeAtRoomEntry[slot]) { runFree = false; break; }
-            // owner == 0xFF: rejects run members, accepts engine-released slots.
-            volatile uint8_t* ownerAddr = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
-                LOADED_SPECIES_OWNER_OFFSET_FROM_PTR + (size_t)slot * LOADED_SPECIES_STRIDE);
-            if (*ownerAddr != SPECIES_SLOT_UNCLAIMED_OWNER) { runFree = false; break; }
-            // Unowned but still holding a live, loaded species -- loading over it clobbers live data.
-            if (SlotHoldsLiveSpecies(base, loadedPtrTableRva, speciesResourceTableRva, slot)) {
-                runFree = false; break;
-            }
+            // Owned, or covered by a live species' run span (see BuildSlotOccupancy).
+            if (occupied[slot]) { runFree = false; break; }
         }
         if (runFree) {
             *outSpecies = (uint8_t)s;
@@ -759,8 +775,6 @@ extern "C" int l_spawn_enemy(void* L) {
     unsigned long long textSlotTableRva = (unsigned long long)p_lua_tointegerx(L, 30, nullptr);
     // Engine's block-claim routine (owner=species + runLen into every slot of the run).
     unsigned long long claimSlotRunFnRva = (unsigned long long)p_lua_tointegerx(L, 31, nullptr);
-    // Crash site #6: the behavior-script VM's unvalidated block-copy memcpy.
-    unsigned long long behaviorScriptCopyGuardHookFnRva = (unsigned long long)p_lua_tointegerx(L, 32, nullptr);
 
 
 
@@ -782,11 +796,6 @@ extern "C" int l_spawn_enemy(void* L) {
     // Lua-supplied RVAs -- can read the slot table for the eviction test. Read-only use.
     g_slotMapBase = base;
     g_slotMapLoadedPtrTableRva = loadedPtrTableRva;
-    // Once-guarded internally; safe to call on every spawn.
-    if (behaviorScriptCopyGuardHookFnRva != 0) {
-        InstallBehaviorScriptCopyGuardHook(base + behaviorScriptCopyGuardHookFnRva,
-                                           base + behaviorScriptCopyGuardHookFnRva + 5);
-    }
     // Diagnostics-only; lets LogEntitySnapshot walk entity+0x134's shape descriptor.
     g_resolveHandleFnAddrForDiag = base + resolveHandleFnRva;
 

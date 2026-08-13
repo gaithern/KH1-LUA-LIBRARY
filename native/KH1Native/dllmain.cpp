@@ -205,7 +205,7 @@ static volatile unsigned char g_customTextActive = 0;
 static bool g_popupHookInstalled = false;
 
 // Finds executable memory near the target, since jmp/call have limited range.
-void* AllocateNear(void* target, size_t size) {
+static void* AllocateNear(void* target, size_t size) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     uintptr_t granularity = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
@@ -226,7 +226,7 @@ void* AllocateNear(void* target, size_t size) {
 }
 
 // Pauses every other thread so bytes can be patched safely.
-std::vector<HANDLE> SuspendOtherThreads() {
+static std::vector<HANDLE> SuspendOtherThreads() {
     std::vector<HANDLE> handles;
     DWORD selfTid = GetCurrentThreadId();
     DWORD pid = GetCurrentProcessId();
@@ -255,7 +255,7 @@ std::vector<HANDLE> SuspendOtherThreads() {
 
 // Opposite of above, resumes those threads
 // after the hook is installed.
-void ResumeThreads(std::vector<HANDLE>& handles) {
+static void ResumeThreads(std::vector<HANDLE>& handles) {
     for (HANDLE h : handles) {
         ResumeThread(h);
         CloseHandle(h);
