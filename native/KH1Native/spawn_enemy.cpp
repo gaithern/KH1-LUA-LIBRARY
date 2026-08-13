@@ -110,6 +110,7 @@ static const BlacklistedRoomRange g_spawnRoomBlacklist[] = {
     // World 16, areas 2..12, every set. A content decision, not a crash workaround.
     // g_AreaNumber is ZERO-INDEXED -- the range was first written 1-indexed and was off by one.
     { 16, 2, 12, "world 16 areas 2-12", "spawning disabled here by request" },
+    { 8, 6, 6, "world 8 area 6", "spawning disabled here by request" },
 };
 
 struct TriggeredLoadEntry {
