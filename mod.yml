@@ -26,6 +26,14 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/kh1_lua_library.lua
+- name: scripts/io_packages/kh1_lua_library/creature_data.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/kh1_lua_library/creature_data.lua
+- name: scripts/io_packages/kh1_lua_library/enemy_spawns.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/kh1_lua_library/enemy_spawns.lua
 - name: scripts/io_packages/kh1_native.dll
   method: copy
   source:

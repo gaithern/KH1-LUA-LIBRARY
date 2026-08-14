@@ -11,6 +11,13 @@ Steam and EGS builds.
 scripts/io_packages/
   kh1_lua_library.lua     Main library -- the public API. Returns a table of functions
                            (see below) for other scripts to require().
+  kh1_lua_library/         Standalone feature modules and their data, one file per
+                           feature. The main library re-exports each module's public
+                           functions, so requiring either one works.
+    enemy_spawns.lua       Enemy spawning. Re-exported as kh1.spawn_enemy /
+                           kh1.update_spawn_enemy.
+    creature_data.lua      Per-creature char-id/weight/template data extracted offline
+                           from room .ard files, used by enemy_spawns.lua.
   VersionCheck.lua         Detects whether the running game is the Steam or EGS build
                            and requires the matching *Global lua file.
   SteamGlobal_*.lua        Per-version memory address tables (from KHPCSpeedrunTools).
@@ -21,6 +28,11 @@ scripts/io_packages/
                            has no primitive for.
 
 native/KH1Native/          Visual Studio project for kh1_native.dll.
+  dllmain.cpp              Lua entry point and shared internals.
+  kh1_native.h             Internals shared between dllmain.cpp and the feature files.
+  packages/                Self-contained feature source, one file per feature, mirroring
+                           the Lua kh1_lua_library/ split.
+    spawn_enemy.cpp        Placement-table splice behind kh1.spawn_enemy.
 
 mod.yml                    OpenKH mod manifest listing the files this mod installs.
 ```
@@ -44,6 +56,37 @@ Only files directly under `scripts/` are auto-run and get `_OnFrame` called by
 LuaBackend; everything in `scripts/io_packages/` is a library meant to be `require()`d
 by those top-level scripts, not run on its own.
 
+### Standalone feature modules
+
+Larger, self-contained features live in their own file under `scripts/io_packages/kh1_lua_library/`
+rather than in the main library, and are required with a dotted path.
+`kh1_lua_library/enemy_spawns.lua` is the first of these, and the shape to copy for new ones:
+
+```lua
+local spawns = require("kh1_lua_library.enemy_spawns")
+spawns.spawn_enemy(model_path, motion_path, x, y, z, callback)
+spawns.update_spawn_enemy()   -- every frame, from your own _OnFrame
+spawns.can_spawn_enemy(model_path)  -- would it be refused? answers without spawning
+```
+
+The `kh1_lua_library.lua` file and the `kh1_lua_library/` folder sit side by side on
+purpose -- `require("kh1_lua_library")` still resolves to the file, and
+`require("kh1_lua_library.<feature>")` resolves into the folder.
+
+The main library `require()`s each feature module and re-exports its public functions, so
+`kh1.spawn_enemy(...)` keeps working and nothing downstream has to change. Because that
+makes the dependency run library → feature, a feature module that needs something back
+out of the main library (enemy spawns needs `get_sora_pos` / `is_in_gummi_garage`) has to
+resolve it lazily at call time instead of `require`ing at load time, or the two modules
+deadlock on each other mid-load. See the comment at the top of the enemy spawn module.
+
+A feature with a native half puts that in `native/KH1Native/packages/` -- one file per
+feature, e.g. `packages/spawn_enemy.cpp` -- leaving `dllmain.cpp` and `kh1_native.h` at the
+project root as the shared entry point and internals. The project adds `$(ProjectDir)` to
+`AdditionalIncludeDirectories` so sources in `packages/` still `#include "pch.h"` and
+`#include "kh1_native.h"` with the same spelling as the root-level ones; changing that
+spelling instead would break the `/Yu"pch.h"` precompiled-header match.
+
 ### What the library provides
 
 - **Reads**: world/room, animation state, combo limits, stock counts, learned/equipped
@@ -57,6 +100,28 @@ by those top-level scripts, not run on its own.
   custom text boxes, playing sound effects.
 - **Bit/byte helpers**: `ReadBit`/`WriteBit`/`ReadBits`, KHSCII string conversion
   (`GetKHSCII`), table utilities (`contains`, `get_index`, `merge_tables`).
+- **Readiness check**: `can_spawn_enemy()` — ask whether a spawn would work *before*
+  attempting it. See below.
+
+### `can_spawn_enemy`
+
+Answers "would `spawn_enemy` refuse right now?" without doing anything:
+
+```lua
+local verdict, code, message = kh1.can_spawn_enemy("xa_ex_2020.mdls")
+-- "ready" | "retry" (transient) | "unavailable" (needs a restart, or unsupported)
+```
+
+It runs the real `spawn_enemy` gates — they're shared functions in
+`packages/spawn_enemy.cpp`, not a reimplementation — but allocates nothing, triggers no
+asset load and constructs nothing, so it's safe to poll. Called with no model path it
+checks only the creature-independent gates and skips the per-creature slot search, which is
+much cheaper. A `"ready"` verdict is not a guarantee: refusals that only surface mid-flight
+(`blob_invalid`, `ctor_threw`, the room's concurrent-enemy budget) can still come back from
+the real call.
+
+`code` is the same short refusal code `spawn_enemy` itself returns (and now passes to its
+callback as a fourth argument), so both paths can share one mapping table.
 
 Anything that needs to call into real game code (rather than just read/write memory) is
 routed through `kh1_native.dll` via `require("kh1_native")`.

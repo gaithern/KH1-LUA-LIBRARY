@@ -15,19 +15,15 @@
     possible, but some additional memory addresses may need to added.
 --]]
 
--- kh1_native.dll (see native/KH1Native in this repo) is a native Lua module
--- that bridges into raw game function calls -- something the OpenKH Lua host
--- itself has no primitive for. Functions in the Advanced section that need to
--- call into game code (rather than just read/write memory) go through it.
 local kh1_native = require("kh1_native")
+local kh1_enemy_spawns = require("kh1_lua_library.enemy_spawns")
 
 -- ########### --
 -- # Helpers # --
 -- ########### --
 
 local function GetKHSCII(INPUT)
-    --[[Converts text to KHSCII, the game's proprietary
-    text encoding.]]
+    -- Converts text to KHSCII, the game's proprietary text encoding.
     local _charTable = {
         [' '] =  0x01,
         ['\n'] =  0x02,
@@ -476,13 +472,8 @@ local function set_spell_effectiveness(spell, value)
 end
 
 local function set_spell_cost(spell, value)
-    --[[ Sets a spells costs.  Defines what valid costs are below.
-     15 = 1/2 CP
-     30 =   1 CP
-    100 =   1 MP
-    200 =   2 MP
-    300 =   3 MP
-    Costs outside this range behave in unexepected ways.]]
+    --[[ Sets a spell's cost. Valid values: 15 = 1/2 CP, 30 = 1 CP,
+    100/200/300 = 1/2/3 MP. Anything else behaves unexpectedly.]]
     local possible_magic_costs = {15,30,100,200,300}
     if possible_magic_costs[value] then
         local memory_location = nil
@@ -617,8 +608,7 @@ local function force_combo_master(on)
 end
 
 local function allow_summon_anywhere(on)
-    --[[ Credits to KSX, ASM target that allows summons 
-    to be used outside of combat.]]
+    -- Credits to KSX, ASM target that allows summons outside of combat.
     if on then
         WriteByte(summonanywhere1, 0x72)
         WriteByte(summonanywhere2, 0x72)
@@ -641,7 +631,7 @@ end
 
 local function allow_air_items(on)
     --[[ Credits to KSX, ASM target that allows using items in mid air.
-    Currently messes with spells in mid air too.]]
+    Currently affects mid air spells too.]]
     if on then
         WriteByte(airitems1, 0x73)
         WriteByte(airitems2, 0x73)
@@ -659,8 +649,7 @@ local function multiply_summon_time(mult)
 end
 
 local function partyActorRVA(z)
-    --[[ Helper function for getting RVA values for Sora, Donald,
-    or Goofy entity/actor pointers]]
+    -- Gets the RVA of the Sora, Donald, or Goofy entity/actor pointer
     if z == 1 then return soraPointer end
     if z == 2 then return donaldPointer end
     return goofyPointer
@@ -669,8 +658,7 @@ end
 local promptBodyRingPos = {0, 0, 0}
 
 local function ClampKHSCII(khscii, maxBytes)
-    --[[ Helper function which clamps KHSCII data to not be too long
-    for level up prompts]]
+    -- Clamps KHSCII data so it isn't too long for level up prompts
     if #khscii <= maxBytes then
         return khscii
     end
@@ -683,10 +671,8 @@ local function ClampKHSCII(khscii, maxBytes)
 end
 
 local function show_prompt(input_title, input_party, duration, colour)
-    --[[ Credits to Topaz.  Show custom text in the level up box.
-    This has been slightly rewritten to use actual exe functions
-    in order to use the in game box queue, to have more prompts
-    on screen than 1.]]
+    --[[ Credits to Topaz. Shows custom text in the level up box, using the
+    game's own box queue so more than one can be on screen at a time.]]
     if colour == nil then
         colour = 0
     end
@@ -748,9 +734,8 @@ local function show_prompt(input_title, input_party, duration, colour)
 end
 
 local function is_pressed(button_array, only)
-    --[[Returns true if the buttons passed in button_array
-    are pressed.  If only is true, then returns true if 
-    only those are pressed]]
+    --[[Returns true if the buttons in button_array are pressed. If only is
+    true, returns true only when no other buttons are pressed.]]
     if only == nil then only = false end
     local input_bits = merge_tables(merge_tables(merge_tables(ReadBits(inputAddress), ReadBits(inputAddress+1)), ReadBits(inputAddress+2)), ReadBits(inputAddress+3))
     local bitmap = {"Select", "L3", "R3", "Start", "DPad U", "DPad R", "DPad D", "DPad L",
@@ -785,8 +770,7 @@ local function is_pressed(button_array, only)
 end
 
 local function is_in_gummi_garage()
-    --[[ Need to fix, actually returns if in Gummi ship,
-    not just Gummi garage]]
+    -- Needs a rename: returns true for the whole Gummi ship, not just the garage
     return ReadInt(inGummi) > 0
 end
 
@@ -815,9 +799,8 @@ local function spawn_prize(item_id)
 end
 
 local function show_custom_item_popup(text)
-    --[[ Uses the in game function to force a map prize pickup box.
-    Injects bytes to read from injected memory for text, so we
-    can have custom text.]]
+    --[[ Uses the in game function to force a map prize pickup box, with
+    injected bytes/memory so the text can be custom.]]
     kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
     kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
     kh1_native.set_custom_popup_text(GetKHSCII(text))
@@ -827,6 +810,32 @@ end
 local function play_se2(se_id, param_2)
     -- Plays a sound effect using the in game function.
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
+end
+
+local function sora_koed()
+    -- Returns if Sora's current HP is 0
+    return ReadByte(maxHP - 0x1) == 0
+end
+
+
+local function ko_sora()
+    -- Triggers the in game functions to KO Sora.
+    if not sora_koed() then
+        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
+    end
+end
+
+local function heartless_angel_sora()
+    -- Sets Sora HP to 1 and MP to 0
+    if not sora_koed() then
+        local stats_page = get_stats_page(ReadLong(soraPointer))
+        if stats_page ~= 0 then
+            WriteByte(stats_page + 0x3C, 1, true)
+            WriteByte(stats_page + 0x44, 0, true)
+        end
+        WriteByte(maxHP - 0x1, 1)
+        WriteByte(maxHP - 0x1 + 2, 0)
+    end
 end
 
 -- ######################## --
@@ -855,9 +864,8 @@ local function set_text_box_size(window_id, width, height)
 end
 
 local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
-    --[[ Opens text box.  Normally text boxes uses a reference to
-    predefined text, so we have to inject ASM and text memory in order
-    to use custom text.]]
+    --[[ Opens a text box. Boxes normally reference predefined text, so ASM
+    and text memory are injected to allow custom text.]]
     window_id = window_id or 1
     if style ~= nil then
         set_text_box_style(window_id, style)
@@ -890,13 +898,11 @@ local function close_text_box(window_id)
     return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
 end
 
---[[ If the script is refreshed, clean up any
-open boxes]]
+-- If the script is refreshed, clean up any open boxes
 kh1_native.close_pending_text_box()
 
 local function update_text_boxes()
---[[ Handles the timing mechanism for open text
-boxes.]]
+    -- Handles the timing mechanism for open text boxes.
     local now = os.clock()
     local current_world = get_world()
     local current_room = get_room()
@@ -906,31 +912,6 @@ boxes.]]
         if timed_out or transitioned then
             close_text_box(window_id)
         end
-    end
-end
-
-local function sora_koed()
-    -- Returns if Sora's current HP is 0
-    return ReadByte(maxHP - 0x1) == 0
-end
-
-local function ko_sora()
-    -- Triggers the in game functions to KO Sora.
-    if not sora_koed() then
-        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
-    end
-end
-
-local function heartless_angel_sora()
-    -- Sets Sora HP to 1 and MP to 0
-    if not sora_koed() then
-        local stats_page = get_stats_page(ReadLong(soraPointer))
-        if stats_page ~= 0 then
-            WriteByte(stats_page + 0x3C, 1, true)
-            WriteByte(stats_page + 0x44, 0, true)
-        end
-        WriteByte(maxHP - 0x1, 1)
-        WriteByte(maxHP - 0x1 + 2, 0)
     end
 end
 
@@ -992,6 +973,9 @@ return {
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
+    spawn_enemy = kh1_enemy_spawns.spawn_enemy,
+    update_spawn_enemy = kh1_enemy_spawns.update_spawn_enemy,
+    can_spawn_enemy = kh1_enemy_spawns.can_spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     open_text_box = open_text_box,
