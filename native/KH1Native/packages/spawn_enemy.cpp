@@ -482,10 +482,13 @@ struct SlotAvailability {
     const char* why[SPECIES_SLOT_COUNT];   // why a slot is unavailable, for diagnostics
 };
 
+// ignoreOurTriggeredLoads models the room-change release without performing it, so the precheck
+// can predict what l_spawn_enemy would free. See l_spawn_enemy_precheck.
 static void ComputeSlotAvailability(unsigned long long base, unsigned long long loadedPtrTableRva,
                                     unsigned long long speciesResourceTableRva,
                                     const uint8_t* roomTable, int32_t roomCount,
-                                    const bool* inUseByLiveEntity, SlotAvailability& av) {
+                                    const bool* inUseByLiveEntity, SlotAvailability& av,
+                                    bool ignoreOurTriggeredLoads = false) {
     for (int s = 0; s < SPECIES_SLOT_COUNT; ++s) { av.occupied[s] = false; av.why[s] = nullptr; }
     auto take = [&av](int s, const char* why) {
         if (s < 0 || s >= SPECIES_SLOT_COUNT) return;
@@ -497,7 +500,7 @@ static void ComputeSlotAvailability(unsigned long long base, unsigned long long 
     for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
         if (roster[s])                                   take(s, WHY_ROOM_ROSTER);
         if (inUseByLiveEntity && inUseByLiveEntity[s])    take(s, WHY_LIVE_ENTITY);
-        if (IsSpeciesTriggeredThisSession((uint8_t)s))    take(s, WHY_OUR_LOAD);
+        if (!ignoreOurTriggeredLoads && IsSpeciesTriggeredThisSession((uint8_t)s)) take(s, WHY_OUR_LOAD);
     }
 
     // Expand anything taken to its whole run, since a creature's blob spans runLen slots. TRUNCATE
@@ -533,10 +536,10 @@ static bool RunIsAvailable(const SlotAvailability& av, int species, int runLen,
     return true;
 }
 
-static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, unsigned long long speciesResourceTableRva, const uint8_t* roomTable, int32_t roomCount, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX) {
+static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, unsigned long long speciesResourceTableRva, const uint8_t* roomTable, int32_t roomCount, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX, bool ignoreOurTriggeredLoads = false) {
     SlotAvailability av;
     ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
-                            roomTable, roomCount, speciesInUseByLiveEntity, av);
+                            roomTable, roomCount, speciesInUseByLiveEntity, av, ignoreOurTriggeredLoads);
     if (slotRunLen < 1) slotRunLen = 1; // a signed-char <= 0 makes FUN_140286190 claim nothing
     // Highest start slot whose whole run still fits inside the allocatable range.
     int startAt = SPECIES_SLOT_ALLOC_MAX - slotRunLen + 1;
@@ -613,14 +616,15 @@ static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned lo
                                             unsigned long long resolveFnAddr, const char* modelPath,
                                             unsigned long long textSlotTableRva,
                                             unsigned long long speciesResourceTableRva,
-                                            uint8_t* outSpecies) {
+                                            uint8_t* outSpecies,
+                                            bool ignoreOurTriggeredLoads = false) {
     // Top-down: start at the highest allocatable slot and walk DOWN past rejected candidates.
     // See FindFreeLoadedSlot's comment for why the direction matters.
     int searchFrom = SPECIES_SLOT_ALLOC_MAX;
     uint8_t candidate = 0;
     int rejected = 0;
     while (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesResourceTableRva, table, count, speciesInUseByLiveEntity, slotRunLen,
-                              &candidate, searchFrom)) {
+                              &candidate, searchFrom, ignoreOurTriggeredLoads)) {
         // Test the WHOLE run against the room's table: a long run otherwise swallows room-native slots
         // further along it, which the room then re-claims over a live creature.
         bool runCollides = false;
@@ -864,10 +868,14 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
     }
 
     // No room-change bookkeeping here: that path releases our runs and rewrites g_lastSpawnRoom*,
-    // which a speculative check must never do.
+    // which a speculative check must never do. roomChangePending models what it WOULD free.
+    bool roomChangePending = false;
     if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
         int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
         int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
+        int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
+        roomChangePending = g_lastSpawnRoomValid &&
+            (curWorld != g_lastSpawnRoomWorld || curArea != g_lastSpawnRoomArea || curSet != g_lastSpawnRoomSet);
         const BlacklistedRoomRange* blocked = GateRoomBlacklisted(curWorld, curArea);
         if (blocked) {
             char msg[224];
@@ -914,8 +922,9 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
     bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
     MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva,
                                    speciesResourceTableRva, speciesInUseByLiveEntity);
+    // A pending room change clears the triggered-load table, so that reuse path won't exist.
     uint8_t species = 0;
-    if ((FindTriggeredLoad(modelPath, &species) &&
+    if ((!roomChangePending && FindTriggeredLoad(modelPath, &species) &&
          ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: our own triggered load")) ||
         (FindLoadedSlotByFilename(base, loadedPtrTableRva, speciesResourceTableRva, modelPath, &species) &&
          ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: loaded-slot filename scan"))) {
@@ -929,13 +938,14 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
     if (FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
                                         templateSlotRunLen, roomTable, roomCount,
                                         base + resolveHandleFnRva, modelPath,
-                                        textSlotTableRva, speciesResourceTableRva, &species)) {
+                                        textSlotTableRva, speciesResourceTableRva, &species,
+                                        roomChangePending)) {
         return PrecheckVerdict(L, "ready", "", "");
     }
 
     SlotAvailability av;
     ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
-                            roomTable, roomCount, speciesInUseByLiveEntity, av);
+                            roomTable, roomCount, speciesInUseByLiveEntity, av, roomChangePending);
     char msg[240];
     snprintf(msg, sizeof(msg),
         "no creature slots free right now -- this creature needs %d consecutive free slots and "
