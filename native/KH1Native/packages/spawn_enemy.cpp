@@ -85,13 +85,33 @@ struct TriggeredLoadEntry {
     unsigned long long loadToken;
     // When the load was recorded; only used to report a run's age.
     unsigned long long recordedTick;
+    // Room visit this load belongs to. An entry from an earlier visit pins nothing and is never
+    // reused: the engine re-tiles slots at room unload, so it describes a room that no longer exists.
+    uint32_t visit;
 };
 static const int MAX_TRIGGERED_LOADS = 64;
 static TriggeredLoadEntry g_triggeredLoads[MAX_TRIGGERED_LOADS];
 static int g_triggeredLoadCount = 0;
 
+// Counts room VISITS, not room keys: comparing keys alone read an A->B->A round trip as "same
+// room" and left the old visit's runs pinned for the rest of the session.
+static uint32_t g_roomVisit = 0;
+static int32_t g_lastSeenRoomWorld = -1, g_lastSeenRoomArea = -1, g_lastSeenRoomSet = -1;
+static bool g_lastSeenRoomValid = false;
+
+// Safe to call from the read-only precheck: it advances the visit counter but never releases
+// anything, and the spawn path's release is gated on g_lastSpawnVisit, not on this.
+static void NoteRoomIdentity(int32_t world, int32_t area, int32_t set) {
+    if (g_lastSeenRoomValid && world == g_lastSeenRoomWorld &&
+        area == g_lastSeenRoomArea && set == g_lastSeenRoomSet) return;
+    g_lastSeenRoomWorld = world; g_lastSeenRoomArea = area; g_lastSeenRoomSet = set;
+    g_lastSeenRoomValid = true;
+    ++g_roomVisit;
+}
+
 static bool FindTriggeredLoad(const char* modelPath, uint8_t* outSpecies) {
     for (int i = 0; i < g_triggeredLoadCount; ++i) {
+        if (g_triggeredLoads[i].visit != g_roomVisit) continue;
         if (strcmp(g_triggeredLoads[i].modelPath, modelPath) == 0) {
             *outSpecies = g_triggeredLoads[i].species;
             return true;
@@ -112,6 +132,7 @@ static unsigned long long LoadedSlotToken(unsigned long long base, unsigned long
 static void EnsureTriggeredLoadToken(unsigned long long base, unsigned long long loadedPtrTableRva,
                                      uint8_t species) {
     for (int i = 0; i < g_triggeredLoadCount; ++i) {
+        if (g_triggeredLoads[i].visit != g_roomVisit) continue;
         if (g_triggeredLoads[i].species != species) continue;
         if (g_triggeredLoads[i].loadToken != 0) return;
         unsigned long long tok = LoadedSlotToken(base, loadedPtrTableRva, species);
@@ -137,18 +158,18 @@ static void RecordTriggeredLoad(unsigned long long base, unsigned long long load
     entry.runLen = runLen;
     entry.loadToken = LoadedSlotToken(base, loadedPtrTableRva, species);
     entry.recordedTick = GetTickCount64();
+    entry.visit = g_roomVisit;
     g_triggeredLoadCount++;
 
     char msg[200];
     snprintf(msg, sizeof(msg),
-        "spawn_enemy: recorded triggered load species=%d runLen=%d model=%s loadToken=0x%llX",
-        (int)species, (int)runLen, modelPath, entry.loadToken);
+        "spawn_enemy: recorded triggered load species=%d runLen=%d model=%s loadToken=0x%llX visit=%u",
+        (int)species, (int)runLen, modelPath, entry.loadToken, g_roomVisit);
     LogDebug(msg);
 }
 
-// Last room we spawned in -- used only to detect a room change.
-static int32_t g_lastSpawnRoomWorld = -1;
-static int32_t g_lastSpawnRoomArea = -1;
+// Visit we last spawned in -- used only to decide when to release and clear our bookkeeping.
+static uint32_t g_lastSpawnVisit = 0;
 // The engine never clears block ownership -- it reclaims by eviction only, so our runs would stay
 // occupied forever. We release them ourselves at room change, once our entities are destroyed.
 static void MarkSpeciesInUseByLiveEntities(unsigned long long base, unsigned long long entityIterFnRva,
@@ -196,14 +217,14 @@ static void ReleaseOurTriggeredRuns(unsigned long long base, unsigned long long 
     LogDebug(msg);
 }
 
-static int32_t g_lastSpawnRoomSet = -1;
-static bool g_lastSpawnRoomValid = false;
+static bool g_lastSpawnVisitValid = false;
 
 // Our own record of slots we loaded. Unlike the live-entity scan it does not depend on handle
 // resolution, which fails exactly when handles start going bad.
-static bool IsSpeciesTriggeredThisSession(uint8_t species) {
+static bool IsSpeciesTriggeredThisVisit(uint8_t species) {
     for (int i = 0; i < g_triggeredLoadCount; ++i) {
-        if (g_triggeredLoads[i].species == species) return true;
+        if (g_triggeredLoads[i].visit == g_roomVisit &&
+            g_triggeredLoads[i].species == species) return true;
     }
     return false;
 }
@@ -474,7 +495,7 @@ static void MarkRoomRosterSlots(const uint8_t* table, int32_t count, bool* roste
 // ============================================================================================
 static const char* const WHY_ROOM_ROSTER = "in this room's placement roster";
 static const char* const WHY_LIVE_ENTITY = "a live entity references it";
-static const char* const WHY_OUR_LOAD    = "we triggered a load into it this session";
+static const char* const WHY_OUR_LOAD    = "we triggered a load into it this room visit";
 static const char* const WHY_RUN_SPAN    = "inside a live species' run span";
 
 struct SlotAvailability {
@@ -482,13 +503,12 @@ struct SlotAvailability {
     const char* why[SPECIES_SLOT_COUNT];   // why a slot is unavailable, for diagnostics
 };
 
-// ignoreOurTriggeredLoads models the room-change release without performing it, so the precheck
-// can predict what l_spawn_enemy would free. See l_spawn_enemy_precheck.
+// No "model the room-change release" flag any more: IsSpeciesTriggeredThisVisit already drops
+// entries from an earlier visit, which is exactly what that release frees.
 static void ComputeSlotAvailability(unsigned long long base, unsigned long long loadedPtrTableRva,
                                     unsigned long long speciesResourceTableRva,
                                     const uint8_t* roomTable, int32_t roomCount,
-                                    const bool* inUseByLiveEntity, SlotAvailability& av,
-                                    bool ignoreOurTriggeredLoads = false) {
+                                    const bool* inUseByLiveEntity, SlotAvailability& av) {
     for (int s = 0; s < SPECIES_SLOT_COUNT; ++s) { av.occupied[s] = false; av.why[s] = nullptr; }
     auto take = [&av](int s, const char* why) {
         if (s < 0 || s >= SPECIES_SLOT_COUNT) return;
@@ -500,7 +520,7 @@ static void ComputeSlotAvailability(unsigned long long base, unsigned long long 
     for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
         if (roster[s])                                   take(s, WHY_ROOM_ROSTER);
         if (inUseByLiveEntity && inUseByLiveEntity[s])    take(s, WHY_LIVE_ENTITY);
-        if (!ignoreOurTriggeredLoads && IsSpeciesTriggeredThisSession((uint8_t)s)) take(s, WHY_OUR_LOAD);
+        if (IsSpeciesTriggeredThisVisit((uint8_t)s))      take(s, WHY_OUR_LOAD);
     }
 
     // Expand anything taken to its whole run, since a creature's blob spans runLen slots. TRUNCATE
@@ -536,10 +556,10 @@ static bool RunIsAvailable(const SlotAvailability& av, int species, int runLen,
     return true;
 }
 
-static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, unsigned long long speciesResourceTableRva, const uint8_t* roomTable, int32_t roomCount, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX, bool ignoreOurTriggeredLoads = false) {
+static bool FindFreeLoadedSlot(unsigned long long base, unsigned long long loadedPtrTableRva, unsigned long long speciesResourceTableRva, const uint8_t* roomTable, int32_t roomCount, const bool* speciesInUseByLiveEntity, int slotRunLen, uint8_t* outSpecies, int searchFrom = SPECIES_SLOT_ALLOC_MAX) {
     SlotAvailability av;
     ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
-                            roomTable, roomCount, speciesInUseByLiveEntity, av, ignoreOurTriggeredLoads);
+                            roomTable, roomCount, speciesInUseByLiveEntity, av);
     if (slotRunLen < 1) slotRunLen = 1; // a signed-char <= 0 makes FUN_140286190 claim nothing
     // Highest start slot whose whole run still fits inside the allocatable range.
     int startAt = SPECIES_SLOT_ALLOC_MAX - slotRunLen + 1;
@@ -616,15 +636,14 @@ static bool FindFreeSlotAvoidingRoomNatives(unsigned long long base, unsigned lo
                                             unsigned long long resolveFnAddr, const char* modelPath,
                                             unsigned long long textSlotTableRva,
                                             unsigned long long speciesResourceTableRva,
-                                            uint8_t* outSpecies,
-                                            bool ignoreOurTriggeredLoads = false) {
+                                            uint8_t* outSpecies) {
     // Top-down: start at the highest allocatable slot and walk DOWN past rejected candidates.
     // See FindFreeLoadedSlot's comment for why the direction matters.
     int searchFrom = SPECIES_SLOT_ALLOC_MAX;
     uint8_t candidate = 0;
     int rejected = 0;
     while (FindFreeLoadedSlot(base, loadedPtrTableRva, speciesResourceTableRva, table, count, speciesInUseByLiveEntity, slotRunLen,
-                              &candidate, searchFrom, ignoreOurTriggeredLoads)) {
+                              &candidate, searchFrom)) {
         // Test the WHOLE run against the room's table: a long run otherwise swallows room-native slots
         // further along it, which the room then re-claims over a live creature.
         bool runCollides = false;
@@ -867,15 +886,16 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
             "the game is in a boss-defeat/slow-motion sequence -- it will be spawnable again shortly");
     }
 
-    // No room-change bookkeeping here: that path releases our runs and rewrites g_lastSpawnRoom*,
-    // which a speculative check must never do. roomChangePending models what it WOULD free.
-    bool roomChangePending = false;
+    // Still releases nothing -- it only advances the visit counter, which is what lets a poll (not
+    // just a spawn attempt) notice the room changed and stop pinning the old visit's runs.
     if (worldNumRva != 0 && areaNumRva != 0 && setNumRva != 0) {
         int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
         int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
         int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
-        roomChangePending = g_lastSpawnRoomValid &&
-            (curWorld != g_lastSpawnRoomWorld || curArea != g_lastSpawnRoomArea || curSet != g_lastSpawnRoomSet);
+        // Only once the new room's table is live: mid-load the room globals read as an intermediate
+        // combination, and bumping on that would unpin a run whose creature is still alive.
+        if (GatePlacementTableValid(base, tablePtrRva, tableCountRva, nullptr, nullptr))
+            NoteRoomIdentity(curWorld, curArea, curSet);
         const BlacklistedRoomRange* blocked = GateRoomBlacklisted(curWorld, curArea);
         if (blocked) {
             char msg[224];
@@ -922,9 +942,9 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
     bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
     MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva,
                                    speciesResourceTableRva, speciesInUseByLiveEntity);
-    // A pending room change clears the triggered-load table, so that reuse path won't exist.
+    // FindTriggeredLoad ignores earlier visits by itself, so no extra room-change guard here.
     uint8_t species = 0;
-    if ((!roomChangePending && FindTriggeredLoad(modelPath, &species) &&
+    if ((FindTriggeredLoad(modelPath, &species) &&
          ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: our own triggered load")) ||
         (FindLoadedSlotByFilename(base, loadedPtrTableRva, speciesResourceTableRva, modelPath, &species) &&
          ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: loaded-slot filename scan"))) {
@@ -938,14 +958,13 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
     if (FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
                                         templateSlotRunLen, roomTable, roomCount,
                                         base + resolveHandleFnRva, modelPath,
-                                        textSlotTableRva, speciesResourceTableRva, &species,
-                                        roomChangePending)) {
+                                        textSlotTableRva, speciesResourceTableRva, &species)) {
         return PrecheckVerdict(L, "ready", "", "");
     }
 
     SlotAvailability av;
     ComputeSlotAvailability(base, loadedPtrTableRva, speciesResourceTableRva,
-                            roomTable, roomCount, speciesInUseByLiveEntity, av, roomChangePending);
+                            roomTable, roomCount, speciesInUseByLiveEntity, av);
     char msg[240];
     snprintf(msg, sizeof(msg),
         "no creature slots free right now -- this creature needs %d consecutive free slots and "
@@ -1029,8 +1048,10 @@ extern "C" int l_spawn_enemy(void* L) {
         int32_t curWorld = *(int32_t*)(uintptr_t)(base + worldNumRva);
         int32_t curArea = *(int32_t*)(uintptr_t)(base + areaNumRva);
         int32_t curSet = *(int32_t*)(uintptr_t)(base + setNumRva);
-        if (g_lastSpawnRoomValid &&
-            (curWorld != g_lastSpawnRoomWorld || curArea != g_lastSpawnRoomArea || curSet != g_lastSpawnRoomSet)) {
+        // Same table-valid guard as the precheck, so both paths number visits identically.
+        if (GatePlacementTableValid(base, tablePtrRva, tableCountRva, nullptr, nullptr))
+            NoteRoomIdentity(curWorld, curArea, curSet);
+        if (g_lastSpawnVisitValid && g_lastSpawnVisit != g_roomVisit) {
             // Release BEFORE clearing the bookkeeping -- it is what identifies our runs.
             ReleaseOurTriggeredRuns(base, loadedPtrTableRva, releaseSlotRunFnRva,
                                     entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva);
@@ -1038,10 +1059,8 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug("spawn_enemy: room changed -- triggered-load bookkeeping cleared");
             // A creature from the previous room cannot still be alive; stop re-reading its pointer.
         }
-        g_lastSpawnRoomWorld = curWorld;
-        g_lastSpawnRoomArea = curArea;
-        g_lastSpawnRoomSet = curSet;
-        g_lastSpawnRoomValid = true;
+        g_lastSpawnVisit = g_roomVisit;
+        g_lastSpawnVisitValid = true;
 
         const BlacklistedRoomRange* blocked = GateRoomBlacklisted(curWorld, curArea);
         if (blocked) {
