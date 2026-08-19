@@ -221,10 +221,12 @@ static bool g_lastSpawnVisitValid = false;
 
 // Our own record of slots we loaded. Unlike the live-entity scan it does not depend on handle
 // resolution, which fails exactly when handles start going bad.
-static bool IsSpeciesTriggeredThisVisit(uint8_t species) {
+static bool IsSlotInTriggeredRunThisVisit(int slot) {
     for (int i = 0; i < g_triggeredLoadCount; ++i) {
-        if (g_triggeredLoads[i].visit == g_roomVisit &&
-            g_triggeredLoads[i].species == species) return true;
+        if (g_triggeredLoads[i].visit != g_roomVisit) continue;
+        int start = (int)g_triggeredLoads[i].species;
+        int len = g_triggeredLoads[i].runLen ? (int)g_triggeredLoads[i].runLen : 1;
+        if (slot >= start && slot < start + len) return true;
     }
     return false;
 }
@@ -327,8 +329,7 @@ static bool ReuseSlotIsSafe(unsigned long long base, unsigned long long loadedPt
     char msg[240];
     snprintf(msg, sizeof(msg),
         "spawn_enemy: slot %d (%s, found via %s) is no longer a usable %d-slot run -- either its "
-        "blob header is gone or another asset has loaded inside it. Refusing to reuse it; falling "
-        "through to a fresh load.",
+        "blob header is gone or another asset has loaded inside it. Not reusing it.",
         (int)species, modelPath, via, runLen);
     LogDebug(msg);
     return false;
@@ -503,7 +504,7 @@ struct SlotAvailability {
     const char* why[SPECIES_SLOT_COUNT];   // why a slot is unavailable, for diagnostics
 };
 
-// No "model the room-change release" flag any more: IsSpeciesTriggeredThisVisit already drops
+// No "model the room-change release" flag any more: IsSlotInTriggeredRunThisVisit already drops
 // entries from an earlier visit, which is exactly what that release frees.
 static void ComputeSlotAvailability(unsigned long long base, unsigned long long loadedPtrTableRva,
                                     unsigned long long speciesResourceTableRva,
@@ -520,7 +521,7 @@ static void ComputeSlotAvailability(unsigned long long base, unsigned long long 
     for (int s = 0; s <= RESOURCE_BLOB_MAX_SPECIES; ++s) {
         if (roster[s])                                   take(s, WHY_ROOM_ROSTER);
         if (inUseByLiveEntity && inUseByLiveEntity[s])    take(s, WHY_LIVE_ENTITY);
-        if (IsSpeciesTriggeredThisVisit((uint8_t)s))      take(s, WHY_OUR_LOAD);
+        if (IsSlotInTriggeredRunThisVisit(s))             take(s, WHY_OUR_LOAD);
     }
 
     // Expand anything taken to its whole run, since a creature's blob spans runLen slots. TRUNCATE
@@ -944,15 +945,24 @@ extern "C" int l_spawn_enemy_precheck(void* L) {
                                    speciesResourceTableRva, speciesInUseByLiveEntity);
     // FindTriggeredLoad ignores earlier visits by itself, so no extra room-change guard here.
     uint8_t species = 0;
-    if ((FindTriggeredLoad(modelPath, &species) &&
+    const bool ourLoadThisVisit = FindTriggeredLoad(modelPath, &species);
+    if ((ourLoadThisVisit &&
          ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: our own triggered load")) ||
-        (FindLoadedSlotByFilename(base, loadedPtrTableRva, speciesResourceTableRva, modelPath, &species) &&
+        (!ourLoadThisVisit &&
+         FindLoadedSlotByFilename(base, loadedPtrTableRva, speciesResourceTableRva, modelPath, &species) &&
          ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "precheck: loaded-slot filename scan"))) {
         if (RoomHasNativeSpecies(roomTable, roomCount, species, base + resolveHandleFnRva, modelPath)) {
             return PrecheckVerdict(L, "retry", "slot_collision",
                 "that creature's slot is in use by a different creature native to this room -- try another room");
         }
         return PrecheckVerdict(L, "ready", "", "");
+    }
+    // Same rule as the spawn path: while our own load for this model is in flight, its slot is
+    // the ONLY acceptable outcome -- reporting "ready" off a free-run search would green-light a
+    // spawn the spawn path is going to make wait anyway.
+    if (ourLoadThisVisit) {
+        return PrecheckVerdict(L, "retry", "our_load_pending",
+            "this creature's asset load is still in progress -- it will be spawnable in a moment");
     }
 
     if (FindFreeSlotAvoidingRoomNatives(base, loadedPtrTableRva, speciesInUseByLiveEntity,
@@ -1128,8 +1138,12 @@ extern "C" int l_spawn_enemy(void* L) {
     }
     bool speciesInUseByLiveEntity[RESOURCE_BLOB_MAX_SPECIES + 1] = {};
     MarkSpeciesInUseByLiveEntities(base, entityIterFnRva, resolveHandleFnRva, speciesResourceTableRva, speciesInUseByLiveEntity);
-    // A failed reuse gate falls through to a fresh load rather than refusing.
-    if (FindTriggeredLoad(modelPath, &species) &&
+    // A load we already triggered for this model pins the request to ITS slot: reusable once
+    // ready, waited on otherwise. Falling through to a fresh load instead claimed a new run
+    // every retry frame -- exhausting the slot window and landing loads inside other in-flight
+    // runs, overwriting their blobs.
+    const bool ourLoadThisVisit = FindTriggeredLoad(modelPath, &species);
+    if (ourLoadThisVisit &&
         ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "our own triggered load")) {
         // Already triggered a load for this creature this session -- reuse
         // the species and don't trigger another load.
@@ -1140,6 +1154,23 @@ extern "C" int l_spawn_enemy(void* L) {
             return RefuseSpawn(L, "slot_collision",
                 "spawn_enemy: chosen slot collides with a different creature already native to this room -- refusing");
         }
+    } else if (ourLoadThisVisit) {
+        // Queued but not started reads state==0, which ReuseSlotIsSafe cannot tell from a dead
+        // slot. Wait it out; the request retries next frame and times out upstream if the load
+        // never lands.
+        static uint8_t lastWaitSpecies = 0xFF;
+        if (species != lastWaitSpecies) {
+            lastWaitSpecies = species;
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                "spawn_enemy: our triggered load for %s (species=%d) is not usable yet -- waiting "
+                "on it rather than claiming another slot run", modelPath, (int)species);
+            LogDebug(msg);
+        }
+        p_lua_pushboolean(L, 0);
+        p_lua_pushstring(L, "spawn_enemy: asset load still in progress -- call again next frame (this is normal for a creature's first load this session)");
+        p_lua_pushboolean(L, 1);
+        return 3;
     } else if (FindLoadedSlotByFilename(base, loadedPtrTableRva, speciesResourceTableRva, modelPath, &species) &&
                ReuseSlotIsSafe(base, loadedPtrTableRva, speciesResourceTableRva, species, modelPath, "loaded-slot filename scan")) {
         // Already loaded this session -- reuse it, but check the room's own
@@ -1474,6 +1505,25 @@ extern "C" int l_spawn_enemy(void* L) {
             *tableCountAddr = oldCount;
             return RefuseSpawn(L, "blob_invalid",
                 "spawn_enemy: this creature's resource data is not valid in this room right now (blob header invalid) -- try again after re-entering the room");
+        }
+
+        // Monotonic sections can still be stomped: a load landing inside the run rewrites later
+        // offsets equal to earlier ones, collapsing a section to zero size. Entity +0x68/+0x13c/
+        // +0x134 are minted from sections 1..2/3..4/4..5, and the engine dereferences all three
+        // without null checks -- a zero-size source constructs an entity that crashes on its
+        // first tick. Every healthy blob observed carries nonzero sizes for these three.
+        if (sec[2] - sec[1] == 0 || sec[4] - sec[3] == 0 || sec[5] - sec[4] == 0) {
+            char msg[300];
+            snprintf(msg, sizeof(msg),
+                "spawn_enemy: species=%d blob sections feeding entity+0x68/+0x13c/+0x134 have "
+                "sizes %d/%d/%d -- a zero means the blob was partly overwritten after loading; "
+                "refusing to construct (a NULL entity field crashes the engine on its next tick)",
+                species, sec[2] - sec[1], sec[4] - sec[3], sec[5] - sec[4]);
+            LogDebug(msg);
+            *tablePtrAddr = oldTable;
+            *tableCountAddr = oldCount;
+            return RefuseSpawn(L, "blob_field_stale",
+                "spawn_enemy: this creature's resource data is damaged in this room right now -- it will recover on a room change");
         }
     }
 

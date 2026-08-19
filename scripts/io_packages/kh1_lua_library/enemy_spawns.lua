@@ -58,6 +58,7 @@ local SPAWN_FAILURE_MESSAGES = {
     run_slot_taken    = "spawn_enemy: this creature needs several consecutive slots and one of them is already in use",
     load_threw        = "spawn_enemy: the asset load threw an exception",
     blob_invalid      = "spawn_enemy: this creature's resource data isn't valid in this room right now -- try again after re-entering the room",
+    blob_field_stale  = "spawn_enemy: this creature's resource data is damaged in this room right now -- it will recover on a room change",
     ctor_threw        = "spawn_enemy: the game's own constructor threw an exception",
     ctor_refused      = "spawn_enemy: the room's concurrent-enemy budget is full right now -- try again after some are defeated",
     -- Deliberate per-room block (g_spawnRoomBlacklist in dllmain.cpp), not a bug.
