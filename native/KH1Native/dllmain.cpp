@@ -790,11 +790,17 @@ extern "C" int l_clear_custom_popup_text(void* L) {
     return 0;
 }
 
-
-
+// Lets library Lua write into kh1_native.log, so script-side events (spawn queue changes)
+// interleave with the native spawn diagnostics they relate to.
+extern "C" int l_log_debug(void* L) {
+    const char* msg = p_lua_tolstring(L, 1, nullptr);
+    if (msg) LogDebug(msg);
+    return 0;
+}
 
 
 static const luaL_Reg kh1_native_lib[] = {
+    {"log_debug", reinterpret_cast<void*>(l_log_debug)},
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},

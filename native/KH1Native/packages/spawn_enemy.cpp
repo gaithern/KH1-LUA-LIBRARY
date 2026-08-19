@@ -1360,6 +1360,33 @@ extern "C" int l_spawn_enemy(void* L) {
             LogDebug(cmsg);
         }
 
+        // Tail slots of the claimed run keep whatever cached identity their last primary load
+        // wrote there (name and state persist across release). The ENGINE trusts that cache when
+        // it later wants that model again and will construct from a slot whose content this load
+        // is about to overwrite -- observed as a black-screen freeze when a cutscene skip reused
+        // a stale xa_di_* identity inside one of our runs. Clear the stale identity so nothing
+        // can reuse these slots by name.
+        {
+            int runSpan = slotRunLen > 0 ? slotRunLen : 1;
+            for (int k = 1; k < runSpan; ++k) {
+                int s = (int)species + k;
+                if (s > RESOURCE_BLOB_MAX_SPECIES) break;
+                char* tailName = (char*)(uintptr_t)(base + loadedPtrTableRva +
+                    LOADED_SPECIES_MODEL_NAME_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
+                volatile uint8_t* tailState = (volatile uint8_t*)(uintptr_t)(base + loadedPtrTableRva +
+                    LOADED_SPECIES_STATE_OFFSET_FROM_PTR + (size_t)s * LOADED_SPECIES_STRIDE);
+                if (tailName[0] != '\0' || *tailState != 0) {
+                    char smsg[224];
+                    snprintf(smsg, sizeof(smsg),
+                        "spawn_enemy: clearing stale cached identity on tail slot %d (was '%.32s', "
+                        "state=%u) so the engine cannot reuse it by name", s, tailName, (unsigned)*tailState);
+                    LogDebug(smsg);
+                    tailName[0] = '\0';
+                    *tailState = 0;
+                }
+            }
+        }
+
         unsigned long long loadArgs[2] = { (unsigned long long)newId, 0 };
         unsigned long long loadResult = 0;
         bool loadOk = SafeCall(base + loadAssetsFnRva, loadArgs, 2, loadResult);

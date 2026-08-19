@@ -165,6 +165,23 @@ end
 local pending_spawn_requests = {}
 local next_spawn_request_id = 1
 
+-- Older DLLs don't export log_debug; degrade to silence rather than error.
+local native_log = kh1_native.log_debug or function() end
+
+-- One line into kh1_native.log describing the event plus the whole queue, so queue history
+-- interleaves with the native spawn diagnostics.
+local function log_queue(event)
+    local ids = {}
+    for id in pairs(pending_spawn_requests) do ids[#ids + 1] = id end
+    table.sort(ids)
+    local parts = {}
+    for _, id in ipairs(ids) do
+        parts[#parts + 1] = string.format("#%d %s", id, tostring(pending_spawn_requests[id].model_path))
+    end
+    native_log(string.format("[spawn queue] %s | pending now: %s",
+        event, #parts > 0 and table.concat(parts, ", ") or "(empty)"))
+end
+
 -- Queues a spawn; drive it with update_spawn_enemy() every frame. Ignored in cutscenes/Gummi.
 -- callback(ok, message, raw_native_message, code) -- code is the short refusal code, nil on success.
 local function spawn_enemy(model_path, motion_path, x, y, z, callback)
@@ -193,6 +210,7 @@ local function spawn_enemy(model_path, motion_path, x, y, z, callback)
         callback = callback,
         deadline = os.clock() + 10.0,
     }
+    log_queue(string.format("queued #%d %s", id, tostring(model_path)))
 end
 
 --[[Live entity census (kh1_native.census_live_entities, still exported) was run
@@ -230,6 +248,10 @@ local function update_spawn_enemy()
             -- else: still within budget, leave it queued for next frame.
         else
             pending_spawn_requests[id] = nil
+            if ok then
+                log_queue(string.format("spawned #%d %s (entity=0x%X)", id,
+                    tostring(req.model_path), math.floor(result or 0)))
+            end
             if req.callback then
                 if ok then
                     -- result is the spawned entity's pointer.
