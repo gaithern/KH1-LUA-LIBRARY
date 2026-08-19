@@ -457,6 +457,17 @@ static const int SPECIES_SLOT_ALLOC_MIN = 0;
 // the cached name, so a VALID blob header is what separates "still live" from "released".
 static const int32_t BLOB_HEADER_FIRST_SECTION = 128;   // blob+4 on every valid header observed
 
+// The load's relocation pass stamps blob+0xD0 with this marker and stores a handle to the
+// relocated sub-record table at blob+0xD4. Release zeroes the handle but leaves the marker, the
+// state byte, the cached name AND the section header intact -- marker-present + handle-zero is
+// the one reliable signature of a released ("zombie") blob. Constructing from one sends the
+// engine's sub-record lookup down its non-relocated fallback path, which reads asset bytes as a
+// handle; the walk-and-patch pass then overwrites the blob's own command list and soft-locks
+// the game (the Angel Star freezes, 2026-08-18/19).
+static const int BLOB_RELOC_MARKER_OFFSET = 0xD0;
+static const int BLOB_RELOC_HANDLE_OFFSET = 0xD4;
+static const uint32_t BLOB_RELOC_MARKER = 0x96969696;
+
 static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loadedPtrTableRva,
                                  unsigned long long speciesResourceTableRva, int slot) {
     if (speciesResourceTableRva == 0) return false;
@@ -468,12 +479,18 @@ static bool SlotHoldsLiveSpecies(unsigned long long base, unsigned long long loa
     if (name[0] == '\0') return false;
     // Section +4 is exactly 128 on every valid header seen, ours and natives alike. A released slot
     // reads 0 or leftover garbage -- testing ">0" instead wrongly locks out reusable slots.
+    unsigned long long blobAddr = base + speciesResourceTableRva +
+        (unsigned long long)slot * RESOURCE_BLOB_SIZE;
     int32_t sec4 = 0;
+    uint32_t relocMarker = 0, relocHandle = 0;
     __try {
-        memcpy(&sec4, (const void*)(uintptr_t)(base + speciesResourceTableRva +
-               (unsigned long long)slot * RESOURCE_BLOB_SIZE + 4), sizeof(sec4));
+        memcpy(&sec4, (const void*)(uintptr_t)(blobAddr + 4), sizeof(sec4));
+        memcpy(&relocMarker, (const void*)(uintptr_t)(blobAddr + BLOB_RELOC_MARKER_OFFSET), sizeof(relocMarker));
+        memcpy(&relocHandle, (const void*)(uintptr_t)(blobAddr + BLOB_RELOC_HANDLE_OFFSET), sizeof(relocHandle));
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return sec4 == BLOB_HEADER_FIRST_SECTION;
+    if (sec4 != BLOB_HEADER_FIRST_SECTION) return false;
+    if (relocMarker == BLOB_RELOC_MARKER && relocHandle == 0) return false; // released zombie
+    return true;
 }
 
 // Marks the room's own reserved set: the placement table authors every creature this room can
