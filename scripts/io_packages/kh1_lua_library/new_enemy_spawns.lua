@@ -34,35 +34,59 @@ local PLACEMENT_MODEL_HANDLE_OFF  = 0x60
 local PLACEMENT_MOTION_HANDLE_OFF = 0x64
 local RECORD_CATEGORY_ACTOR       = 3
 local SPAWN_LOAD_TIMEOUT          = 5.0
+local ENTITY_POOL_STRIDE          = 0x4B0
+local ENTITY_POOL_COUNT           = 96
+local ENTITY_OCC_FLAG_OFF         = 0x374
+local ENTITY_SPECIES_HND_OFF      = 0x134
+local RUNLEN_OFF_FROM_PTR         = -0x47
+local BLOB_TABLE_SLOT_COUNT       = 65
 
 local pending_spawns = {}
 
-local function get_room_roster()
-    local roster = {}
-    local table_ptr = ReadLong(placementTablePtr)
-    local count = ReadInt(placementTableCount)
-    if table_ptr == 0 or count <= 0 or count > 4096 then return roster end
-    for i = 0, count - 1 do
-        local rec = table_ptr + i * PLACEMENT_RECORD_SIZE
-        local species = ReadByte(rec + PLACEMENT_SPECIES_OFF, true)
-        local run_len = ReadByte(rec + PLACEMENT_RUNLEN_OFF, true)
-        if run_len < 1 then run_len = 1 end
-        for k = 0, run_len - 1 do
-            local s = species + k
-            if s >= 0 and s <= SLOT_ALLOC_MAX then roster[s] = true end
-        end
-    end
-    return roster
+local function resolve_handle(h)
+    if h == 0 then return 0 end
+    h = h & 0x7FFFFFFF
+    local addr = resource_handle_bucket_table + (h >> 25) * 8
+    local lo = ReadInt(addr) & 0xFFFFFFFF
+    local hi = ReadInt(addr + 4) & 0xFFFFFFFF
+    if lo == 0xFFFFFFFF and hi == 0xFFFFFFFF then return 0 end
+    return ((hi << 32) | lo) | (h & 0x1FFFFFF)
 end
 
-local function run_is_free(roster, excluded, start, run_len)
+local function live_entity_occupancy()
+    local occ = {}
+    if not entityPoolBase or not resource_handle_bucket_table or not speciesResourceTable
+        or not loadedSpeciesPtrTable then return occ end
+    local base = kh1_native.get_module_base()
+    local blob_lo = base + speciesResourceTable
+    local blob_hi = blob_lo + BLOB_TABLE_SLOT_COUNT * RESOURCE_BLOB_SIZE
+    for i = 0, ENTITY_POOL_COUNT - 1 do
+        local e = entityPoolBase + i * ENTITY_POOL_STRIDE
+        if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then
+            local resolved = resolve_handle(ReadInt(e + ENTITY_SPECIES_HND_OFF) & 0xFFFFFFFF)
+            if resolved >= blob_lo and resolved < blob_hi then
+                local sp = (resolved - blob_lo) >> 18
+                -- entity+0x134 can point mid-run; the slot's owner byte is the run's primary.
+                local primary = ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + sp * SLOT_STRIDE)
+                if primary == SLOT_OWNER_FREE or primary > SLOT_ALLOC_MAX then primary = sp end
+                local rl = ReadByte(loadedSpeciesPtrTable + RUNLEN_OFF_FROM_PTR + primary * SLOT_STRIDE)
+                if rl < 1 then rl = 1 end
+                for k = 0, rl - 1 do occ[primary + k] = true end
+            end
+        end
+    end
+    return occ
+end
+
+local function compute_occupancy()
+    return live_entity_occupancy()
+end
+
+local function run_is_free(occ, excluded, start, run_len)
     for k = 0, run_len - 1 do
         local s = start + k
         if s > SLOT_ALLOC_MAX then return false end
-        if roster[s] or (excluded and excluded[s]) then return false end
-        if ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + s * SLOT_STRIDE) ~= SLOT_OWNER_FREE then
-            return false
-        end
+        if occ[s] or (excluded and excluded[s]) then return false end
     end
     return true
 end
@@ -70,9 +94,9 @@ end
 local function find_free_species_run(run_len, excluded)
     if not loadedSpeciesPtrTable or not placementTablePtr then return nil end
     if run_len < 1 then run_len = 1 end
-    local roster = get_room_roster()
+    local occ = compute_occupancy()
     for start = SLOT_ALLOC_MAX - run_len + 1, SLOT_ALLOC_MIN, -1 do
-        if run_is_free(roster, excluded, start, run_len) then return start end
+        if run_is_free(occ, excluded, start, run_len) then return start end
     end
     return nil
 end
