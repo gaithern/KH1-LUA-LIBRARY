@@ -33,7 +33,6 @@ local PLACEMENT_WEIGHT_OFF        = 0x59
 local PLACEMENT_MODEL_HANDLE_OFF  = 0x60
 local PLACEMENT_MOTION_HANDLE_OFF = 0x64
 local RECORD_CATEGORY_ACTOR       = 3
-local SLOT_RUN_LEN                = 1
 local SPAWN_LOAD_TIMEOUT          = 5.0
 
 local pending_spawns = {}
@@ -56,16 +55,24 @@ local function get_room_roster()
     return roster
 end
 
-local function find_free_species_slot(excluded)
-    if not loadedSpeciesPtrTable or not placementTablePtr then return nil end
-    local roster = get_room_roster()
-    for s = SLOT_ALLOC_MAX, SLOT_ALLOC_MIN, -1 do
-        if not roster[s] and not (excluded and excluded[s]) then
-            local owner = ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + s * SLOT_STRIDE)
-            if owner == SLOT_OWNER_FREE then
-                return s
-            end
+local function run_is_free(roster, excluded, start, run_len)
+    for k = 0, run_len - 1 do
+        local s = start + k
+        if s > SLOT_ALLOC_MAX then return false end
+        if roster[s] or (excluded and excluded[s]) then return false end
+        if ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + s * SLOT_STRIDE) ~= SLOT_OWNER_FREE then
+            return false
         end
+    end
+    return true
+end
+
+local function find_free_species_run(run_len, excluded)
+    if not loadedSpeciesPtrTable or not placementTablePtr then return nil end
+    if run_len < 1 then run_len = 1 end
+    local roster = get_room_roster()
+    for start = SLOT_ALLOC_MAX - run_len + 1, SLOT_ALLOC_MIN, -1 do
+        if run_is_free(roster, excluded, start, run_len) then return start end
     end
     return nil
 end
@@ -119,10 +126,10 @@ local function get_creature_data(model_path)
     return model_path and kh1_creature_data[model_path] or nil
 end
 
-local function resolve_species_slot(model_path, excluded)
+local function resolve_species_slot(model_path, run_len, excluded)
     local reused = find_loaded_slot_by_filename(model_path)
     if reused then return reused, false end
-    local free = find_free_species_slot(excluded)
+    local free = find_free_species_run(run_len, excluded)
     if free then return free, true end
     return nil, nil
 end
@@ -152,7 +159,6 @@ local function splice_placement_record(species, template, char_id, weight, x, y,
     WriteFloat(record + PLACEMENT_POS_Z_OFF, z, true)
     WriteShort(record + PLACEMENT_CHARID_OFF, char_id, true)
     WriteByte(record + PLACEMENT_SPECIES_OFF, species, true)
-    WriteByte(record + PLACEMENT_RUNLEN_OFF, SLOT_RUN_LEN, true)
     WriteByte(record + PLACEMENT_WEIGHT_OFF, weight, true)
     WriteInt(record + PLACEMENT_MODEL_HANDLE_OFF, 0, true)
     WriteInt(record + PLACEMENT_MOTION_HANDLE_OFF, 0, true)
@@ -227,12 +233,46 @@ local function sora_position()
     return ReadFloat(sora + 0x10, true), ReadFloat(sora + 0x14, true), ReadFloat(sora + 0x18, true)
 end
 
+local HANDLE_BUCKET_COUNT = 64
+local HANDLE_BUCKET_HEADROOM = 6
+
+local function boss_slowdown_active()
+    if not g_GameSpeed then return false end
+    local speed = ReadFloat(g_GameSpeed)
+    return speed > 0.0 and speed < 0.9
+end
+
+local function handle_buckets_full()
+    if not resource_handle_bucket_table then return false end
+    local claimed = 0
+    for i = 0, HANDLE_BUCKET_COUNT - 1 do
+        if ReadLong(resource_handle_bucket_table + i * 8) ~= -1 then claimed = claimed + 1 end
+    end
+    return claimed >= HANDLE_BUCKET_COUNT - HANDLE_BUCKET_HEADROOM
+end
+
+local last_room_world, last_room_area, last_room_set = nil, nil, nil
+
+local function drop_pending_on_room_change()
+    if not g_WorldNumber or not g_AreaNumber or not g_SetNumber then return end
+    local w, a, s = ReadInt(g_WorldNumber), ReadInt(g_AreaNumber), ReadInt(g_SetNumber)
+    if w == last_room_world and a == last_room_area and s == last_room_set then return end
+    last_room_world, last_room_area, last_room_set = w, a, s
+    if next(pending_spawns) then
+        log(string.format("room changed to %d/%d/%d -- dropping in-flight spawns (stale slots)", w, a, s))
+        pending_spawns = {}
+    end
+end
+
 local function spawn_enemy(model_path, x, y, z)
     if not model_path then return false, "bad_args" end
     if inCutscene and ReadInt(inCutscene) ~= 0 then return false, "cutscene" end
+    if boss_slowdown_active() then return false, "boss_slowdown" end
 
     local data = get_creature_data(model_path)
     if not data then return false, "no_data" end
+
+    drop_pending_on_room_change()
 
     local pending = pending_spawns[model_path]
     if pending then
@@ -251,11 +291,18 @@ local function spawn_enemy(model_path, x, y, z)
         return false, "loading"
     end
 
+    if handle_buckets_full() then return false, "handles_full" end
+
+    local run_len = string.byte(data.template, PLACEMENT_RUNLEN_OFF + 1) or 1
+    if run_len < 1 then run_len = 1 end
+
     local excluded = {}
-    for _, p in pairs(pending_spawns) do excluded[p.species] = true end
-    local species, needs_load = resolve_species_slot(model_path, excluded)
+    for _, p in pairs(pending_spawns) do
+        for k = 0, (p.run_len or 1) - 1 do excluded[p.species + k] = true end
+    end
+    local species, needs_load = resolve_species_slot(model_path, run_len, excluded)
     if not species then return false, "slots_full" end
-    log(string.format("%s resolved species=%d needs_load=%s", model_path, species, tostring(needs_load)))
+    log(string.format("%s resolved species=%d run_len=%d needs_load=%s", model_path, species, run_len, tostring(needs_load)))
 
     if x == nil or y == nil or z == nil then
         local sx, sy, sz = sora_position()
@@ -277,8 +324,8 @@ local function spawn_enemy(model_path, x, y, z)
         rollback_splice(ctx)
         return false, "load_failed"
     end
-    log(string.format("%s load triggered, waiting for species=%d", model_path, species))
-    pending_spawns[model_path] = { ctx = ctx, species = species, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
+    log(string.format("%s load triggered, waiting for species=%d run_len=%d", model_path, species, run_len))
+    pending_spawns[model_path] = { ctx = ctx, species = species, run_len = run_len, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
     return false, "loading"
 end
 
