@@ -55,6 +55,15 @@ local function resolve_handle(h)
     return ((hi << 32) | lo) | (h & 0x1FFFFFF)
 end
 
+local function mark_occupied_run(occ, sp)
+    if sp < 0 or sp > SLOT_ALLOC_MAX then return end
+    local primary = ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + sp * SLOT_STRIDE)
+    if primary == SLOT_OWNER_FREE or primary > SLOT_ALLOC_MAX then primary = sp end
+    local rl = ReadByte(loadedSpeciesPtrTable + RUNLEN_OFF_FROM_PTR + primary * SLOT_STRIDE)
+    if rl < 1 then rl = 1 end
+    for k = 0, rl - 1 do occ[primary + k] = true end
+end
+
 local function live_entity_occupancy()
     local occ = {}
     if not entityPoolBase or not resource_handle_bucket_table or not speciesResourceTable
@@ -62,18 +71,21 @@ local function live_entity_occupancy()
     local base = kh1_native.get_module_base()
     local blob_lo = base + speciesResourceTable
     local blob_hi = blob_lo + BLOB_TABLE_SLOT_COUNT * RESOURCE_BLOB_SIZE
+    local table_ptr = GetPointer(placementTablePtr)
+    local count = ReadInt(placementTableCount)
+    local table_ok = table_ptr ~= 0 and count > 0 and count <= 4096
     for i = 0, ENTITY_POOL_COUNT - 1 do
         local e = entityPoolBase + i * ENTITY_POOL_STRIDE
         if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then
             local resolved = resolve_handle(ReadInt(e + ENTITY_SPECIES_HND_OFF) & 0xFFFFFFFF)
             if resolved >= blob_lo and resolved < blob_hi then
-                local sp = (resolved - blob_lo) >> 18
-                -- entity+0x134 can point mid-run; the slot's owner byte is the run's primary.
-                local primary = ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + sp * SLOT_STRIDE)
-                if primary == SLOT_OWNER_FREE or primary > SLOT_ALLOC_MAX then primary = sp end
-                local rl = ReadByte(loadedSpeciesPtrTable + RUNLEN_OFF_FROM_PTR + primary * SLOT_STRIDE)
-                if rl < 1 then rl = 1 end
-                for k = 0, rl - 1 do occ[primary + k] = true end
+                mark_occupied_run(occ, (resolved - blob_lo) >> 18)
+            end
+            if table_ok then
+                local ridx = ReadInt(e + 0x04) & 0xFFFF
+                if ridx < count then
+                    mark_occupied_run(occ, ReadByte(table_ptr + ridx * PLACEMENT_RECORD_SIZE + PLACEMENT_SPECIES_OFF, true))
+                end
             end
         end
     end
