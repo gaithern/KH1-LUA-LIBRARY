@@ -167,6 +167,32 @@ extern "C" int l_free(void* L) {
     return 1;
 }
 
+struct PersistBlock { char key[64]; void* addr; };
+static PersistBlock g_persistBlocks[32];
+static int g_persistCount = 0;
+
+extern "C" int l_persistent_block(void* L) {
+    size_t klen = 0;
+    const char* key = p_lua_tolstring(L, 1, &klen);
+    unsigned long long size = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    if (!key || klen == 0 || klen >= sizeof(g_persistBlocks[0].key)) { p_lua_pushinteger(L, 0); return 1; }
+    for (int i = 0; i < g_persistCount; ++i) {
+        if (memcmp(g_persistBlocks[i].key, key, klen) == 0 && g_persistBlocks[i].key[klen] == '\0') {
+            p_lua_pushinteger(L, (long long)(unsigned long long)g_persistBlocks[i].addr);
+            return 1;
+        }
+    }
+    if (g_persistCount >= 32 || size == 0) { p_lua_pushinteger(L, 0); return 1; }
+    void* p = VirtualAlloc(nullptr, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) { p_lua_pushinteger(L, 0); return 1; }
+    memcpy(g_persistBlocks[g_persistCount].key, key, klen);
+    g_persistBlocks[g_persistCount].key[klen] = '\0';
+    g_persistBlocks[g_persistCount].addr = p;
+    g_persistCount++;
+    p_lua_pushinteger(L, (long long)(unsigned long long)p);
+    return 1;
+}
+
 // copy_memory(dest, src, size) -> ok. SEH-guarded memcpy for absolute addresses.
 extern "C" int l_copy_memory(void* L) {
     unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
@@ -194,6 +220,27 @@ extern "C" int l_write_bytes(void* L) {
             memcpy((void*)(uintptr_t)dest, src, len);
             ok = true;
         } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    }
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+extern "C" int l_patch_code(void* L) {
+    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    size_t len = 0;
+    const char* src = p_lua_tolstring(L, 2, &len);
+    bool ok = false;
+    if (dest != 0 && src && len > 0) {
+        DWORD oldProtect = 0;
+        if (VirtualProtect((void*)(uintptr_t)dest, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            __try {
+                memcpy((void*)(uintptr_t)dest, src, len);
+                ok = true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+            DWORD tmp = 0;
+            VirtualProtect((void*)(uintptr_t)dest, len, oldProtect, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)dest, len);
+        }
     }
     p_lua_pushboolean(L, ok ? 1 : 0);
     return 1;
@@ -861,6 +908,8 @@ static const luaL_Reg kh1_native_lib[] = {
     {"free", reinterpret_cast<void*>(l_free)},
     {"copy_memory", reinterpret_cast<void*>(l_copy_memory)},
     {"write_bytes", reinterpret_cast<void*>(l_write_bytes)},
+    {"patch_code", reinterpret_cast<void*>(l_patch_code)},
+    {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
     {"spawn_enemy", reinterpret_cast<void*>(l_spawn_enemy)},
     {"spawn_enemy_precheck", reinterpret_cast<void*>(l_spawn_enemy_precheck)},
     {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
