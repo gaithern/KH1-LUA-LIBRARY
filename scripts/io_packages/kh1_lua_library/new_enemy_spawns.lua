@@ -213,12 +213,17 @@ local function release_all_on_room_change()
     if w == last_room_world and a == last_room_area and s == last_room_set then return end
     last_room_world, last_room_area, last_room_set = w, a, s
     local rows = redirect.active_rows()
+    local released = 0
     for _, r in ipairs(rows) do
-        if fnc_release_species_slot_run then kh1_native.call_function(fnc_release_species_slot_run, r.slot_n, 1) end
-        if r.buf_base ~= 0 then kh1_native.free(r.buf_base) end
+        local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
+        local still_ours = slot_ptr >= r.buf_base and slot_ptr < r.buf_end
+        if still_ours and fnc_release_species_slot_run then
+            kh1_native.call_function(fnc_release_species_slot_run, r.slot_n, 1)
+            released = released + 1
+        end
         redirect.release(r.row)
     end
-    if #rows > 0 then log(string.format("room change: released %d redirect slot(s)", #rows)) end
+    if #rows > 0 then log(string.format("room change: %d row(s), released %d still-ours slot(s)", #rows, released)) end
     pending_spawns = {}
 end
 
@@ -270,7 +275,7 @@ local function spawn_enemy(model_path, x, y, z)
 
     local run_len = string.byte(data.template, PLACEMENT_RUNLEN_OFF + 1) or 1
     if run_len < 1 then run_len = 1 end
-    local buf_size = run_len * RESOURCE_BLOB_SIZE
+    local buf_size = (run_len + 2) * RESOURCE_BLOB_SIZE
 
     local slot = redirect.find_free_slot()
     if not slot then log(model_path .. " -> slots_full"); return false, "slots_full" end
