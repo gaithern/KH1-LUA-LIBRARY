@@ -101,7 +101,10 @@ function M.active_rows()
 end
 
 local sc = string.char
-local function build_cave2_bytes(cave_addr)
+local function jmp_abs(target)
+    return sc(0xFF,0x25,0x00,0x00,0x00,0x00) .. string.pack("<I8", target)
+end
+local function build_cave2_bytes()
     local body =
         sc(0x4C,0x8B,0xD1) ..
         sc(0x48,0xB8) .. string.pack("<I8", abs(RVA.blob_base)) ..
@@ -114,10 +117,9 @@ local function build_cave2_bytes(cave_addr)
         sc(0x49,0x8B,0x40,0x08,0x49,0x39,0xC2,0x0F,0x83,0x09,0x00,0x00,0x00) ..
         sc(0x41,0x8B,0x48,0x10,0xE9,0x09,0x00,0x00,0x00) ..
         sc(0x49,0x83,0xC0,0x20,0x41,0xFF,0xCB,0x75,0xCA)
-    local rel = (abs(RVA.hook2_resume) - (cave_addr + #body + 5)) & 0xFFFFFFFF
-    return body .. sc(0xE9) .. string.pack("<I4", rel)
+    return body .. sc(0xFF,0x25,0x00,0x00,0x00,0x00) .. string.pack("<I8", abs(RVA.hook2_resume))
 end
-local function build_cave1_bytes(cave_addr)
+local function build_cave1_bytes()
     local body =
         sc(0x48,0x8B,0xC3) ..
         sc(0x48,0xB9) .. string.pack("<I8", abs(RVA.blob_base)) ..
@@ -131,8 +133,7 @@ local function build_cave1_bytes(cave_addr)
         sc(0x41,0x8B,0x40,0x10,0xE9,0x09,0x00,0x00,0x00) ..
         sc(0x49,0x83,0xC0,0x20,0x41,0xFF,0xCB,0x75,0xCA) ..
         sc(0x48,0xBA) .. string.pack("<I8", abs(RVA.species_tab))
-    local rel = (abs(RVA.hook1_resume) - (cave_addr + #body + 5)) & 0xFFFFFFFF
-    return body .. sc(0xE9) .. string.pack("<I4", rel)
+    return body .. sc(0xFF,0x25,0x00,0x00,0x00,0x00) .. string.pack("<I8", abs(RVA.hook1_resume))
 end
 
 function M.is_installed()
@@ -152,9 +153,8 @@ function M.install()
     local cave2 = kh1_native.allocate(0x400, 1)
     if cave1 == 0 or cave2 == 0 then return false, "cave alloc failed" end
 
-    local c1 = build_cave1_bytes(cave1)
-    local c2 = build_cave2_bytes(cave2)
-    if not c1 or not c2 then return false, "cave bytes not yet embedded" end
+    local c1 = build_cave1_bytes()
+    local c2 = build_cave2_bytes()
     kh1_native.write_bytes(cave1, c1)
     kh1_native.write_bytes(cave2, c2)
 
@@ -164,15 +164,11 @@ function M.install()
     wl(OFF_CAVE2, cave2)
     if ci(OFF_REG_COUNT) == 0 then wi(OFF_REG_COUNT, 0) end
 
-    local function jmp5(from, to)
-        local rel = (to - (from + 5)) & 0xFFFFFFFF
-        return string.pack("<B I4", 0xE9, rel)
-    end
     local h1 = abs(RVA.hook1_splice)
-    local p1 = jmp5(h1, cave1) .. string.rep("\x90", (RVA.hook1_resume - RVA.hook1_splice) - 5)
+    local p1 = jmp_abs(cave1) .. string.rep("\x90", (RVA.hook1_resume - RVA.hook1_splice) - 14)
     kh1_native.patch_code(h1, p1)
     local h2 = abs(RVA.hook2_entry)
-    local p2 = jmp5(h2, cave2) .. "\x90\x90"
+    local p2 = jmp_abs(cave2)
     kh1_native.patch_code(h2, p2)
 
     wi(OFF_VERSION, 1)
