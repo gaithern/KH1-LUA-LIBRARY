@@ -34,6 +34,7 @@ local PLACEMENT_MODEL_HANDLE_OFF  = 0x60
 local PLACEMENT_MOTION_HANDLE_OFF = 0x64
 local RECORD_CATEGORY_ACTOR       = 3
 local SPAWN_LOAD_TIMEOUT          = 5.0
+local SPAWN_SETTLE_SECONDS        = 4.0
 local ENTITY_POOL_STRIDE          = 0x4B0
 local ENTITY_POOL_COUNT           = 96
 local ENTITY_OCC_FLAG_OFF         = 0x374
@@ -42,6 +43,7 @@ local RUNLEN_OFF_FROM_PTR         = -0x47
 local BLOB_TABLE_SLOT_COUNT       = 65
 
 local pending_spawns = {}
+local our_spawn_runs = {}
 
 local function resolve_handle(h)
     if h == 0 then return 0 end
@@ -79,7 +81,17 @@ local function live_entity_occupancy()
 end
 
 local function compute_occupancy()
-    return live_entity_occupancy()
+    local occ = live_entity_occupancy()
+    local now = os.clock()
+    local kept = {}
+    for _, r in ipairs(our_spawn_runs) do
+        if now < r.until_time then
+            kept[#kept + 1] = r
+            for k = 0, (r.run_len or 1) - 1 do occ[r.species + k] = true end
+        end
+    end
+    our_spawn_runs = kept
+    return occ
 end
 
 local function run_is_free(occ, excluded, start, run_len)
@@ -138,7 +150,8 @@ local function find_loaded_slot_by_filename(model_path)
     for s = SLOT_ALLOC_MIN, SLOT_ALLOC_MAX do
         if ReadByte(loadedSpeciesPtrTable + STATE_OFF_FROM_PTR + s * SLOT_STRIDE) == SLOT_STATE_READY then
             local name_rva = loadedSpeciesPtrTable + MODEL_NAME_OFF_FROM_PTR + s * SLOT_STRIDE
-            if cached_name_matches(name_rva, model_path) and blob_is_healthy(s) then
+            if cached_name_matches(name_rva, model_path) and blob_is_healthy(s)
+                and blob_construct_safe(s) then
                 return s
             end
         end
@@ -285,9 +298,10 @@ local function drop_pending_on_room_change()
     local w, a, s = ReadInt(g_WorldNumber), ReadInt(g_AreaNumber), ReadInt(g_SetNumber)
     if w == last_room_world and a == last_room_area and s == last_room_set then return end
     last_room_world, last_room_area, last_room_set = w, a, s
-    if next(pending_spawns) then
-        log(string.format("room changed to %d/%d/%d -- dropping in-flight spawns (stale slots)", w, a, s))
+    if next(pending_spawns) or #our_spawn_runs > 0 then
+        log(string.format("room changed to %d/%d/%d -- clearing pending + spawn-run tracking", w, a, s))
         pending_spawns = {}
+        our_spawn_runs = {}
     end
 end
 
@@ -307,7 +321,10 @@ local function spawn_enemy(model_path, x, y, z)
             log(string.format("%s load ready (species=%d), constructing", model_path, pending.species))
             local entity = construct_entity(pending.ctx)
             pending_spawns[model_path] = nil
-            if entity then return true, entity end
+            if entity then
+                our_spawn_runs[#our_spawn_runs + 1] = { species = pending.species, run_len = pending.run_len, until_time = os.clock() + SPAWN_SETTLE_SECONDS }
+                return true, entity
+            end
             rollback_splice(pending.ctx)
             return false, "ctor_failed"
         end
@@ -342,7 +359,10 @@ local function spawn_enemy(model_path, x, y, z)
 
     if not needs_load then
         local entity = construct_entity(ctx)
-        if entity then return true, entity end
+        if entity then
+            our_spawn_runs[#our_spawn_runs + 1] = { species = species, run_len = run_len, until_time = os.clock() + SPAWN_SETTLE_SECONDS }
+            return true, entity
+        end
         rollback_splice(ctx)
         return false, "ctor_failed"
     end
