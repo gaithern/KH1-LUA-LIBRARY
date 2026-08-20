@@ -3,6 +3,9 @@
 local kh1_native = require("kh1_native")
 local kh1_creature_data = require("kh1_lua_library.creature_data")
 
+local native_log = kh1_native.log_debug or function(_) end
+local function log(msg) native_log("[new_spawn] " .. msg) end
+
 local SLOT_STRIDE                 = 0x50
 local OWNER_OFF_FROM_PTR          = -0x48
 local SLOT_OWNER_FREE             = 0xFF
@@ -80,6 +83,22 @@ local function blob_is_healthy(species)
     if ReadInt(blob + 4) ~= BLOB_HEADER_FIRST_SECTION then return false end
     local marker = ReadInt(blob + BLOB_RELOC_MARKER_OFF) & 0xFFFFFFFF
     if marker == BLOB_RELOC_MARKER and ReadInt(blob + BLOB_RELOC_HANDLE_OFF) == 0 then return false end
+    return true
+end
+
+local function blob_construct_safe(species)
+    local blob = speciesResourceTable + species * RESOURCE_BLOB_SIZE
+    local s = {}
+    for i = 0, 8 do s[i] = ReadInt(blob + 4 + i * 4) end
+    if s[0] ~= BLOB_HEADER_FIRST_SECTION then return false, string.format("hdr sec0=%d", s[0]) end
+    local prev = 0
+    for i = 0, 4 do
+        if s[i] < 0 or s[i] < prev then return false, string.format("hdr not monotonic at %d", i) end
+        prev = s[i]
+    end
+    if (s[2] - s[1]) == 0 or (s[4] - s[3]) == 0 or (s[5] - s[4]) == 0 then
+        return false, string.format("zero section size %d/%d/%d", s[2] - s[1], s[4] - s[3], s[5] - s[4])
+    end
     return true
 end
 
@@ -189,8 +208,16 @@ local function slot_is_ready(species)
 end
 
 local function construct_entity(ctx)
+    local safe, why = blob_construct_safe(ctx.species)
+    if not safe then
+        log(string.format("REFUSE construct species=%d id=0x%X: blob unsafe (%s)", ctx.species, ctx.id, why))
+        return nil
+    end
+    log(string.format("construct species=%d id=0x%X", ctx.species, ctx.id))
     local ok, entity = kh1_native.call_function(fnc_spawn_world_gimmick_entity, ctx.id)
-    if not ok or entity == 0 then return nil end
+    if not ok then log("construct CRASHED (SafeCall caught)"); return nil end
+    if entity == 0 then log("construct returned null (budget?)"); return nil end
+    log(string.format("construct OK entity=0x%X", entity))
     return entity
 end
 
@@ -210,6 +237,7 @@ local function spawn_enemy(model_path, x, y, z)
     local pending = pending_spawns[model_path]
     if pending then
         if slot_is_ready(pending.species) then
+            log(string.format("%s load ready (species=%d), constructing", model_path, pending.species))
             local entity = construct_entity(pending.ctx)
             pending_spawns[model_path] = nil
             if entity then return true, entity end
@@ -227,6 +255,7 @@ local function spawn_enemy(model_path, x, y, z)
     for _, p in pairs(pending_spawns) do excluded[p.species] = true end
     local species, needs_load = resolve_species_slot(model_path, excluded)
     if not species then return false, "slots_full" end
+    log(string.format("%s resolved species=%d needs_load=%s", model_path, species, tostring(needs_load)))
 
     if x == nil or y == nil or z == nil then
         local sx, sy, sz = sora_position()
@@ -235,6 +264,7 @@ local function spawn_enemy(model_path, x, y, z)
 
     local ctx = splice_placement_record(species, data.template, data.charId, data.weight, x, y, z)
     if not ctx then return false, "splice_failed" end
+    log(string.format("%s spliced id=0x%X buffer=0x%X pos=(%.0f,%.0f,%.0f)", model_path, ctx.id, ctx.buffer, x, y, z))
 
     if not needs_load then
         local entity = construct_entity(ctx)
@@ -247,6 +277,7 @@ local function spawn_enemy(model_path, x, y, z)
         rollback_splice(ctx)
         return false, "load_failed"
     end
+    log(string.format("%s load triggered, waiting for species=%d", model_path, species))
     pending_spawns[model_path] = { ctx = ctx, species = species, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
     return false, "loading"
 end
