@@ -246,7 +246,10 @@ local function handle_buckets_full()
     if not resource_handle_bucket_table then return false end
     local claimed = 0
     for i = 0, HANDLE_BUCKET_COUNT - 1 do
-        if ReadLong(resource_handle_bucket_table + i * 8) ~= -1 then claimed = claimed + 1 end
+        local addr = resource_handle_bucket_table + i * 8
+        local lo = ReadInt(addr) & 0xFFFFFFFF
+        local hi = ReadInt(addr + 4) & 0xFFFFFFFF
+        if not (lo == 0xFFFFFFFF and hi == 0xFFFFFFFF) then claimed = claimed + 1 end
     end
     return claimed >= HANDLE_BUCKET_COUNT - HANDLE_BUCKET_HEADROOM
 end
