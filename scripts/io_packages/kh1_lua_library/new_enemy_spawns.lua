@@ -34,8 +34,15 @@ local PLACEMENT_MODEL_HANDLE_OFF  = 0x60
 local PLACEMENT_MOTION_HANDLE_OFF = 0x64
 local RECORD_CATEGORY_ACTOR       = 3
 local SPAWN_LOAD_TIMEOUT          = 5.0
+local RUNLEN_OFF_FROM_PTR         = -0x47
+local ENTITY_POOL_STRIDE          = 0x4B0
+local ENTITY_POOL_COUNT           = 96
+local ENTITY_OCC_FLAG_OFF         = 0x374
+local ENTITY_SPECIES_HND_OFF      = 0x134
+local BLOB_TABLE_SLOT_COUNT       = 65
 
 local pending_spawns = {}
+local our_spawn_runs = {}
 
 local function run_is_free(excluded, start, run_len)
     for k = 0, run_len - 1 do
@@ -103,6 +110,78 @@ end
 
 local function get_creature_data(model_path)
     return model_path and kh1_creature_data[model_path] or nil
+end
+
+local function resolve_handle(h)
+    if h == 0 then return 0 end
+    h = h & 0x7FFFFFFF
+    local addr = resource_handle_bucket_table + (h >> 25) * 8
+    local lo = ReadInt(addr) & 0xFFFFFFFF
+    local hi = ReadInt(addr + 4) & 0xFFFFFFFF
+    if lo == 0xFFFFFFFF and hi == 0xFFFFFFFF then return 0 end
+    return ((hi << 32) | lo) | (h & 0x1FFFFFF)
+end
+
+local function mark_run(occ, sp)
+    if sp < 0 or sp > SLOT_ALLOC_MAX then return end
+    local primary = ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + sp * SLOT_STRIDE)
+    if primary == SLOT_OWNER_FREE or primary > SLOT_ALLOC_MAX then primary = sp end
+    local rl = ReadByte(loadedSpeciesPtrTable + RUNLEN_OFF_FROM_PTR + primary * SLOT_STRIDE)
+    if rl < 1 then rl = 1 end
+    for k = 0, rl - 1 do occ[primary + k] = true end
+end
+
+local function live_referenced_slots()
+    local occ = {}
+    if not entityPoolBase or not resource_handle_bucket_table or not speciesResourceTable
+        or not loadedSpeciesPtrTable then return occ end
+    local base = kh1_native.get_module_base()
+    local blob_lo = base + speciesResourceTable
+    local blob_hi = blob_lo + BLOB_TABLE_SLOT_COUNT * RESOURCE_BLOB_SIZE
+    local table_ptr = GetPointer(placementTablePtr)
+    local count = ReadInt(placementTableCount)
+    local table_ok = table_ptr ~= 0 and count > 0 and count <= 4096
+    for i = 0, ENTITY_POOL_COUNT - 1 do
+        local e = entityPoolBase + i * ENTITY_POOL_STRIDE
+        if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then
+            local resolved = resolve_handle(ReadInt(e + ENTITY_SPECIES_HND_OFF) & 0xFFFFFFFF)
+            if resolved >= blob_lo and resolved < blob_hi then mark_run(occ, (resolved - blob_lo) >> 18) end
+            if table_ok then
+                local ridx = ReadInt(e + 0x04) & 0xFFFF
+                if ridx < count then mark_run(occ, ReadByte(table_ptr + ridx * PLACEMENT_RECORD_SIZE + PLACEMENT_SPECIES_OFF, true)) end
+            end
+        end
+    end
+    return occ
+end
+
+local function release_our_runs()
+    if fnc_release_species_slot_run and #our_spawn_runs > 0 then
+        local occ = live_referenced_slots()
+        local released, kept = 0, 0
+        for _, r in ipairs(our_spawn_runs) do
+            local sp = r.species
+            local name_ok = cached_name_matches(loadedSpeciesPtrTable + MODEL_NAME_OFF_FROM_PTR + sp * SLOT_STRIDE, r.model)
+            local token_ok = ReadLong(loadedSpeciesPtrTable + sp * SLOT_STRIDE) == r.token
+            local in_use = false
+            for k = 0, (r.run_len or 1) - 1 do if occ[sp + k] then in_use = true break end end
+            if name_ok and token_ok and not in_use then
+                kh1_native.call_function(fnc_release_species_slot_run, sp, r.run_len)
+                released = released + 1
+            else
+                kept = kept + 1
+            end
+        end
+        log(string.format("room change: released %d of %d spawned runs (%d re-taken/alive, kept)", released, #our_spawn_runs, kept))
+    end
+    our_spawn_runs = {}
+end
+
+local function record_our_spawn(species, run_len, model_path)
+    our_spawn_runs[#our_spawn_runs + 1] = {
+        species = species, run_len = run_len, model = model_path,
+        token = ReadLong(loadedSpeciesPtrTable + species * SLOT_STRIDE),
+    }
 end
 
 local function resolve_species_slot(model_path, run_len, excluded)
@@ -240,10 +319,8 @@ local function drop_pending_on_room_change()
     local w, a, s = ReadInt(g_WorldNumber), ReadInt(g_AreaNumber), ReadInt(g_SetNumber)
     if w == last_room_world and a == last_room_area and s == last_room_set then return end
     last_room_world, last_room_area, last_room_set = w, a, s
-    if next(pending_spawns) then
-        log(string.format("room changed to %d/%d/%d -- dropping in-flight spawns", w, a, s))
-        pending_spawns = {}
-    end
+    if next(pending_spawns) then pending_spawns = {} end
+    release_our_runs()
 end
 
 local function spawn_enemy(model_path, x, y, z)
@@ -262,7 +339,10 @@ local function spawn_enemy(model_path, x, y, z)
             log(string.format("%s load ready (species=%d), constructing", model_path, pending.species))
             local entity = construct_entity(pending.ctx)
             pending_spawns[model_path] = nil
-            if entity then return true, entity end
+            if entity then
+                record_our_spawn(pending.species, pending.run_len, model_path)
+                return true, entity
+            end
             rollback_splice(pending.ctx)
             return false, "ctor_failed"
         end
@@ -297,7 +377,10 @@ local function spawn_enemy(model_path, x, y, z)
 
     if not needs_load then
         local entity = construct_entity(ctx)
-        if entity then return true, entity end
+        if entity then
+            record_our_spawn(species, run_len, model_path)
+            return true, entity
+        end
         rollback_splice(ctx)
         return false, "ctor_failed"
     end
