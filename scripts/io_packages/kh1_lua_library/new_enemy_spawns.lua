@@ -139,9 +139,6 @@ local function blob_construct_safe(species)
         if s[i] < 0 or s[i] < prev then return false, string.format("hdr not monotonic at %d", i) end
         prev = s[i]
     end
-    if (s[2] - s[1]) == 0 or (s[4] - s[3]) == 0 or (s[5] - s[4]) == 0 then
-        return false, string.format("zero section size %d/%d/%d", s[2] - s[1], s[4] - s[3], s[5] - s[4])
-    end
     return true
 end
 
