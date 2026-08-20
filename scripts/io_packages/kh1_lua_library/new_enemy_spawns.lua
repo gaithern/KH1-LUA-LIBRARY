@@ -376,6 +376,17 @@ local function spawn_enemy(model_path, x, y, z)
         return false, "ctor_failed"
     end
 
+    do
+        local diag = {}
+        for k = 0, run_len - 1 do
+            local sl = species + k
+            local own = ReadByte(loadedSpeciesPtrTable + OWNER_OFF_FROM_PTR + sl * SLOT_STRIDE)
+            local st = ReadByte(loadedSpeciesPtrTable + STATE_OFF_FROM_PTR + sl * SLOT_STRIDE)
+            diag[#diag + 1] = string.format("s%d:own%02X/st%d", sl, own, st)
+        end
+        log(string.format("%s pre-load target run %d..%d: %s", model_path, species, species + run_len - 1, table.concat(diag, " ")))
+    end
+
     if not trigger_asset_load(ctx, model_path, data.motionPath) then
         rollback_splice(ctx)
         return false, "load_failed"
