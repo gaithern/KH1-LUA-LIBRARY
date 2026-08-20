@@ -265,12 +265,12 @@ local function drop_pending_on_room_change()
 end
 
 local function spawn_enemy(model_path, x, y, z)
-    if not model_path then return false, "bad_args" end
-    if inCutscene and ReadInt(inCutscene) ~= 0 then return false, "cutscene" end
-    if boss_slowdown_active() then return false, "boss_slowdown" end
+    if not model_path then log("called with nil model"); return false, "bad_args" end
+    if inCutscene and ReadInt(inCutscene) ~= 0 then log(model_path .. " -> cutscene"); return false, "cutscene" end
+    if boss_slowdown_active() then log(model_path .. " -> boss_slowdown"); return false, "boss_slowdown" end
 
     local data = get_creature_data(model_path)
-    if not data then return false, "no_data" end
+    if not data then log(model_path .. " -> no_data"); return false, "no_data" end
 
     drop_pending_on_room_change()
 
@@ -291,7 +291,7 @@ local function spawn_enemy(model_path, x, y, z)
         return false, "loading"
     end
 
-    if handle_buckets_full() then return false, "handles_full" end
+    if handle_buckets_full() then log(model_path .. " -> handles_full"); return false, "handles_full" end
 
     local run_len = string.byte(data.template, PLACEMENT_RUNLEN_OFF + 1) or 1
     if run_len < 1 then run_len = 1 end
@@ -301,7 +301,7 @@ local function spawn_enemy(model_path, x, y, z)
         for k = 0, (p.run_len or 1) - 1 do excluded[p.species + k] = true end
     end
     local species, needs_load = resolve_species_slot(model_path, run_len, excluded)
-    if not species then return false, "slots_full" end
+    if not species then log(model_path .. " -> slots_full (run_len=" .. run_len .. ")"); return false, "slots_full" end
     log(string.format("%s resolved species=%d run_len=%d needs_load=%s", model_path, species, run_len, tostring(needs_load)))
 
     if x == nil or y == nil or z == nil then
