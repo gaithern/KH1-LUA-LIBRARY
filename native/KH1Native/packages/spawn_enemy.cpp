@@ -1229,6 +1229,32 @@ extern "C" int l_spawn_enemy(void* L) {
             SPECIES_SLOT_ALLOC_MAX - SPECIES_SLOT_ALLOC_MIN + 1, detail);
         LogDebug(msg);
 
+        // A roster claiming nearly the whole window may be over-counted: MarkRoomRosterSlots
+        // trusts +0x55/+0x56 on EVERY record, but those bytes may only mean species/run-length
+        // on actor records (id category 3). Log the composition once per table so the histogram
+        // can settle whether roster marking should filter by category.
+        static int32_t lastRosterLoggedCount = -1;
+        if (occupied >= 40 && oldTable && oldCount > 0 && oldCount != lastRosterLoggedCount) {
+            lastRosterLoggedCount = oldCount;
+            int catCount[8] = {}; int catSlots[8] = {}; int otherCats = 0;
+            for (int32_t i = 0; i < oldCount; ++i) {
+                const uint8_t* rec = oldTable + (size_t)i * PLACEMENT_RECORD_SIZE;
+                uint32_t rid; memcpy(&rid, rec, 4);
+                uint32_t cat = rid >> 16;
+                int len = (int)(int8_t)rec[0x56]; if (len < 1) len = 1;
+                if (cat < 8) { ++catCount[cat]; catSlots[cat] += len; } else { ++otherCats; }
+            }
+            char hmsg[320];
+            snprintf(hmsg, sizeof(hmsg),
+                "spawn_enemy: roster composition (%d records) by id category (records/claimed slots): "
+                "c0=%d/%d c1=%d/%d c2=%d/%d c3=%d/%d c4=%d/%d c5=%d/%d c6=%d/%d c7=%d/%d other=%d",
+                oldCount,
+                catCount[0], catSlots[0], catCount[1], catSlots[1], catCount[2], catSlots[2],
+                catCount[3], catSlots[3], catCount[4], catSlots[4], catCount[5], catSlots[5],
+                catCount[6], catSlots[6], catCount[7], catSlots[7], otherCats);
+            LogDebug(hmsg);
+        }
+
         // Carry the numbers in the CODE, not the message: the reason code is what reliably survives
         // the native/Lua boundary (see the note above SPAWN_FAILURE_MESSAGES).
         char code[48];
