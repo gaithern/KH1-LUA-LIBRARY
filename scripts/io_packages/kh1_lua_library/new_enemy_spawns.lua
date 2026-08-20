@@ -155,26 +155,31 @@ local function live_referenced_slots()
     return occ
 end
 
-local function release_our_runs()
-    if fnc_release_species_slot_run and #our_spawn_runs > 0 then
-        local occ = live_referenced_slots()
-        local released, kept = 0, 0
-        for _, r in ipairs(our_spawn_runs) do
-            local sp = r.species
-            local name_ok = cached_name_matches(loadedSpeciesPtrTable + MODEL_NAME_OFF_FROM_PTR + sp * SLOT_STRIDE, r.model)
-            local token_ok = ReadLong(loadedSpeciesPtrTable + sp * SLOT_STRIDE) == r.token
+local function reclaim_dead_runs()
+    if not fnc_release_species_slot_run or #our_spawn_runs == 0 then return end
+    local occ = live_referenced_slots()
+    local kept, released, dropped = {}, 0, 0
+    for _, r in ipairs(our_spawn_runs) do
+        local sp = r.species
+        local ours = cached_name_matches(loadedSpeciesPtrTable + MODEL_NAME_OFF_FROM_PTR + sp * SLOT_STRIDE, r.model)
+            and ReadLong(loadedSpeciesPtrTable + sp * SLOT_STRIDE) == r.token
+        if not ours then
+            dropped = dropped + 1
+        else
             local in_use = false
             for k = 0, (r.run_len or 1) - 1 do if occ[sp + k] then in_use = true break end end
-            if name_ok and token_ok and not in_use then
+            if in_use then
+                kept[#kept + 1] = r
+            else
                 kh1_native.call_function(fnc_release_species_slot_run, sp, r.run_len)
                 released = released + 1
-            else
-                kept = kept + 1
             end
         end
-        log(string.format("room change: released %d of %d spawned runs (%d re-taken/alive, kept)", released, #our_spawn_runs, kept))
     end
-    our_spawn_runs = {}
+    if released > 0 or dropped > 0 then
+        log(string.format("reclaim: released %d dead run(s), dropped %d re-taken, %d still alive", released, dropped, #kept))
+    end
+    our_spawn_runs = kept
 end
 
 local function record_our_spawn(species, run_len, model_path)
@@ -320,7 +325,6 @@ local function drop_pending_on_room_change()
     if w == last_room_world and a == last_room_area and s == last_room_set then return end
     last_room_world, last_room_area, last_room_set = w, a, s
     if next(pending_spawns) then pending_spawns = {} end
-    release_our_runs()
 end
 
 local function spawn_enemy(model_path, x, y, z)
@@ -357,6 +361,8 @@ local function spawn_enemy(model_path, x, y, z)
 
     local run_len = string.byte(data.template, PLACEMENT_RUNLEN_OFF + 1) or 1
     if run_len < 1 then run_len = 1 end
+
+    reclaim_dead_runs()
 
     local excluded = {}
     for _, p in pairs(pending_spawns) do
