@@ -40,12 +40,12 @@ local function acquire_buffer(need_size)
         local b = buffer_pool[i]
         if b.size >= need_size then
             table.remove(buffer_pool, i)
-            return b.addr, b.size
+            return b.addr, b.size, true
         end
     end
     local addr = kh1_native.allocate(need_size)
     if addr == 0 then return nil end
-    return addr, need_size
+    return addr, need_size, false
 end
 
 local function pool_buffer(addr, size)
@@ -282,16 +282,19 @@ local function reclaim_dead_rows()
         if pending_rows[r.row] or alive[r.row] then
             dead_streak[r.row] = 0
         elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
-            free_slot(r.slot_n)
+            local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
+            local still_ours = slot_ptr >= r.buf_base and slot_ptr < r.buf_end
+            if still_ours then free_slot(r.slot_n) end
             pool_buffer(r.buf_base, r.buf_end - r.buf_base)
             redirect.release(r.row)
             dead_streak[r.row] = nil
             reclaimed = reclaimed + 1
+            log(string.format("reclaim slot=%d buf=0x%X %s", r.slot_n, r.buf_base,
+                still_ours and "(freed)" or "(retiled -> left for native)"))
         else
             dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
         end
     end
-    if reclaimed > 0 then log(string.format("reclaimed %d dead spawn slot(s)", reclaimed)) end
 end
 
 local last_room_world, last_room_area, last_room_set = nil, nil, nil
@@ -373,11 +376,12 @@ local function spawn_enemy(model_path, x, y, z)
 
     local slot = redirect.find_free_slot()
     if not slot then return fail("slots_full") end
-    local buf, buf_actual = acquire_buffer(buf_size)
+    local buf, buf_actual, reused = acquire_buffer(buf_size)
     if not buf then return fail("buf_alloc_failed") end
     local row = redirect.claim(buf, buf + buf_actual, slot, hash)
     if not row then pool_buffer(buf, buf_actual); return fail("registry_full") end
-    log(string.format("%s -> slot=%d buf=0x%X size=0x%X row=%d", model_path, slot, buf, buf_actual, row))
+    log(string.format("%s -> slot=%d buf=0x%X size=0x%X row=%d %s", model_path, slot, buf, buf_actual,
+        row, reused and "(pooled)" or "(new)"))
 
     local ctx = splice_placement_record(slot, data.template, data.charId, data.weight, x, y, z)
     if not ctx then
