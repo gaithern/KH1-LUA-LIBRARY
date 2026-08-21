@@ -28,6 +28,8 @@ local RESOURCE_BLOB_SIZE          = 0x40000
 local BLOB_HEADER_FIRST_SECTION   = 128
 local SPAWN_LOAD_TIMEOUT          = 5.0
 
+local REUSE_ENABLED = false
+
 local pending_spawns = {}
 local installed = false
 
@@ -261,7 +263,7 @@ local function spawn_enemy(model_path, x, y, z)
         return false, "loading"
     end
 
-    local loaded = find_our_loaded(hash)
+    local loaded = REUSE_ENABLED and find_our_loaded(hash)
     if loaded then
         local ctx = splice_placement_record(loaded.slot_n, data.template, data.charId, data.weight, x, y, z)
         if not ctx then return false, "splice_failed" end
