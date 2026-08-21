@@ -21,19 +21,10 @@ local PLACEMENT_MODEL_HANDLE_OFF  = 0x60
 local PLACEMENT_MOTION_HANDLE_OFF = 0x64
 local RECORD_CATEGORY_ACTOR       = 3
 
-local SLOT_STRIDE                 = 0x50
-local STATE_OFF                   = 0x03  -- state byte, relative to owner-table slot base
-local SLOT_STATE_READY            = 6
-local SLOT_MAX                    = 49    -- highest usable game species slot
-local SLOT_NONE                   = 0xFF  -- row no longer holds a game slot (freed post-construct)
 local RESOURCE_BLOB_SIZE          = 0x40000
 local BLOB_HEADER_FIRST_SECTION   = 128
 local SPAWN_LOAD_TIMEOUT          = 5.0
-
-local REUSE_ENABLED = false
--- Weight written into our spliced record. The constructor sums live-entity weights and returns 0
--- ("budget full") once the room cap is exceeded, so a low value lets far more of our spawns fit.
-local SPAWN_WEIGHT = 1
+local SPAWN_WEIGHT                = 1
 
 local pending_spawns = {}
 local installed = false
@@ -132,13 +123,8 @@ local function handle_buckets_full()
     return claimed >= HANDLE_BUCKET_COUNT - HANDLE_BUCKET_HEADROOM
 end
 
-local function slot_state(slot)
-    return ReadByte(species_owner_table + slot * SLOT_STRIDE + STATE_OFF)
-end
-local function slot_is_ready(slot)
-    return slot_state(slot) == SLOT_STATE_READY
-end
-
+-- Blob header sanity: first section marker present and section offsets monotonic. This is our
+-- readiness gate now that no species slot tracks load state.
 local function blob_construct_safe(buf)
     local s = {}
     for i = 0, 4 do s[i] = ReadInt(buf + 4 + i * 4, true) end
@@ -161,29 +147,13 @@ local function intern_path(path)
     return addr
 end
 
-local function mint_string_handle(path)
-    local addr = intern_path(path)
-    if addr == 0 then return nil end
-    local ok, handle = kh1_native.call_function(fnc_mint_resource_handle, addr)
-    if not ok then return nil end
-    return handle & 0xFFFFFFFF
-end
-
 local function mint_ptr_handle(addr)
     local ok, handle = kh1_native.call_function(fnc_mint_resource_handle, addr)
     if not ok then return nil end
     return handle & 0xFFFFFFFF
 end
 
--- Find a model we already loaded this session (from the persistent registry, so reuse survives F1).
-local function find_our_loaded(hash)
-    for _, r in ipairs(redirect.active_rows()) do
-        if r.tag == hash and slot_is_ready(r.slot_n) then return r end
-    end
-    return nil
-end
-
-local function splice_placement_record(slot, template, char_id, weight, x, y, z)
+local function splice_placement_record(template, char_id, x, y, z)
     if not template or #template ~= PLACEMENT_RECORD_SIZE then return nil end
     local old_ptr = GetPointer(placementTablePtr)
     local old_count = ReadInt(placementTableCount)
@@ -207,8 +177,8 @@ local function splice_placement_record(slot, template, char_id, weight, x, y, z)
     WriteFloat(record + PLACEMENT_POS_Y_OFF, y, true)
     WriteFloat(record + PLACEMENT_POS_Z_OFF, z, true)
     WriteShort(record + PLACEMENT_CHARID_OFF, char_id, true)
-    WriteByte(record + PLACEMENT_SPECIES_OFF, slot, true)
-    WriteByte(record + PLACEMENT_RUNLEN_OFF, 1, true)  -- 1 game slot for bookkeeping; data is ours
+    WriteByte(record + PLACEMENT_SPECIES_OFF, 0, true)   -- ignored: constructor uses record+0x08
+    WriteByte(record + PLACEMENT_RUNLEN_OFF, 1, true)
     WriteByte(record + PLACEMENT_WEIGHT_OFF, SPAWN_WEIGHT, true)
     WriteInt(record + PLACEMENT_MODEL_HANDLE_OFF, 0, true)
     WriteInt(record + PLACEMENT_MOTION_HANDLE_OFF, 0, true)
@@ -216,8 +186,7 @@ local function splice_placement_record(slot, template, char_id, weight, x, y, z)
     WriteLong(placementTablePtr, buffer)
     WriteInt(placementTableCount, new_count)
 
-    return { buffer = buffer, record = record, id = id, slot = slot,
-             old_ptr = old_ptr, old_count = old_count }
+    return { buffer = buffer, record = record, id = id, old_ptr = old_ptr, old_count = old_count }
 end
 
 local function rollback_splice(ctx)
@@ -226,35 +195,46 @@ local function rollback_splice(ctx)
     WriteInt(placementTableCount, ctx.old_count)
 end
 
-local function trigger_asset_load(ctx, model_path, motion_path, buf)
-    local model_handle = mint_string_handle(model_path)
-    local motion_handle = mint_string_handle(motion_path)
-    local buf_handle = mint_ptr_handle(buf)
-    if not model_handle or not motion_handle or not buf_handle then return false end
-    WriteInt(ctx.record + PLACEMENT_MODEL_HANDLE_OFF, model_handle, true)
-    WriteInt(ctx.record + PLACEMENT_MOTION_HANDLE_OFF, motion_handle, true)
-    WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)  -- dest = our buffer
-    WriteByte(species_owner_table + ctx.slot * SLOT_STRIDE + STATE_OFF, 0)  -- RVA global
+local function call_ok(fn, arg)
+    return (kh1_native.call_function(fn, arg))
+end
 
-    local base = kh1_native.get_module_base()
-    local ok, job = kh1_native.call_function(fnc_alloc_async_job_slot,
-        base + gimmick_job_pool, 0, base + fnc_async_load_job_callback, 0)
-    if not ok or job == 0 then return false end
-    WriteLong(job + 0x20, ctx.record, true)
-    WriteLong(job + 0x28, 0, true)
+local function model_fixup(dest)
+    if not call_ok(fnc_blob_reloc, dest + ReadInt(dest + 4, true)) then return false end
+    if ReadInt(dest + 0xC, true) - ReadInt(dest + 8, true) > 0 then
+        if not call_ok(fnc_blob_fixup_a, dest + ReadInt(dest + 8, true)) then return false end
+    end
+    if ReadInt(dest + 0x18, true) - ReadInt(dest + 0x14, true) > 0 then
+        if not call_ok(fnc_blob_fixup_b, dest + ReadInt(dest + 0x14, true)) then return false end
+    end
+    return true
+end
+
+local function motion_fixup(dest)
+    if not call_ok(fnc_blob_reloc, dest + ReadInt(dest + 4, true)) then return false end
+    if ReadInt(dest + 0x10, true) - ReadInt(dest + 0xC, true) > 0 then
+        local base2 = dest + ReadInt(dest + 0xC, true)
+        for k = 0, 9 do
+            local lo = ReadInt(base2 + 4 + k * 4, true)
+            local hi = ReadInt(base2 + 8 + k * 4, true)
+            if hi - lo > 0 then
+                if not call_ok(fnc_motion_fixup, base2 + lo) then return false end
+            end
+        end
+    end
     return true
 end
 
 local function construct_entity(ctx, buf)
     local safe, why = blob_construct_safe(buf)
     if not safe then
-        log(string.format("REFUSE construct slot=%d id=0x%X: blob unsafe (%s)", ctx.slot, ctx.id, why))
+        log(string.format("REFUSE construct id=0x%X: blob unsafe (%s)", ctx.id, why))
         return nil
     end
     local ok, entity = kh1_native.call_function(fnc_spawn_world_gimmick_entity, ctx.id)
     if not ok then log("construct CRASHED (SafeCall caught)"); return nil end
     if entity == 0 then log("construct returned null (budget?)"); return nil end
-    log(string.format("construct OK slot=%d entity=0x%X", ctx.slot, entity))
+    log(string.format("construct OK entity=0x%X", entity))
     return entity
 end
 
@@ -275,14 +255,6 @@ local function resolve_handle(h)
     return ((hi << 32) | lo) | (h & 0x1FFFFFF)
 end
 
-local function free_slot(slot_n)
-    local base = species_owner_table + slot_n * SLOT_STRIDE
-    WriteByte(base, 0xFF)
-    WriteByte(base + 2, 0)
-    WriteByte(base + 3, 0)
-    WriteLong(loadedSpeciesPtrTable + slot_n * SLOT_STRIDE, 0)
-end
-
 local function live_rows(rows)
     local alive = {}
     for i = 0, ENTITY_POOL_COUNT - 1 do
@@ -301,16 +273,22 @@ local function live_rows(rows)
     return alive
 end
 
+local function cleanup_pending(model_path, p)
+    rollback_splice(p.ctx)
+    redirect.release(p.row)
+    pool_buffer(p.buf, p.size)
+    pending_spawns[model_path] = nil
+end
+
 local function reclaim_dead_rows()
     local now_c = os.clock()
     for model, p in pairs(pending_spawns) do
-        if now_c >= p.deadline then
-            pending_spawns[model] = nil
+        if now_c >= p.deadline + 2.0 then
             rollback_splice(p.ctx)
-            if p.ctx.slot and p.ctx.slot <= SLOT_MAX then free_slot(p.ctx.slot) end
             redirect.release(p.row)
-            if p.size then pool_buffer(p.buf, p.size) end
-            log(string.format("swept stale load %s slot=%d row=%d", model, p.ctx.slot or -1, p.row))
+            pool_buffer(p.buf, p.size)
+            pending_spawns[model] = nil
+            log("swept stale load " .. model)
         end
     end
     local rows = redirect.active_rows()
@@ -318,32 +296,17 @@ local function reclaim_dead_rows()
     local pending_rows = {}
     for _, p in pairs(pending_spawns) do pending_rows[p.row] = true end
     local alive = live_rows(rows)
-    local reclaimed, harvested = 0, 0
     for _, r in ipairs(rows) do
-        if pending_rows[r.row] then
+        if pending_rows[r.row] or alive[r.row] then
             dead_streak[r.row] = 0
-        elseif alive[r.row] then
-            dead_streak[r.row] = 0
-            if r.slot_n <= SLOT_MAX then
-                free_slot(r.slot_n)
-                redirect.set_row_slot(r.row, SLOT_NONE)
-                harvested = harvested + 1
-            end
         elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
-            if r.slot_n <= SLOT_MAX then
-                local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
-                if slot_ptr >= r.buf_base and slot_ptr < r.buf_end then free_slot(r.slot_n) end
-            end
             pool_buffer(r.buf_base, r.buf_end - r.buf_base)
             redirect.release(r.row)
             dead_streak[r.row] = nil
-            reclaimed = reclaimed + 1
-            log(string.format("reclaim slot=%d buf=0x%X (dead)", r.slot_n, r.buf_base))
         else
             dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
         end
     end
-    if harvested > 0 then log(string.format("harvested %d slot(s) for reuse", harvested)) end
 end
 
 local last_room_world, last_room_area, last_room_set = nil, nil, nil
@@ -354,20 +317,58 @@ local function release_all_on_room_change()
     if w == last_room_world and a == last_room_area and s == last_room_set then return end
     last_room_world, last_room_area, last_room_set = w, a, s
     local rows = redirect.active_rows()
-    local released = 0
     for _, r in ipairs(rows) do
-        if r.slot_n <= SLOT_MAX then
-            local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
-            if slot_ptr >= r.buf_base and slot_ptr < r.buf_end then
-                free_slot(r.slot_n)
-                released = released + 1
-            end
-        end
         pool_buffer(r.buf_base, r.buf_end - r.buf_base)
         redirect.release(r.row)
     end
-    if #rows > 0 then log(string.format("room change: %d row(s), released %d still-holding slot(s)", #rows, released)) end
+    if #rows > 0 then log(string.format("room change: released %d row(s)", #rows)) end
     pending_spawns = {}
+end
+
+local function queue_load(filename, dest)
+    local fname = intern_path(filename)
+    if fname == 0 then return false end
+    redirect.clear_done()
+    return (kh1_native.call_function(fnc_queue_file_load_to_address, fname, dest, redirect.completion_addr(), 0))
+end
+
+local function drive_pending(model_path, p)
+    local dest = redirect.poll_done()
+    if p.stage == 0 then
+        if dest ~= p.buf then
+            if dest then redirect.clear_done() end                 -- stale completion, ignore
+            if os.clock() >= p.deadline then cleanup_pending(model_path, p); return false, "timeout" end
+            return false, "loading"
+        end
+        local _, size = redirect.poll_done()
+        redirect.clear_done()
+        if not model_fixup(p.buf) then cleanup_pending(model_path, p); return false, "load_failed" end
+        local motion_dest = p.buf + ((size + 0x7F) & ~0x7F)
+        if motion_dest + RESOURCE_BLOB_SIZE > p.buf + p.size then
+            cleanup_pending(model_path, p); return false, "buf_alloc_failed"
+        end
+        p.motion_dest = motion_dest
+        redirect.set_motion(p.row, motion_dest)
+        if not queue_load(p.motion_path, motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
+        p.stage = 1
+        p.deadline = os.clock() + SPAWN_LOAD_TIMEOUT
+        return false, "loading"
+    elseif p.stage == 1 then
+        if dest ~= p.motion_dest then
+            if dest then redirect.clear_done() end
+            if os.clock() >= p.deadline then cleanup_pending(model_path, p); return false, "timeout" end
+            return false, "loading"
+        end
+        redirect.clear_done()
+        if not motion_fixup(p.motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
+        p.stage = 2
+    end
+
+    local entity = construct_entity(p.ctx, p.buf)
+    pending_spawns[model_path] = nil
+    if entity then return true, entity end
+    rollback_splice(p.ctx); redirect.release(p.row); pool_buffer(p.buf, p.size)
+    return false, "ctor_failed"
 end
 
 local function spawn_enemy(model_path, x, y, z)
@@ -388,36 +389,8 @@ local function spawn_enemy(model_path, x, y, z)
         x, y, z = x or sx, y or sy, z or sz
     end
 
-    local hash = model_hash(model_path)
-
-    local pending = pending_spawns[model_path]
-    if pending then
-        if slot_is_ready(pending.ctx.slot) then
-            local entity = construct_entity(pending.ctx, pending.buf)
-            pending_spawns[model_path] = nil
-            if entity then return true, entity end
-            rollback_splice(pending.ctx)
-            return fail("ctor_failed")
-        end
-        if os.clock() >= pending.deadline then
-            pending_spawns[model_path] = nil
-            return fail("timeout")
-        end
-        return false, "loading"
-    end
-
-    local loaded = REUSE_ENABLED and find_our_loaded(hash)
-    if loaded then
-        local ctx = splice_placement_record(loaded.slot_n, data.template, data.charId, data.weight, x, y, z)
-        if not ctx then return fail("splice_failed") end
-        local buf_handle = mint_ptr_handle(loaded.buf_base)
-        if not buf_handle then rollback_splice(ctx); return fail("mint_failed") end
-        WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)
-        local entity = construct_entity(ctx, loaded.buf_base)
-        if entity then return true, entity end
-        rollback_splice(ctx)
-        return fail("ctor_failed")
-    end
+    local p = pending_spawns[model_path]
+    if p then return drive_pending(model_path, p) end
 
     if handle_buckets_full() then return fail("handles_full") end
 
@@ -425,30 +398,40 @@ local function spawn_enemy(model_path, x, y, z)
     if run_len < 1 then run_len = 1 end
     local buf_size = (run_len + 2) * RESOURCE_BLOB_SIZE
 
-    local slot = redirect.find_free_slot()
-    if not slot then return fail("slots_full") end
-    local buf, buf_actual, reused = acquire_buffer(buf_size)
+    local buf, buf_actual = acquire_buffer(buf_size)
     if not buf then return fail("buf_alloc_failed") end
-    local row = redirect.claim(buf, buf + buf_actual, slot, hash)
+    local hash = model_hash(model_path)
+    local row = redirect.claim(buf, buf + buf_actual, hash)
     if not row then pool_buffer(buf, buf_actual); return fail("registry_full") end
-    log(string.format("%s -> slot=%d buf=0x%X size=0x%X row=%d %s", model_path, slot, buf, buf_actual,
-        row, reused and "(pooled)" or "(new)"))
 
-    local ctx = splice_placement_record(slot, data.template, data.charId, data.weight, x, y, z)
-    if not ctx then
-        redirect.release(row); pool_buffer(buf, buf_actual)
-        return fail("splice_failed")
-    end
+    local ctx = splice_placement_record(data.template, data.charId, x, y, z)
+    if not ctx then redirect.release(row); pool_buffer(buf, buf_actual); return fail("splice_failed") end
 
-    if not trigger_asset_load(ctx, model_path, data.motionPath, buf) then
-        rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual)
-        return fail("load_failed")
+    local buf_handle = mint_ptr_handle(buf)
+    if not buf_handle then
+        rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual); return fail("mint_failed")
     end
-    pending_spawns[model_path] = { ctx = ctx, buf = buf, size = buf_actual, row = row, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
+    WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)
+
+    if not queue_load(model_path, buf) then
+        rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual); return fail("load_failed")
+    end
+    log(string.format("%s -> buf=0x%X size=0x%X row=%d (loading)", model_path, buf, buf_actual, row))
+    pending_spawns[model_path] = { ctx = ctx, buf = buf, size = buf_actual, row = row,
+        stage = 0, motion_path = data.motionPath, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
     return false, "loading"
+end
+
+local function slot_stats()
+    local live = 0
+    for i = 0, ENTITY_POOL_COUNT - 1 do
+        local e = entityPoolBase + i * ENTITY_POOL_STRIDE
+        if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then live = live + 1 end
+    end
+    return ENTITY_POOL_COUNT - live, ENTITY_POOL_COUNT, 0
 end
 
 return {
     spawn_enemy = spawn_enemy,
-    slot_stats = redirect.slot_stats,
+    slot_stats = slot_stats,
 }
