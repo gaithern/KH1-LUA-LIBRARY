@@ -286,12 +286,13 @@ end
 
 local function spawn_enemy(model_path, x, y, z)
     if not model_path then log("called with nil model"); return false, "bad_args" end
-    if inCutscene and ReadInt(inCutscene) ~= 0 then return false, "cutscene" end
-    if boss_slowdown_active() then return false, "boss_slowdown" end
-    if not ensure_installed() then return false, "install_failed" end
+    local function fail(reason) log(model_path .. " FAIL: " .. reason); return false, reason end
+    if inCutscene and ReadInt(inCutscene) ~= 0 then return fail("cutscene") end
+    if boss_slowdown_active() then return fail("boss_slowdown") end
+    if not ensure_installed() then return fail("install_failed") end
 
     local data = get_creature_data(model_path)
-    if not data then log(model_path .. " -> no_data"); return false, "no_data" end
+    if not data then return fail("no_data") end
 
     release_all_on_room_change()
     reclaim_dead_rows()
@@ -310,11 +311,11 @@ local function spawn_enemy(model_path, x, y, z)
             pending_spawns[model_path] = nil
             if entity then return true, entity end
             rollback_splice(pending.ctx)
-            return false, "ctor_failed"
+            return fail("ctor_failed")
         end
         if os.clock() >= pending.deadline then
             pending_spawns[model_path] = nil
-            return false, "timeout"
+            return fail("timeout")
         end
         return false, "loading"
     end
@@ -322,39 +323,39 @@ local function spawn_enemy(model_path, x, y, z)
     local loaded = REUSE_ENABLED and find_our_loaded(hash)
     if loaded then
         local ctx = splice_placement_record(loaded.slot_n, data.template, data.charId, data.weight, x, y, z)
-        if not ctx then return false, "splice_failed" end
+        if not ctx then return fail("splice_failed") end
         local buf_handle = mint_ptr_handle(loaded.buf_base)
-        if not buf_handle then rollback_splice(ctx); return false, "mint_failed" end
+        if not buf_handle then rollback_splice(ctx); return fail("mint_failed") end
         WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)
         local entity = construct_entity(ctx, loaded.buf_base)
         if entity then return true, entity end
         rollback_splice(ctx)
-        return false, "ctor_failed"
+        return fail("ctor_failed")
     end
 
-    if handle_buckets_full() then log(model_path .. " -> handles_full"); return false, "handles_full" end
+    if handle_buckets_full() then return fail("handles_full") end
 
     local run_len = string.byte(data.template, PLACEMENT_RUNLEN_OFF + 1) or 1
     if run_len < 1 then run_len = 1 end
     local buf_size = (run_len + 2) * RESOURCE_BLOB_SIZE
 
     local slot = redirect.find_free_slot()
-    if not slot then log(model_path .. " -> slots_full"); return false, "slots_full" end
+    if not slot then return fail("slots_full") end
     local buf = kh1_native.allocate(buf_size)
-    if buf == 0 then return false, "buf_alloc_failed" end
+    if buf == 0 then return fail("buf_alloc_failed") end
     local row = redirect.claim(buf, buf + buf_size, slot, hash)
-    if not row then kh1_native.free(buf); return false, "registry_full" end
+    if not row then kh1_native.free(buf); return fail("registry_full") end
     log(string.format("%s -> slot=%d buf=0x%X size=0x%X row=%d", model_path, slot, buf, buf_size, row))
 
     local ctx = splice_placement_record(slot, data.template, data.charId, data.weight, x, y, z)
     if not ctx then
         redirect.release(row); kh1_native.free(buf)
-        return false, "splice_failed"
+        return fail("splice_failed")
     end
 
     if not trigger_asset_load(ctx, model_path, data.motionPath, buf) then
         rollback_splice(ctx); redirect.release(row); kh1_native.free(buf)
-        return false, "load_failed"
+        return fail("load_failed")
     end
     pending_spawns[model_path] = { ctx = ctx, buf = buf, row = row, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
     return false, "loading"
