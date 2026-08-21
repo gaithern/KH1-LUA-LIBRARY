@@ -265,6 +265,9 @@ local function spawn_enemy(model_path, x, y, z)
     if loaded then
         local ctx = splice_placement_record(loaded.slot_n, data.template, data.charId, data.weight, x, y, z)
         if not ctx then return false, "splice_failed" end
+        local buf_handle = mint_ptr_handle(loaded.buf_base)
+        if not buf_handle then rollback_splice(ctx); return false, "mint_failed" end
+        WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)
         local entity = construct_entity(ctx, loaded.buf_base)
         if entity then return true, entity end
         rollback_splice(ctx)

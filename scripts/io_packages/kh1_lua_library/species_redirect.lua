@@ -49,8 +49,14 @@ local function row_addr(i) return ctrl + ROWS_BASE + i * ROW_STRIDE end
 
 local function find_free_slot()
     local owner_base = abs(RVA.species_tab)
+    local claimed = {}
+    local count = ci(OFF_REG_COUNT)
+    for i = 0, count - 1 do
+        local r = row_addr(i)
+        if ReadInt(r + ROW_ACTIVE, true) == 1 then claimed[ReadInt(r + ROW_SLOTN, true)] = true end
+    end
     for s = LAST_USABLE_SLOT, FIRST_USABLE_SLOT, -1 do
-        if ReadByte(owner_base + s * SLOT_STRIDE + SLOT_OWNER_OFF, true) == OWNER_FREE then
+        if not claimed[s] and ReadByte(owner_base + s * SLOT_STRIDE + SLOT_OWNER_OFF, true) == OWNER_FREE then
             return s
         end
     end
