@@ -207,6 +207,62 @@ local function construct_entity(ctx, buf)
     return entity
 end
 
+local ENTITY_POOL_STRIDE = 0x4B0
+local ENTITY_POOL_COUNT = 96
+local ENTITY_OCC_FLAG_OFF = 0x374
+local ENTITY_BLOB_HND_OFF = 0x154
+
+local function resolve_handle(h)
+    if h == 0 then return 0 end
+    h = h & 0x7FFFFFFF
+    local addr = resource_handle_bucket_table + (h >> 25) * 8
+    local lo = ReadInt(addr) & 0xFFFFFFFF
+    local hi = ReadInt(addr + 4) & 0xFFFFFFFF
+    if lo == 0xFFFFFFFF and hi == 0xFFFFFFFF then return 0 end
+    return ((hi << 32) | lo) | (h & 0x1FFFFFF)
+end
+
+local function free_slot(slot_n)
+    local base = species_owner_table + slot_n * SLOT_STRIDE
+    WriteByte(base, 0xFF)
+    WriteByte(base + 2, 0)
+    WriteByte(base + 3, 0)
+    WriteLong(loadedSpeciesPtrTable + slot_n * SLOT_STRIDE, 0)
+end
+
+local function live_rows(rows)
+    local alive = {}
+    for i = 0, ENTITY_POOL_COUNT - 1 do
+        local e = entityPoolBase + i * ENTITY_POOL_STRIDE
+        if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then
+            local resolved = resolve_handle(ReadInt(e + ENTITY_BLOB_HND_OFF) & 0xFFFFFFFF)
+            if resolved ~= 0 then
+                for _, r in ipairs(rows) do
+                    if resolved >= r.buf_base and resolved < r.buf_end then alive[r.row] = true break end
+                end
+            end
+        end
+    end
+    return alive
+end
+
+local function reclaim_dead_rows()
+    local rows = redirect.active_rows()
+    if #rows == 0 then return end
+    local pending_rows = {}
+    for _, p in pairs(pending_spawns) do pending_rows[p.row] = true end
+    local alive = live_rows(rows)
+    local reclaimed = 0
+    for _, r in ipairs(rows) do
+        if not alive[r.row] and not pending_rows[r.row] then
+            free_slot(r.slot_n)
+            redirect.release(r.row)
+            reclaimed = reclaimed + 1
+        end
+    end
+    if reclaimed > 0 then log(string.format("reclaimed %d dead spawn slot(s)", reclaimed)) end
+end
+
 local last_room_world, last_room_area, last_room_set = nil, nil, nil
 
 local function release_all_on_room_change()
@@ -218,13 +274,8 @@ local function release_all_on_room_change()
     local released = 0
     for _, r in ipairs(rows) do
         local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
-        local still_ours = slot_ptr >= r.buf_base and slot_ptr < r.buf_end
-        if still_ours then
-            local base = species_owner_table + r.slot_n * SLOT_STRIDE
-            WriteByte(base, 0xFF)
-            WriteByte(base + 2, 0)
-            WriteByte(base + 3, 0)
-            WriteLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE, 0)
+        if slot_ptr >= r.buf_base and slot_ptr < r.buf_end then
+            free_slot(r.slot_n)
             released = released + 1
         end
         redirect.release(r.row)
@@ -243,6 +294,7 @@ local function spawn_enemy(model_path, x, y, z)
     if not data then log(model_path .. " -> no_data"); return false, "no_data" end
 
     release_all_on_room_change()
+    reclaim_dead_rows()
 
     if x == nil or y == nil or z == nil then
         local sx, sy, sz = sora_position()
