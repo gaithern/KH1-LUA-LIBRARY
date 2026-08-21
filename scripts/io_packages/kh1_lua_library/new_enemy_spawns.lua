@@ -24,6 +24,8 @@ local RECORD_CATEGORY_ACTOR       = 3
 local SLOT_STRIDE                 = 0x50
 local STATE_OFF                   = 0x03  -- state byte, relative to owner-table slot base
 local SLOT_STATE_READY            = 6
+local SLOT_MAX                    = 49    -- highest usable game species slot
+local SLOT_NONE                   = 0xFF  -- row no longer holds a game slot (freed post-construct)
 local RESOURCE_BLOB_SIZE          = 0x40000
 local BLOB_HEADER_FIRST_SECTION   = 128
 local SPAWN_LOAD_TIMEOUT          = 5.0
@@ -285,15 +287,15 @@ local function reclaim_dead_rows()
         if pending_rows[r.row] or alive[r.row] then
             dead_streak[r.row] = 0
         elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
-            local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
-            local still_ours = slot_ptr >= r.buf_base and slot_ptr < r.buf_end
-            if still_ours then free_slot(r.slot_n) end
+            if r.slot_n <= SLOT_MAX then
+                local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
+                if slot_ptr >= r.buf_base and slot_ptr < r.buf_end then free_slot(r.slot_n) end
+            end
             pool_buffer(r.buf_base, r.buf_end - r.buf_base)
             redirect.release(r.row)
             dead_streak[r.row] = nil
             reclaimed = reclaimed + 1
-            log(string.format("reclaim slot=%d buf=0x%X %s", r.slot_n, r.buf_base,
-                still_ours and "(freed)" or "(retiled -> left for native)"))
+            log(string.format("reclaim slot=%d buf=0x%X (dead)", r.slot_n, r.buf_base))
         else
             dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
         end
@@ -310,15 +312,17 @@ local function release_all_on_room_change()
     local rows = redirect.active_rows()
     local released = 0
     for _, r in ipairs(rows) do
-        local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
-        if slot_ptr >= r.buf_base and slot_ptr < r.buf_end then
-            free_slot(r.slot_n)
-            released = released + 1
+        if r.slot_n <= SLOT_MAX then
+            local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
+            if slot_ptr >= r.buf_base and slot_ptr < r.buf_end then
+                free_slot(r.slot_n)
+                released = released + 1
+            end
         end
         pool_buffer(r.buf_base, r.buf_end - r.buf_base)
         redirect.release(r.row)
     end
-    if #rows > 0 then log(string.format("room change: %d row(s), released %d still-ours slot(s)", #rows, released)) end
+    if #rows > 0 then log(string.format("room change: %d row(s), released %d still-holding slot(s)", #rows, released)) end
     pending_spawns = {}
 end
 
@@ -347,7 +351,11 @@ local function spawn_enemy(model_path, x, y, z)
         if slot_is_ready(pending.ctx.slot) then
             local entity = construct_entity(pending.ctx, pending.buf)
             pending_spawns[model_path] = nil
-            if entity then return true, entity end
+            if entity then
+                free_slot(pending.ctx.slot)
+                redirect.set_row_slot(pending.row, SLOT_NONE)
+                return true, entity
+            end
             rollback_splice(pending.ctx)
             return fail("ctor_failed")
         end

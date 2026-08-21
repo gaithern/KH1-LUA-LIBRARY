@@ -88,6 +88,10 @@ function M.release(row)
     if row then WriteInt(row_addr(row) + ROW_ACTIVE, 0, true) end
 end
 
+function M.set_row_slot(row, slot_n)
+    if row then WriteInt(row_addr(row) + ROW_SLOTN, slot_n, true) end
+end
+
 function M.active_rows()
     local out = {}
     local count = ci(OFF_REG_COUNT)
