@@ -910,8 +910,6 @@ static const luaL_Reg kh1_native_lib[] = {
     {"write_bytes", reinterpret_cast<void*>(l_write_bytes)},
     {"patch_code", reinterpret_cast<void*>(l_patch_code)},
     {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
-    {"spawn_enemy", reinterpret_cast<void*>(l_spawn_enemy)},
-    {"spawn_enemy_precheck", reinterpret_cast<void*>(l_spawn_enemy_precheck)},
     {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
     {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
     {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},
