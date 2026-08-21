@@ -351,11 +351,7 @@ local function spawn_enemy(model_path, x, y, z)
         if slot_is_ready(pending.ctx.slot) then
             local entity = construct_entity(pending.ctx, pending.buf)
             pending_spawns[model_path] = nil
-            if entity then
-                free_slot(pending.ctx.slot)
-                redirect.set_row_slot(pending.row, SLOT_NONE)
-                return true, entity
-            end
+            if entity then return true, entity end
             rollback_splice(pending.ctx)
             return fail("ctor_failed")
         end
