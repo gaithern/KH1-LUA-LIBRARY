@@ -219,8 +219,12 @@ local function release_all_on_room_change()
     for _, r in ipairs(rows) do
         local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
         local still_ours = slot_ptr >= r.buf_base and slot_ptr < r.buf_end
-        if still_ours and fnc_release_species_slot_run then
-            kh1_native.call_function(fnc_release_species_slot_run, r.slot_n, 1)
+        if still_ours then
+            local base = species_owner_table + r.slot_n * SLOT_STRIDE
+            WriteByte(base, 0xFF)
+            WriteByte(base + 2, 0)
+            WriteByte(base + 3, 0)
+            WriteLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE, 0)
             released = released + 1
         end
         redirect.release(r.row)
