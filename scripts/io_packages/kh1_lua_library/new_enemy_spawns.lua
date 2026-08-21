@@ -282,10 +282,17 @@ local function reclaim_dead_rows()
     local pending_rows = {}
     for _, p in pairs(pending_spawns) do pending_rows[p.row] = true end
     local alive = live_rows(rows)
-    local reclaimed = 0
+    local reclaimed, harvested = 0, 0
     for _, r in ipairs(rows) do
-        if pending_rows[r.row] or alive[r.row] then
+        if pending_rows[r.row] then
             dead_streak[r.row] = 0
+        elseif alive[r.row] then
+            dead_streak[r.row] = 0
+            if r.slot_n <= SLOT_MAX then
+                free_slot(r.slot_n)
+                redirect.set_row_slot(r.row, SLOT_NONE)
+                harvested = harvested + 1
+            end
         elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
             if r.slot_n <= SLOT_MAX then
                 local slot_ptr = ReadLong(loadedSpeciesPtrTable + r.slot_n * SLOT_STRIDE)
@@ -300,6 +307,7 @@ local function reclaim_dead_rows()
             dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
         end
     end
+    if harvested > 0 then log(string.format("harvested %d slot(s) for reuse", harvested)) end
 end
 
 local last_room_world, last_room_area, last_room_set = nil, nil, nil
