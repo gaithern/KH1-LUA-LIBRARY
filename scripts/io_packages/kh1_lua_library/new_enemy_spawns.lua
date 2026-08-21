@@ -33,6 +33,27 @@ local REUSE_ENABLED = false
 local pending_spawns = {}
 local installed = false
 
+local buffer_pool = {}
+
+local function acquire_buffer(need_size)
+    for i = #buffer_pool, 1, -1 do
+        local b = buffer_pool[i]
+        if b.size >= need_size then
+            table.remove(buffer_pool, i)
+            return b.addr, b.size
+        end
+    end
+    local addr = kh1_native.allocate(need_size)
+    if addr == 0 then return nil end
+    return addr, need_size
+end
+
+local function pool_buffer(addr, size)
+    if addr and addr ~= 0 and size and size > 0 then
+        buffer_pool[#buffer_pool + 1] = { addr = addr, size = size }
+    end
+end
+
 local function ensure_installed()
     if installed then return true end
     local ok, why = redirect.install()
@@ -256,6 +277,7 @@ local function reclaim_dead_rows()
     for _, r in ipairs(rows) do
         if not alive[r.row] and not pending_rows[r.row] then
             free_slot(r.slot_n)
+            pool_buffer(r.buf_base, r.buf_end - r.buf_base)
             redirect.release(r.row)
             reclaimed = reclaimed + 1
         end
@@ -278,6 +300,7 @@ local function release_all_on_room_change()
             free_slot(r.slot_n)
             released = released + 1
         end
+        pool_buffer(r.buf_base, r.buf_end - r.buf_base)
         redirect.release(r.row)
     end
     if #rows > 0 then log(string.format("room change: %d row(s), released %d still-ours slot(s)", #rows, released)) end
@@ -341,20 +364,20 @@ local function spawn_enemy(model_path, x, y, z)
 
     local slot = redirect.find_free_slot()
     if not slot then return fail("slots_full") end
-    local buf = kh1_native.allocate(buf_size)
-    if buf == 0 then return fail("buf_alloc_failed") end
-    local row = redirect.claim(buf, buf + buf_size, slot, hash)
-    if not row then kh1_native.free(buf); return fail("registry_full") end
-    log(string.format("%s -> slot=%d buf=0x%X size=0x%X row=%d", model_path, slot, buf, buf_size, row))
+    local buf, buf_actual = acquire_buffer(buf_size)
+    if not buf then return fail("buf_alloc_failed") end
+    local row = redirect.claim(buf, buf + buf_actual, slot, hash)
+    if not row then pool_buffer(buf, buf_actual); return fail("registry_full") end
+    log(string.format("%s -> slot=%d buf=0x%X size=0x%X row=%d", model_path, slot, buf, buf_actual, row))
 
     local ctx = splice_placement_record(slot, data.template, data.charId, data.weight, x, y, z)
     if not ctx then
-        redirect.release(row); kh1_native.free(buf)
+        redirect.release(row); pool_buffer(buf, buf_actual)
         return fail("splice_failed")
     end
 
     if not trigger_asset_load(ctx, model_path, data.motionPath, buf) then
-        rollback_splice(ctx); redirect.release(row); kh1_native.free(buf)
+        rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual)
         return fail("load_failed")
     end
     pending_spawns[model_path] = { ctx = ctx, buf = buf, row = row, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
