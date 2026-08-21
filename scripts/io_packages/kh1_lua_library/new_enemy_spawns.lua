@@ -29,6 +29,9 @@ local BLOB_HEADER_FIRST_SECTION   = 128
 local SPAWN_LOAD_TIMEOUT          = 5.0
 
 local REUSE_ENABLED = false
+-- Weight written into our spliced record. The constructor sums live-entity weights and returns 0
+-- ("budget full") once the room cap is exceeded, so a low value lets far more of our spawns fit.
+local SPAWN_WEIGHT = 1
 
 local pending_spawns = {}
 local installed = false
@@ -179,7 +182,7 @@ local function splice_placement_record(slot, template, char_id, weight, x, y, z)
     WriteShort(record + PLACEMENT_CHARID_OFF, char_id, true)
     WriteByte(record + PLACEMENT_SPECIES_OFF, slot, true)
     WriteByte(record + PLACEMENT_RUNLEN_OFF, 1, true)  -- 1 game slot for bookkeeping; data is ours
-    WriteByte(record + PLACEMENT_WEIGHT_OFF, weight, true)
+    WriteByte(record + PLACEMENT_WEIGHT_OFF, SPAWN_WEIGHT, true)
     WriteInt(record + PLACEMENT_MODEL_HANDLE_OFF, 0, true)
     WriteInt(record + PLACEMENT_MOTION_HANDLE_OFF, 0, true)
 
