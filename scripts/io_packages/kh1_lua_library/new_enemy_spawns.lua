@@ -231,7 +231,9 @@ end
 local ENTITY_POOL_STRIDE = 0x4B0
 local ENTITY_POOL_COUNT = 96
 local ENTITY_OCC_FLAG_OFF = 0x374
-local ENTITY_BLOB_HND_OFF = 0x154
+local ENTITY_BLOB_HND_OFFS = { 0x68, 0x134, 0x138, 0x13c, 0x154, 0x1d0, 0x1d4 }
+local RECLAIM_GRACE = 2
+local dead_streak = {}
 
 local function resolve_handle(h)
     if h == 0 then return 0 end
@@ -256,10 +258,12 @@ local function live_rows(rows)
     for i = 0, ENTITY_POOL_COUNT - 1 do
         local e = entityPoolBase + i * ENTITY_POOL_STRIDE
         if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then
-            local resolved = resolve_handle(ReadInt(e + ENTITY_BLOB_HND_OFF) & 0xFFFFFFFF)
-            if resolved ~= 0 then
-                for _, r in ipairs(rows) do
-                    if resolved >= r.buf_base and resolved < r.buf_end then alive[r.row] = true break end
+            for _, off in ipairs(ENTITY_BLOB_HND_OFFS) do
+                local resolved = resolve_handle(ReadInt(e + off) & 0xFFFFFFFF)
+                if resolved ~= 0 then
+                    for _, r in ipairs(rows) do
+                        if resolved >= r.buf_base and resolved < r.buf_end then alive[r.row] = true break end
+                    end
                 end
             end
         end
@@ -275,11 +279,16 @@ local function reclaim_dead_rows()
     local alive = live_rows(rows)
     local reclaimed = 0
     for _, r in ipairs(rows) do
-        if not alive[r.row] and not pending_rows[r.row] then
+        if pending_rows[r.row] or alive[r.row] then
+            dead_streak[r.row] = 0
+        elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
             free_slot(r.slot_n)
             pool_buffer(r.buf_base, r.buf_end - r.buf_base)
             redirect.release(r.row)
+            dead_streak[r.row] = nil
             reclaimed = reclaimed + 1
+        else
+            dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
         end
     end
     if reclaimed > 0 then log(string.format("reclaimed %d dead spawn slot(s)", reclaimed)) end
