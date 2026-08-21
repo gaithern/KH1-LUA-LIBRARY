@@ -38,19 +38,44 @@ local SPAWN_WEIGHT = 1
 local pending_spawns = {}
 local installed = false
 
+local ARENA_SIZE = 0x2000000
+local ARENA_CELL = RESOURCE_BLOB_SIZE
+local ARENA_CAP  = 6
+local arenas = {}
 local buffer_pool = {}
 
-local function acquire_buffer(need_size)
-    for i = #buffer_pool, 1, -1 do
-        local b = buffer_pool[i]
-        if b.size >= need_size then
-            table.remove(buffer_pool, i)
-            return b.addr, b.size, true
+local function arena_carve(need)
+    local sz = (need + (ARENA_CELL - 1)) & ~(ARENA_CELL - 1)
+    if sz > ARENA_SIZE then return nil end
+    for _, a in ipairs(arenas) do
+        if a.bump + sz <= ARENA_SIZE then
+            local addr = a.base + a.bump
+            a.bump = a.bump + sz
+            return addr, sz
         end
     end
-    local addr = kh1_native.allocate(need_size)
-    if addr == 0 then return nil end
-    return addr, need_size, false
+    if #arenas >= ARENA_CAP then return nil end
+    local raw = kh1_native.allocate(ARENA_SIZE * 2)
+    if raw == 0 then return nil end
+    local base = (raw + (ARENA_SIZE - 1)) & ~(ARENA_SIZE - 1)
+    arenas[#arenas + 1] = { base = base, bump = sz }
+    log(string.format("arena %d: base=0x%X (1 handle bucket)", #arenas, base))
+    return base, sz
+end
+
+local function acquire_buffer(need_size)
+    local best_i, best
+    for i = #buffer_pool, 1, -1 do
+        local b = buffer_pool[i]
+        if b.size >= need_size and (not best or b.size < best.size) then best_i, best = i, b end
+    end
+    if best then
+        table.remove(buffer_pool, best_i)
+        return best.addr, best.size, true
+    end
+    local addr, sz = arena_carve(need_size)
+    if not addr then return nil end
+    return addr, sz, false
 end
 
 local function pool_buffer(addr, size)
@@ -277,6 +302,17 @@ local function live_rows(rows)
 end
 
 local function reclaim_dead_rows()
+    local now_c = os.clock()
+    for model, p in pairs(pending_spawns) do
+        if now_c >= p.deadline then
+            pending_spawns[model] = nil
+            rollback_splice(p.ctx)
+            if p.ctx.slot and p.ctx.slot <= SLOT_MAX then free_slot(p.ctx.slot) end
+            redirect.release(p.row)
+            if p.size then pool_buffer(p.buf, p.size) end
+            log(string.format("swept stale load %s slot=%d row=%d", model, p.ctx.slot or -1, p.row))
+        end
+    end
     local rows = redirect.active_rows()
     if #rows == 0 then return end
     local pending_rows = {}
@@ -408,10 +444,11 @@ local function spawn_enemy(model_path, x, y, z)
         rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual)
         return fail("load_failed")
     end
-    pending_spawns[model_path] = { ctx = ctx, buf = buf, row = row, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
+    pending_spawns[model_path] = { ctx = ctx, buf = buf, size = buf_actual, row = row, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
     return false, "loading"
 end
 
 return {
     spawn_enemy = spawn_enemy,
+    slot_stats = redirect.slot_stats,
 }

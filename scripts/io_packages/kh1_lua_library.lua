@@ -975,6 +975,7 @@ return {
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_new_enemy_spawns.spawn_enemy,
+    spawn_slot_stats = kh1_new_enemy_spawns.slot_stats,
     update_spawn_enemy = kh1_enemy_spawns.update_spawn_enemy,
     can_spawn_enemy = kh1_enemy_spawns.can_spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,

@@ -64,6 +64,23 @@ local function find_free_slot()
 end
 M.find_free_slot = find_free_slot
 
+function M.slot_stats()
+    local owner_base = abs(RVA.species_tab)
+    local claimed = {}
+    local count = ci(OFF_REG_COUNT)
+    for i = 0, count - 1 do
+        local r = row_addr(i)
+        if ReadInt(r + ROW_ACTIVE, true) == 1 then claimed[ReadInt(r + ROW_SLOTN, true)] = true end
+    end
+    local free, ours = 0, 0
+    for s = FIRST_USABLE_SLOT, LAST_USABLE_SLOT do
+        local owned = ReadByte(owner_base + s * SLOT_STRIDE + SLOT_OWNER_OFF, true)
+        if claimed[s] then ours = ours + 1
+        elseif owned == OWNER_FREE then free = free + 1 end
+    end
+    return free, LAST_USABLE_SLOT - FIRST_USABLE_SLOT + 1, ours
+end
+
 function M.claim(buf_base, buf_end, slot_n, tag)
     local count = ci(OFF_REG_COUNT)
     local free = nil
