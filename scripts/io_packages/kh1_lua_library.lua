@@ -16,124 +16,17 @@
 --]]
 
 local kh1_native = require("kh1_native")
-local kh1_spawn_enemy = require("kh1_lua_library.spawn_enemy")
+local kh1_spawn_enemy = require("modules.spawn_enemy")
+local kh1_khscii = require("helpers.khscii")
+local kh1_text_boxes = require("modules.text_boxes")
+local kh1_prize_popup = require("modules.prize_popup")
+local kh1_level_up_prompt = require("modules.level_up_prompt")
+
+local GetKHSCII = kh1_khscii.GetKHSCII
 
 -- ########### --
 -- # Helpers # --
 -- ########### --
-
-local function GetKHSCII(INPUT)
-    -- Converts text to KHSCII, the game's proprietary text encoding.
-    local _charTable = {
-        [' '] =  0x01,
-        ['\n'] =  0x02,
-        ['-'] =  0x6E,
-        ['!'] =  0x5F,
-        ['?'] =  0x60,
-        ['%'] =  0x62,
-        ['/'] =  0x66,
-        ['.'] =  0x68,
-        [','] =  0x69,
-        [';'] =  0x6C,
-        [':'] =  0x6B,
-        ['\''] =  0x71,
-        ['('] =  0x74,
-        [')'] =  0x75,
-        ['['] =  0x76,
-        [']'] =  0x77,
-        ['¡'] =  0xCA,
-        ['¿'] =  0xCB,
-        ['À'] =  0xCC,
-        ['Á'] =  0xCD,
-        ['Â'] =  0xCE,
-        ['Ä'] =  0xCF,
-        ['Ç'] =  0xD0,
-        ['È'] =  0xD1,
-        ['É'] =  0xD2,
-        ['Ê'] =  0xD3,
-        ['Ë'] =  0xD4,
-        ['Ì'] =  0xD5,
-        ['Í'] =  0xD6,
-        ['Î'] =  0xD7,
-        ['Ï'] =  0xD8,
-        ['Ñ'] =  0xD9,
-        ['Ò'] =  0xDA,
-        ['Ó'] =  0xDB,
-        ['Ô'] =  0xDC,
-        ['Ö'] =  0xDD,
-        ['Ù'] =  0xDE,
-        ['Ú'] =  0xDF,
-        ['Û'] =  0xE0,
-        ['Ü'] =  0xE1,
-        ['ß'] =  0xE2,
-        ['à'] =  0xE3,
-        ['á'] =  0xE4,
-        ['â'] =  0xE5,
-        ['ä'] =  0xE6,
-        ['ç'] =  0xE7,
-        ['è'] =  0xE8,
-        ['é'] =  0xE9,
-        ['ê'] =  0xEA,
-        ['ë'] =  0xEB,
-        ['ì'] =  0xEC,
-        ['í'] =  0xED,
-        ['î'] =  0xEE,
-        ['ï'] =  0xEF,
-        ['ñ'] =  0xF0,
-        ['ò'] =  0xF1,
-        ['ó'] =  0xF2,
-        ['ô'] =  0xF3,
-        ['ö'] =  0xF4,
-        ['ù'] =  0xF5,
-        ['ú'] =  0xF6,
-        ['û'] =  0xF7,
-        ['ü'] =  0xF8
-    }
-
-    local _returnArray = {}
-
-    local i = 1
-    local z = 1
-
-    while z <= #INPUT do
-        local _literalHex = INPUT:match('^{0x(%x%x?)}', z)
-
-        if _literalHex then
-            _returnArray[i] = tonumber(_literalHex, 16)
-            z = z + 4 + #_literalHex
-            i = i + 1
-            goto continue
-        end
-
-        local _char = INPUT:sub(z, z)
-
-        if _char >= 'a' and _char <= 'z' then
-            _returnArray[i] = string.byte(_char) - 0x1C
-            z = z + 1
-        elseif _char >= 'A' and _char <= 'Z' then
-            _returnArray[i] = string.byte(_char) - 0x16
-            z = z + 1
-        elseif _char >= '0' and _char <= '9' then
-            _returnArray[i] = string.byte(_char) - 0x0F
-            z = z + 1
-        else
-            if _charTable[_char] ~= nil then
-                _returnArray[i] = _charTable[_char]
-                z = z + 1
-            else
-                _returnArray[i] = 0x01
-                z = z + 1
-            end
-        end
-
-        i = i + 1
-
-        ::continue::
-    end
-
-    table.insert(_returnArray, 0x00)
-    return _returnArray
-end
 
 local function byte_to_bits(byte)
     -- Converts 1 byte to array of 8 bits
@@ -648,91 +541,6 @@ local function multiply_summon_time(mult)
     WriteInt(summonTime, new_value)
 end
 
-local function partyActorRVA(z)
-    -- Gets the RVA of the Sora, Donald, or Goofy entity/actor pointer
-    if z == 1 then return soraPointer end
-    if z == 2 then return donaldPointer end
-    return goofyPointer
-end
-
-local promptBodyRingPos = {0, 0, 0}
-
-local function ClampKHSCII(khscii, maxBytes)
-    -- Clamps KHSCII data so it isn't too long for level up prompts
-    if #khscii <= maxBytes then
-        return khscii
-    end
-    local clamped = {}
-    for i = 1, maxBytes - 1 do
-        clamped[i] = khscii[i]
-    end
-    clamped[maxBytes] = 0x00
-    return clamped
-end
-
-local function show_prompt(input_title, input_party, duration, colour)
-    --[[ Credits to Topaz. Shows custom text in the level up box, using the
-    game's own box queue so more than one can be on screen at a time.]]
-    if colour == nil then
-        colour = 0
-    end
-
-    local allOk = true
-
-    for z = 1, 3 do
-        local _boxArray = input_party[z]
-        if _boxArray then
-            local actor_ptr = GetPointer(partyActorRVA(z))
-            if actor_ptr == 0 or ReadInt(actor_ptr + 0x130, true) == 0 then
-                allOk = false
-            else
-                local _titleAddress = textMemory + 0x20 * (z - 1)
-                local ringPos = promptBodyRingPos[z]
-                promptBodyRingPos[z] = (ringPos + 1) % 5
-                local _textAddress = (textMemory + 0x70) + (0x140 * (z - 1)) + (0x40 * ringPos)
-
-                if input_title[z] then
-                    WriteArray(_titleAddress, ClampKHSCII(GetKHSCII(input_title[z]), 0x20))
-                end
-                WriteArray(_textAddress, ClampKHSCII(GetKHSCII(_boxArray[1]), 0x20))
-                local line1_ptr = BASE_ADDR + _textAddress
-                local line2_ptr = 0
-                if _boxArray[2] then
-                    WriteArray(_textAddress + 0x20, ClampKHSCII(GetKHSCII(_boxArray[2]), 0x20))
-                    line2_ptr = BASE_ADDR + _textAddress + 0x20
-                end
-
-                local ok = kh1_native.call_function(fnc_enqueue_levelup_prompt, actor_ptr, line1_ptr, line2_ptr)
-                if not ok then
-                    allOk = false
-                else
-                    local found = nil
-                    for slot = 0, 2 do
-                        for q = 0, 4 do
-                            local boxAddr = boxMemory + slot * 0x3A20 + q * 0xBA0
-                            if ReadLong(boxAddr + 0x20) == line1_ptr then
-                                found = boxAddr
-                                break
-                            end
-                        end
-                        if found then break end
-                    end
-
-                    if found then
-                        WriteLong(found + 0x30, BASE_ADDR + _titleAddress)
-                        WriteLong(found + 0xB88, BASE_ADDR + colorBox + colour)
-                        WriteLong(found + 0xB90, BASE_ADDR + colorText + colour)
-                    else
-                        allOk = false
-                    end
-                end
-            end
-        end
-    end
-
-    return allOk
-end
-
 local function is_pressed(button_array, only)
     --[[Returns true if the buttons in button_array are pressed. If only is
     true, returns true only when no other buttons are pressed.]]
@@ -802,15 +610,6 @@ local function spawn_prize(item_id)
     return spawned
 end
 
-local function show_custom_item_popup(text)
-    --[[ Uses the in game function to force a map prize pickup box, with
-    injected bytes/memory so the text can be custom.]]
-    kh1_native.install_popup_text_hook(fnc_item_popup_text_hook, fnc_item_popup_text_resume, fnc_item_popup_text_call_target)
-    kh1_native.install_popup_completion_hook(fnc_item_popup_tick, fnc_item_popup_tick_resume, g_item_popup_state)
-    kh1_native.set_custom_popup_text(GetKHSCII(text))
-    return kh1_native.call_function(fnc_show_item_message, 1, 1)
-end
-
 local function play_se2(se_id, param_2)
     -- Plays a sound effect using the in game function.
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
@@ -839,83 +638,6 @@ local function heartless_angel_sora()
         end
         WriteByte(maxHP - 0x1, 1)
         WriteByte(maxHP - 0x1 + 2, 0)
-    end
-end
-
--- ######################## --
--- # Advanced: Text Boxes # --
--- ######################## --
-
--- Table for tracking open boxes
-local open_text_boxes = {}
-
-local function set_text_box_style(window_id, style)
-    -- Controls the style of text box.
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_005_set_window_type, {window_id, style})
-end
-
-local function set_text_box_position(window_id, x, y)
-    -- Controls text box position on screen.
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_003_set_window_position, {window_id, x, y})
-end
-
-local function set_text_box_size(window_id, width, height)
-    -- Controls box width/height.
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_004_set_window_size, {window_id, width, height})
-end
-
-local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
-    --[[ Opens a text box. Boxes normally reference predefined text, so ASM
-    and text memory are injected to allow custom text.]]
-    window_id = window_id or 1
-    if style ~= nil then
-        set_text_box_style(window_id, style)
-    end
-    if x ~= nil and y ~= nil then
-        set_text_box_position(window_id, x, y)
-    end
-    if width ~= nil and height ~= nil then
-        set_text_box_size(window_id, width, height)
-    end
-    kh1_native.install_textbox_hook(fnc_display_message_text_hook, fnc_display_message_text_resume)
-    kh1_native.install_textbox_anim_hook(fnc_display_message_anim_hook, fnc_display_message_anim_resume, fnc_display_message_anim_call_target)
-    kh1_native.set_textbox_text(GetKHSCII(text))
-    local opened = kh1_native.call_evdl_syscall(fnc_0B1_open_window_no_close, {window_id})
-    local displayed = kh1_native.call_evdl_syscall(fnc_001_display_message, {window_id, 0})
-    kh1_native.set_pending_text_box(window_id, fnc_002_close_window)
-    open_text_boxes[window_id] = {
-        deadline = (duration_seconds and duration_seconds > 0) and (os.clock() + duration_seconds) or nil,
-        open_world = get_world(),
-        open_room = get_room(),
-    }
-    return opened and displayed
-end
-
-local function close_text_box(window_id)
-    -- Closes text box
-    window_id = window_id or 1
-    open_text_boxes[window_id] = nil
-    kh1_native.clear_pending_text_box()
-    return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
-end
-
--- If the script is refreshed, clean up any open boxes
-kh1_native.close_pending_text_box()
-
-local function update_text_boxes()
-    -- Handles the timing mechanism for open text boxes.
-    local now = os.clock()
-    local current_world = get_world()
-    local current_room = get_room()
-    for window_id, box in pairs(open_text_boxes) do
-        local timed_out = box.deadline and now >= box.deadline
-        local transitioned = current_world ~= box.open_world or current_room ~= box.open_room
-        if timed_out or transitioned then
-            close_text_box(window_id)
-        end
     end
 end
 
@@ -970,7 +692,7 @@ return {
     allow_midair_dodge_roll_guard = allow_midair_dodge_roll_guard,
     allow_air_items = allow_air_items,
     multiply_summon_time = multiply_summon_time,
-    show_prompt = show_prompt,
+    show_prompt = kh1_level_up_prompt.show_prompt,
     GetKHSCII = GetKHSCII,
     is_pressed = is_pressed,
     is_in_gummi_garage = is_in_gummi_garage,
@@ -979,14 +701,14 @@ return {
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
-    show_custom_item_popup = show_custom_item_popup,
+    show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
     play_se2 = play_se2,
-    open_text_box = open_text_box,
-    close_text_box = close_text_box,
-    update_text_boxes = update_text_boxes,
-    set_text_box_style = set_text_box_style,
-    set_text_box_position = set_text_box_position,
-    set_text_box_size = set_text_box_size,
+    open_text_box = kh1_text_boxes.open_text_box,
+    close_text_box = kh1_text_boxes.close_text_box,
+    update_text_boxes = kh1_text_boxes.update_text_boxes,
+    set_text_box_style = kh1_text_boxes.set_text_box_style,
+    set_text_box_position = kh1_text_boxes.set_text_box_position,
+    set_text_box_size = kh1_text_boxes.set_text_box_size,
     sora_koed = sora_koed,
     ko_sora = ko_sora,
     heartless_angel_sora = heartless_angel_sora
