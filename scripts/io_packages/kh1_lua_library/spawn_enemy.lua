@@ -2,10 +2,181 @@
 
 local kh1_native = require("kh1_native")
 local kh1_creature_data = require("kh1_lua_library.creature_data")
-local redirect = require("kh1_lua_library.species_redirect")
 
 local native_log = kh1_native.log_debug or function(_) end
-local function log(msg) native_log("[new_spawn] " .. msg) end
+local function log(msg) native_log("[spawn_enemy] " .. msg) end
+
+-- ############################################################ --
+-- # Species-table redirect: persistent control block + caves  # --
+-- ############################################################ --
+
+local CTRL_KEY  = "kh1_species_redirect_v2"
+local CTRL_SIZE = 0x4000
+local MAGIC     = 0x52454432  -- 'RED2'
+
+local OFF_MAGIC     = 0x00
+local OFF_VERSION   = 0x04
+local OFF_CAVE2     = 0x08
+local OFF_COMP      = 0x10   -- address of the file-load completion cave
+local OFF_BLOB_BASE = 0x18
+local OFF_REG_COUNT = 0x28
+local OFF_DONE_FLAG = 0x30   -- completion cave sets this to 1
+local OFF_DONE_SIZE = 0x34   -- loaded size (ECX)
+local OFF_DONE_DEST = 0x38   -- loaded dest (R8)
+
+local ROWS_BASE  = 0x100
+local ROW_STRIDE = 0x40
+local ROW_BUFBASE = 0x00
+local ROW_BUFEND  = 0x08
+local ROW_MOTION  = 0x10   -- motion blob pointer (returned by cave2)
+local ROW_ACTIVE  = 0x18
+local ROW_TAG     = 0x1C
+local MAX_ROWS = (CTRL_SIZE - ROWS_BASE) // ROW_STRIDE
+
+local RD_RVA = {
+    hook2_entry  = 0x285db0,
+    hook2_resume = 0x285dbe,
+    blob_base    = 0xD2ADA0,
+}
+
+local ctrl = nil
+local module_base = nil
+
+local function abs(rva) return module_base + rva end
+local function ci(off) return ReadInt(ctrl + off, true) end
+local function wi(off, v) WriteInt(ctrl + off, v, true) end
+local function wl(off, v) WriteLong(ctrl + off, v, true) end
+local function row_addr(i) return ctrl + ROWS_BASE + i * ROW_STRIDE end
+
+local function rd_claim(buf_base, buf_end, tag)
+    local count = ci(OFF_REG_COUNT)
+    local free = nil
+    for i = 0, count - 1 do
+        if ReadInt(row_addr(i) + ROW_ACTIVE, true) == 0 then free = i break end
+    end
+    if not free then
+        if count >= MAX_ROWS then return nil end
+        free = count
+        wi(OFF_REG_COUNT, count + 1)
+    end
+    local r = row_addr(free)
+    WriteLong(r + ROW_BUFBASE, buf_base, true)
+    WriteLong(r + ROW_BUFEND, buf_end, true)
+    WriteLong(r + ROW_MOTION, 0, true)
+    WriteInt(r + ROW_TAG, tag or 0, true)
+    WriteInt(r + ROW_ACTIVE, 1, true)
+    return free
+end
+
+local function rd_release(row)
+    if row then WriteInt(row_addr(row) + ROW_ACTIVE, 0, true) end
+end
+
+local function rd_set_motion(row, ptr)
+    if row then WriteLong(row_addr(row) + ROW_MOTION, ptr, true) end
+end
+
+local function rd_active_rows()
+    local out = {}
+    local count = ci(OFF_REG_COUNT)
+    for i = 0, count - 1 do
+        local r = row_addr(i)
+        if ReadInt(r + ROW_ACTIVE, true) == 1 then
+            out[#out + 1] = {
+                row = i,
+                buf_base = ReadLong(r + ROW_BUFBASE, true),
+                buf_end = ReadLong(r + ROW_BUFEND, true),
+                motion = ReadLong(r + ROW_MOTION, true),
+                tag = ReadInt(r + ROW_TAG, true),
+            }
+        end
+    end
+    return out
+end
+
+local function rd_completion_addr() return ReadLong(ctrl + OFF_COMP, true) end
+local function rd_clear_done() wi(OFF_DONE_FLAG, 0) end
+local function rd_poll_done()
+    if ci(OFF_DONE_FLAG) == 0 then return nil end
+    return ReadLong(ctrl + OFF_DONE_DEST, true), ReadInt(ctrl + OFF_DONE_SIZE, true) & 0xFFFFFFFF
+end
+
+local sc = string.char
+local function jmp_abs(target)
+    return sc(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00) .. string.pack("<I8", target)
+end
+
+-- hook2 (FUN_140285db0) splice. For a blob addr inside one of our rows, return that row's motion
+-- pointer and RET; otherwise recompute the reverse-math index and fall through to the game's own
+-- species-table lookup at hook2_resume. Byte layout verified against capstone (jump offsets fixed).
+local function build_cave2()
+    return
+        sc(0x4C,0x8B,0xD1) ..                                   -- mov r10, rcx
+        sc(0x48,0xB8) .. string.pack("<I8", ctrl) ..            -- mov rax, ctrl
+        sc(0x44,0x8B,0x58,0x28) ..                              -- mov r11d, [rax+0x28]  (regCount)
+        sc(0x45,0x85,0xDB) ..                                   -- test r11d, r11d
+        sc(0x0F,0x84,0x3D,0x00,0x00,0x00) ..                    -- jz FALLBACK
+        sc(0x4C,0x8D,0x80,0x00,0x01,0x00,0x00) ..               -- lea r8, [rax+0x100] (rows)
+        sc(0x41,0x83,0x78,0x18,0x00) ..                         -- LOOP: cmp dword [r8+0x18], 0 (active)
+        sc(0x0F,0x84,0x1E,0x00,0x00,0x00) ..                    -- jz NEXT
+        sc(0x49,0x8B,0x00) ..                                   -- mov rax, [r8]      (bufBase)
+        sc(0x49,0x39,0xC2) ..                                   -- cmp r10, rax
+        sc(0x0F,0x82,0x12,0x00,0x00,0x00) ..                    -- jb NEXT
+        sc(0x49,0x8B,0x40,0x08) ..                              -- mov rax, [r8+8]    (bufEnd)
+        sc(0x49,0x39,0xC2) ..                                   -- cmp r10, rax
+        sc(0x0F,0x83,0x05,0x00,0x00,0x00) ..                    -- jae NEXT
+        sc(0x49,0x8B,0x40,0x10) ..                              -- mov rax, [r8+0x10] (motionPtr)
+        sc(0xC3) ..                                             -- ret
+        sc(0x49,0x83,0xC0,0x40) ..                              -- NEXT: add r8, 0x40
+        sc(0x41,0xFF,0xCB) ..                                   -- dec r11d
+        sc(0x0F,0x85,0xCA,0xFF,0xFF,0xFF) ..                    -- jnz LOOP
+        sc(0x48,0xB8) .. string.pack("<I8", abs(RD_RVA.blob_base)) .. -- FALLBACK: mov rax, blob_base
+        sc(0x48,0x2B,0xC8) ..                                   -- sub rcx, rax
+        sc(0x48,0xC1,0xE9,0x12) ..                              -- shr rcx, 0x12
+        jmp_abs(abs(RD_RVA.hook2_resume))                       -- jmp hook2_resume
+end
+
+-- File-load completion callback: (ECX=size, R8=dest). Stash both and raise a flag the driver polls.
+local function build_completion()
+    return
+        sc(0x48,0xB8) .. string.pack("<I8", ctrl + OFF_DONE_DEST) .. sc(0x4C,0x89,0x00) ..  -- mov [dest], r8
+        sc(0x48,0xB8) .. string.pack("<I8", ctrl + OFF_DONE_SIZE) .. sc(0x89,0x08) ..        -- mov [size], ecx
+        sc(0x48,0xB8) .. string.pack("<I8", ctrl + OFF_DONE_FLAG) .. sc(0xC7,0x00,0x01,0x00,0x00,0x00) .. -- mov [flag], 1
+        sc(0xC3)
+end
+
+local function rd_is_installed()
+    return ctrl ~= nil and ci(OFF_MAGIC) == MAGIC
+end
+
+local function rd_install()
+    module_base = kh1_native.get_module_base()
+    ctrl = kh1_native.persistent_block(CTRL_KEY, CTRL_SIZE)
+    if ctrl == 0 or ctrl == nil then return false, "persistent_block failed" end
+    if rd_is_installed() then return true, "already installed" end
+
+    local cave2 = kh1_native.allocate(0x200, 1)
+    local comp = kh1_native.allocate(0x80, 1)
+    if cave2 == 0 or comp == 0 then return false, "cave alloc failed" end
+
+    wl(OFF_BLOB_BASE, abs(RD_RVA.blob_base))
+    wl(OFF_CAVE2, cave2)
+    wl(OFF_COMP, comp)
+    wi(OFF_REG_COUNT, 0)
+    wi(OFF_DONE_FLAG, 0)
+
+    kh1_native.write_bytes(cave2, build_cave2())
+    kh1_native.write_bytes(comp, build_completion())
+    kh1_native.patch_code(abs(RD_RVA.hook2_entry), jmp_abs(cave2))
+
+    wi(OFF_VERSION, 2)
+    wi(OFF_MAGIC, MAGIC)
+    return true, "installed"
+end
+
+-- ############################################################ --
+-- # Spawn driver                                             # --
+-- ############################################################ --
 
 local PLACEMENT_RECORD_SIZE       = 0x78
 local PLACEMENT_ID_OFF            = 0x00
@@ -24,11 +195,13 @@ local RECORD_CATEGORY_ACTOR       = 3
 local RESOURCE_BLOB_SIZE          = 0x40000
 local BLOB_HEADER_FIRST_SECTION   = 128
 local SPAWN_LOAD_TIMEOUT          = 5.0
-local SPAWN_WEIGHT                = 1
+local SPAWN_WEIGHT                = 1  -- low weight so the room's concurrent-enemy budget fits many
 
 local pending_spawns = {}
 local installed = false
 
+-- Handle-bucket-bounded arena allocator: every buffer is carved from a few 32MB-aligned arenas so
+-- all buffers in one arena share ONE handle bucket (the game never frees buckets).
 local ARENA_SIZE = 0x2000000
 local ARENA_CELL = RESOURCE_BLOB_SIZE
 local ARENA_CAP  = 6
@@ -77,7 +250,7 @@ end
 
 local function ensure_installed()
     if installed then return true end
-    local ok, why = redirect.install()
+    local ok, why = rd_install()
     if not ok then log("redirect install failed: " .. tostring(why)); return false end
     installed = true
     return true
@@ -195,6 +368,8 @@ local function rollback_splice(ctx)
     WriteInt(placementTableCount, ctx.old_count)
 end
 
+-- Blob relocation, replicating exactly what hook1/motion-callback do (same functions, same args),
+-- minus the species-slot writes. If any fault, SafeCall returns false and we refuse the spawn.
 local function call_ok(fn, arg)
     return (kh1_native.call_function(fn, arg))
 end
@@ -275,7 +450,7 @@ end
 
 local function cleanup_pending(model_path, p)
     rollback_splice(p.ctx)
-    redirect.release(p.row)
+    rd_release(p.row)
     pool_buffer(p.buf, p.size)
     pending_spawns[model_path] = nil
 end
@@ -285,13 +460,13 @@ local function reclaim_dead_rows()
     for model, p in pairs(pending_spawns) do
         if now_c >= p.deadline + 2.0 then
             rollback_splice(p.ctx)
-            redirect.release(p.row)
+            rd_release(p.row)
             pool_buffer(p.buf, p.size)
             pending_spawns[model] = nil
             log("swept stale load " .. model)
         end
     end
-    local rows = redirect.active_rows()
+    local rows = rd_active_rows()
     if #rows == 0 then return end
     local pending_rows = {}
     for _, p in pairs(pending_spawns) do pending_rows[p.row] = true end
@@ -301,7 +476,7 @@ local function reclaim_dead_rows()
             dead_streak[r.row] = 0
         elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
             pool_buffer(r.buf_base, r.buf_end - r.buf_base)
-            redirect.release(r.row)
+            rd_release(r.row)
             dead_streak[r.row] = nil
         else
             dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
@@ -316,10 +491,10 @@ local function release_all_on_room_change()
     local w, a, s = ReadInt(g_WorldNumber), ReadInt(g_AreaNumber), ReadInt(g_SetNumber)
     if w == last_room_world and a == last_room_area and s == last_room_set then return end
     last_room_world, last_room_area, last_room_set = w, a, s
-    local rows = redirect.active_rows()
+    local rows = rd_active_rows()
     for _, r in ipairs(rows) do
         pool_buffer(r.buf_base, r.buf_end - r.buf_base)
-        redirect.release(r.row)
+        rd_release(r.row)
     end
     if #rows > 0 then log(string.format("room change: released %d row(s)", #rows)) end
     pending_spawns = {}
@@ -328,46 +503,48 @@ end
 local function queue_load(filename, dest)
     local fname = intern_path(filename)
     if fname == 0 then return false end
-    redirect.clear_done()
-    return (kh1_native.call_function(fnc_queue_file_load_to_address, fname, dest, redirect.completion_addr(), 0))
+    rd_clear_done()
+    return (kh1_native.call_function(fnc_queue_file_load_to_address, fname, dest, rd_completion_addr(), 0))
 end
 
+-- Drive a spawn already loading: model -> motion -> construct, one file at a time. The CC driver
+-- polls the same request every frame until it succeeds/fails, so only one load is ever in flight.
 local function drive_pending(model_path, p)
-    local dest = redirect.poll_done()
+    local dest = rd_poll_done()
     if p.stage == 0 then
         if dest ~= p.buf then
-            if dest then redirect.clear_done() end                 -- stale completion, ignore
+            if dest then rd_clear_done() end                       -- stale completion, ignore
             if os.clock() >= p.deadline then cleanup_pending(model_path, p); return false, "timeout" end
             return false, "loading"
         end
-        local _, size = redirect.poll_done()
-        redirect.clear_done()
+        local _, size = rd_poll_done()
+        rd_clear_done()
         if not model_fixup(p.buf) then cleanup_pending(model_path, p); return false, "load_failed" end
         local motion_dest = p.buf + ((size + 0x7F) & ~0x7F)
         if motion_dest + RESOURCE_BLOB_SIZE > p.buf + p.size then
             cleanup_pending(model_path, p); return false, "buf_alloc_failed"
         end
         p.motion_dest = motion_dest
-        redirect.set_motion(p.row, motion_dest)
+        rd_set_motion(p.row, motion_dest)
         if not queue_load(p.motion_path, motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
         p.stage = 1
         p.deadline = os.clock() + SPAWN_LOAD_TIMEOUT
         return false, "loading"
     elseif p.stage == 1 then
         if dest ~= p.motion_dest then
-            if dest then redirect.clear_done() end
+            if dest then rd_clear_done() end
             if os.clock() >= p.deadline then cleanup_pending(model_path, p); return false, "timeout" end
             return false, "loading"
         end
-        redirect.clear_done()
+        rd_clear_done()
         if not motion_fixup(p.motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
         p.stage = 2
     end
-
+    -- stage 2: construct (motion resolves through cave2 -> row.motion)
     local entity = construct_entity(p.ctx, p.buf)
     pending_spawns[model_path] = nil
     if entity then return true, entity end
-    rollback_splice(p.ctx); redirect.release(p.row); pool_buffer(p.buf, p.size)
+    rollback_splice(p.ctx); rd_release(p.row); pool_buffer(p.buf, p.size)
     return false, "ctor_failed"
 end
 
@@ -401,20 +578,20 @@ local function spawn_enemy(model_path, x, y, z)
     local buf, buf_actual = acquire_buffer(buf_size)
     if not buf then return fail("buf_alloc_failed") end
     local hash = model_hash(model_path)
-    local row = redirect.claim(buf, buf + buf_actual, hash)
+    local row = rd_claim(buf, buf + buf_actual, hash)
     if not row then pool_buffer(buf, buf_actual); return fail("registry_full") end
 
     local ctx = splice_placement_record(data.template, data.charId, x, y, z)
-    if not ctx then redirect.release(row); pool_buffer(buf, buf_actual); return fail("splice_failed") end
+    if not ctx then rd_release(row); pool_buffer(buf, buf_actual); return fail("splice_failed") end
 
     local buf_handle = mint_ptr_handle(buf)
     if not buf_handle then
-        rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual); return fail("mint_failed")
+        rollback_splice(ctx); rd_release(row); pool_buffer(buf, buf_actual); return fail("mint_failed")
     end
     WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)
 
     if not queue_load(model_path, buf) then
-        rollback_splice(ctx); redirect.release(row); pool_buffer(buf, buf_actual); return fail("load_failed")
+        rollback_splice(ctx); rd_release(row); pool_buffer(buf, buf_actual); return fail("load_failed")
     end
     log(string.format("%s -> buf=0x%X size=0x%X row=%d (loading)", model_path, buf, buf_actual, row))
     pending_spawns[model_path] = { ctx = ctx, buf = buf, size = buf_actual, row = row,
@@ -422,16 +599,6 @@ local function spawn_enemy(model_path, x, y, z)
     return false, "loading"
 end
 
-local function slot_stats()
-    local live = 0
-    for i = 0, ENTITY_POOL_COUNT - 1 do
-        local e = entityPoolBase + i * ENTITY_POOL_STRIDE
-        if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then live = live + 1 end
-    end
-    return ENTITY_POOL_COUNT - live, ENTITY_POOL_COUNT, 0
-end
-
 return {
     spawn_enemy = spawn_enemy,
-    slot_stats = slot_stats,
 }

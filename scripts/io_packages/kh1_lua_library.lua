@@ -16,7 +16,7 @@
 --]]
 
 local kh1_native = require("kh1_native")
-local kh1_new_enemy_spawns = require("kh1_lua_library.new_enemy_spawns")
+local kh1_spawn_enemy = require("kh1_lua_library.spawn_enemy")
 
 -- ########### --
 -- # Helpers # --
@@ -973,8 +973,7 @@ return {
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
-    spawn_enemy = kh1_new_enemy_spawns.spawn_enemy,
-    spawn_slot_stats = kh1_new_enemy_spawns.slot_stats,
+    spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     open_text_box = open_text_box,
