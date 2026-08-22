@@ -16,7 +16,7 @@
 --]]
 
 local kh1_native = require("kh1_native")
-local kh1_enemy_spawns = require("kh1_lua_library.enemy_spawns")
+local kh1_spawn_enemy = require("kh1_lua_library.spawn_enemy")
 
 -- ########### --
 -- # Helpers # --
@@ -774,6 +774,10 @@ local function is_in_gummi_garage()
     return ReadInt(inGummi) > 0
 end
 
+local function is_in_gummi()
+    return ReadInt(saveOpenAddress) == 7
+end
+
 local function grant_shared_ability(shared_ability_value)
     -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
@@ -970,12 +974,11 @@ return {
     GetKHSCII = GetKHSCII,
     is_pressed = is_pressed,
     is_in_gummi_garage = is_in_gummi_garage,
+    is_in_gummi = is_in_gummi,
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
-    spawn_enemy = kh1_enemy_spawns.spawn_enemy,
-    update_spawn_enemy = kh1_enemy_spawns.update_spawn_enemy,
-    can_spawn_enemy = kh1_enemy_spawns.can_spawn_enemy,
+    spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = show_custom_item_popup,
     play_se2 = play_se2,
     open_text_box = open_text_box,

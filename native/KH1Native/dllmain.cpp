@@ -146,6 +146,106 @@ extern "C" int l_write_floats(void* L) {
     return 1;
 }
 
+// allocate(size[, executable]) -> address (0 on failure). Reserves+commits process memory
+// the caller owns until free()'d; pass executable=1 for code caves.
+extern "C" int l_allocate(void* L) {
+    unsigned long long size = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    bool executable = p_lua_tointegerx(L, 2, nullptr) != 0;
+    if (size == 0) { p_lua_pushinteger(L, 0); return 1; }
+    DWORD prot = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    void* p = VirtualAlloc(nullptr, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, prot);
+    p_lua_pushinteger(L, (long long)(unsigned long long)p);
+    return 1;
+}
+
+// free(address) -> ok. Releases a region from allocate(). Freeing memory the game still
+// references corrupts it, so only free what nothing live points into.
+extern "C" int l_free(void* L) {
+    unsigned long long addr = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    bool ok = addr != 0 && VirtualFree((void*)(uintptr_t)addr, 0, MEM_RELEASE) != 0;
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+struct PersistBlock { char key[64]; void* addr; };
+static PersistBlock g_persistBlocks[32];
+static int g_persistCount = 0;
+
+extern "C" int l_persistent_block(void* L) {
+    size_t klen = 0;
+    const char* key = p_lua_tolstring(L, 1, &klen);
+    unsigned long long size = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    if (!key || klen == 0 || klen >= sizeof(g_persistBlocks[0].key)) { p_lua_pushinteger(L, 0); return 1; }
+    for (int i = 0; i < g_persistCount; ++i) {
+        if (memcmp(g_persistBlocks[i].key, key, klen) == 0 && g_persistBlocks[i].key[klen] == '\0') {
+            p_lua_pushinteger(L, (long long)(unsigned long long)g_persistBlocks[i].addr);
+            return 1;
+        }
+    }
+    if (g_persistCount >= 32 || size == 0) { p_lua_pushinteger(L, 0); return 1; }
+    void* p = VirtualAlloc(nullptr, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) { p_lua_pushinteger(L, 0); return 1; }
+    memcpy(g_persistBlocks[g_persistCount].key, key, klen);
+    g_persistBlocks[g_persistCount].key[klen] = '\0';
+    g_persistBlocks[g_persistCount].addr = p;
+    g_persistCount++;
+    p_lua_pushinteger(L, (long long)(unsigned long long)p);
+    return 1;
+}
+
+// copy_memory(dest, src, size) -> ok. SEH-guarded memcpy for absolute addresses.
+extern "C" int l_copy_memory(void* L) {
+    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long src = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    unsigned long long size = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
+    bool ok = false;
+    if (dest != 0 && src != 0 && size > 0) {
+        __try {
+            memcpy((void*)(uintptr_t)dest, (const void*)(uintptr_t)src, (size_t)size);
+            ok = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    }
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+// write_bytes(dest, str) -> ok. Writes a Lua string's raw bytes to an absolute address.
+extern "C" int l_write_bytes(void* L) {
+    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    size_t len = 0;
+    const char* src = p_lua_tolstring(L, 2, &len);
+    bool ok = false;
+    if (dest != 0 && src && len > 0) {
+        __try {
+            memcpy((void*)(uintptr_t)dest, src, len);
+            ok = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    }
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+extern "C" int l_patch_code(void* L) {
+    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    size_t len = 0;
+    const char* src = p_lua_tolstring(L, 2, &len);
+    bool ok = false;
+    if (dest != 0 && src && len > 0) {
+        DWORD oldProtect = 0;
+        if (VirtualProtect((void*)(uintptr_t)dest, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            __try {
+                memcpy((void*)(uintptr_t)dest, src, len);
+                ok = true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+            DWORD tmp = 0;
+            VirtualProtect((void*)(uintptr_t)dest, len, oldProtect, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)dest, len);
+        }
+    }
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
 
 // --- EVDL SYSCALL BRIDGE ---
 
@@ -790,16 +890,26 @@ extern "C" int l_clear_custom_popup_text(void* L) {
     return 0;
 }
 
-
-
+// Lets library Lua write into kh1_native.log, so script-side events (spawn queue changes)
+// interleave with the native spawn diagnostics they relate to.
+extern "C" int l_log_debug(void* L) {
+    const char* msg = p_lua_tolstring(L, 1, nullptr);
+    if (msg) LogDebug(msg);
+    return 0;
+}
 
 
 static const luaL_Reg kh1_native_lib[] = {
+    {"log_debug", reinterpret_cast<void*>(l_log_debug)},
     {"call_function", reinterpret_cast<void*>(l_call_function)},
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
-    {"spawn_enemy", reinterpret_cast<void*>(l_spawn_enemy)},
-    {"spawn_enemy_precheck", reinterpret_cast<void*>(l_spawn_enemy_precheck)},
+    {"allocate", reinterpret_cast<void*>(l_allocate)},
+    {"free", reinterpret_cast<void*>(l_free)},
+    {"copy_memory", reinterpret_cast<void*>(l_copy_memory)},
+    {"write_bytes", reinterpret_cast<void*>(l_write_bytes)},
+    {"patch_code", reinterpret_cast<void*>(l_patch_code)},
+    {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
     {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
     {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
     {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},

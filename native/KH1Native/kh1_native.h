@@ -36,8 +36,3 @@ void LogDebug(const char* msg);
 // Calls base-relative game code SEH-wrapped; false means it faulted.
 bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount,
               unsigned long long& outResult);
-
-// Enemy spawn (packages/spawn_enemy.cpp).
-extern "C" int l_spawn_enemy(void* L);
-// Read-only "would spawn_enemy refuse right now?" -- same gates, no side effects.
-extern "C" int l_spawn_enemy_precheck(void* L);
