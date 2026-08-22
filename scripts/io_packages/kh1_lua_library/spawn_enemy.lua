@@ -33,11 +33,7 @@ local ROW_ACTIVE  = 0x18
 local ROW_TAG     = 0x1C
 local MAX_ROWS = (CTRL_SIZE - ROWS_BASE) // ROW_STRIDE
 
-local RD_RVA = {
-    hook2_entry  = 0x285db0,
-    hook2_resume = 0x285dbe,
-    blob_base    = 0xD2ADA0,
-}
+local HOOK2_SPLICE_LEN = 14
 
 local ctrl = nil
 local module_base = nil
@@ -130,10 +126,10 @@ local function build_cave2()
         sc(0x49,0x83,0xC0,0x40) ..                              -- NEXT: add r8, 0x40
         sc(0x41,0xFF,0xCB) ..                                   -- dec r11d
         sc(0x0F,0x85,0xCA,0xFF,0xFF,0xFF) ..                    -- jnz LOOP
-        sc(0x48,0xB8) .. string.pack("<I8", abs(RD_RVA.blob_base)) .. -- FALLBACK: mov rax, blob_base
+        sc(0x48,0xB8) .. string.pack("<I8", abs(speciesResourceTable)) .. -- FALLBACK: mov rax, blob_base
         sc(0x48,0x2B,0xC8) ..                                   -- sub rcx, rax
         sc(0x48,0xC1,0xE9,0x12) ..                              -- shr rcx, 0x12
-        jmp_abs(abs(RD_RVA.hook2_resume))                       -- jmp hook2_resume
+        jmp_abs(abs(fnc_reverse_blob_to_slot_ptr + HOOK2_SPLICE_LEN)) -- jmp hook2_resume
 end
 
 -- File-load completion callback: (ECX=size, R8=dest). Stash both and raise a flag the driver polls.
@@ -159,7 +155,7 @@ local function rd_install()
     local comp = kh1_native.allocate(0x80, 1)
     if cave2 == 0 or comp == 0 then return false, "cave alloc failed" end
 
-    wl(OFF_BLOB_BASE, abs(RD_RVA.blob_base))
+    wl(OFF_BLOB_BASE, abs(speciesResourceTable))
     wl(OFF_CAVE2, cave2)
     wl(OFF_COMP, comp)
     wi(OFF_REG_COUNT, 0)
@@ -167,7 +163,7 @@ local function rd_install()
 
     kh1_native.write_bytes(cave2, build_cave2())
     kh1_native.write_bytes(comp, build_completion())
-    kh1_native.patch_code(abs(RD_RVA.hook2_entry), jmp_abs(cave2))
+    kh1_native.patch_code(abs(fnc_reverse_blob_to_slot_ptr), jmp_abs(cave2))
 
     wi(OFF_VERSION, 2)
     wi(OFF_MAGIC, MAGIC)
