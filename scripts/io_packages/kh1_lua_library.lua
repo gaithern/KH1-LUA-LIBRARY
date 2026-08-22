@@ -774,6 +774,10 @@ local function is_in_gummi_garage()
     return ReadInt(inGummi) > 0
 end
 
+local function is_in_gummi()
+    return ReadInt(saveOpenAddress) == 7
+end
+
 local function grant_shared_ability(shared_ability_value)
     -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
@@ -970,6 +974,7 @@ return {
     GetKHSCII = GetKHSCII,
     is_pressed = is_pressed,
     is_in_gummi_garage = is_in_gummi_garage,
+    is_in_gummi = is_in_gummi,
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
     spawn_prize = spawn_prize,
