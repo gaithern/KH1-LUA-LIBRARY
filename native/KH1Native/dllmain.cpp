@@ -225,32 +225,58 @@ extern "C" int l_write_bytes(void* L) {
     return 1;
 }
 
+// Defined in the hook section below; declared here so patch_code/allocate_near can use them.
+static void* AllocateNear(void* target, size_t size);
+static std::vector<HANDLE> SuspendOtherThreads();
+static void ResumeThreads(std::vector<HANDLE>& handles);
+
+// SEH-guarded memcpy in its own frame: __try can't coexist with C++ objects (C2712).
+static bool GuardedMemcpy(void* dst, const void* src, size_t len) {
+    __try {
+        memcpy(dst, src, len);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// patch_code(dest, str[, suspend]) -> ok. suspend=1 pauses all other threads during the
+// write so a hot call site can't execute a half-written patch.
 extern "C" int l_patch_code(void* L) {
     unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
     size_t len = 0;
     const char* src = p_lua_tolstring(L, 2, &len);
+    bool suspend = p_lua_tointegerx(L, 3, nullptr) != 0;
     bool ok = false;
     if (dest != 0 && src && len > 0) {
+        std::vector<HANDLE> threads;
+        if (suspend) threads = SuspendOtherThreads();
         DWORD oldProtect = 0;
         if (VirtualProtect((void*)(uintptr_t)dest, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            __try {
-                memcpy((void*)(uintptr_t)dest, src, len);
-                ok = true;
-            } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+            ok = GuardedMemcpy((void*)(uintptr_t)dest, src, len);
             DWORD tmp = 0;
             VirtualProtect((void*)(uintptr_t)dest, len, oldProtect, &tmp);
             FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)dest, len);
         }
+        if (suspend) ResumeThreads(threads);
     }
     p_lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
 
+// allocate_near(address, size) -> addr (0 on failure). Executable memory within rel32
+// range of `address`, for caves reached by E9/E8 from patched game code. Never freed.
+extern "C" int l_allocate_near(void* L) {
+    unsigned long long target = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
+    unsigned long long size = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
+    void* p = (target != 0 && size != 0) ? AllocateNear((void*)(uintptr_t)target, (SIZE_T)size) : nullptr;
+    p_lua_pushinteger(L, (long long)(unsigned long long)p);
+    return 1;
+}
 
 // --- EVDL SYSCALL BRIDGE ---
 
 // EVDL syscalls need a scriptCtx with a stack; this mocks one up rather than injecting into
-// the live context.
+// the live context. Kept native because the mocked-ctx layout (stack @+408, top idx @+404) is
+// engine-specific and the text-box Lua modules call it through call_evdl_syscall.
 
 static const unsigned long long MAX_SYSCALL_STACK = 32;
 static unsigned char g_scratchScriptCtx[4512] = {};
@@ -290,19 +316,11 @@ extern "C" int l_call_evdl_syscall(void* L) {
     return 2;
 }
 
-// --- POPUP TEXT HOOK ---
+// --- CODE-CAVE HELPERS ---
 
-// Custom text injection for the prize popup.
-
-// Buffer to hold custom prize text
-static unsigned char g_customTextBuffer[512] = {};
-
-// volatile: the injected game code writes this flag too.
-static volatile unsigned char g_customTextActive = 0;
-
-// Flag to handle whether the custom byte
-// code has been injected or not.
-static bool g_popupHookInstalled = false;
+// Shared by l_allocate_near and l_patch_code. The text box + prize popup code-cave splices that
+// used to live here now live in Lua modules (kh1_lua_library/text_boxes.lua, prize_popup.lua)
+// built on these primitives plus call_evdl_syscall above.
 
 // Finds executable memory near the target, since jmp/call have limited range.
 static void* AllocateNear(void* target, size_t size) {
@@ -363,532 +381,6 @@ static void ResumeThreads(std::vector<HANDLE>& handles) {
     handles.clear();
 }
 
-// --- TEXT BOX HOOK ---
-
-// Buffer to hold our custom text
-static unsigned char g_textBoxBuffer[512] = {};
-
-// volatile: the injected game code writes this flag too.
-static volatile unsigned char g_textBoxActive = 0;
-
-// Flags
-static bool g_textBoxHookInstalled = false;
-static bool g_textBoxAnimHookInstalled = false;
-
-// Points the text box at our custom buffer for the life of the box.
-static bool InstallTextBoxHook(unsigned long long hookAddr, unsigned long long resumeAddr) {
-    if (g_textBoxHookInstalled) return true;
-
-    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
-    bool movRdx = (hookPtr[0] == 0x4B) && (hookPtr[1] == 0x8B) && (hookPtr[2] == 0x94);
-    if (!movRdx) {
-        LogDebug("InstallTextBoxHook: unexpected original bytes at hook address, aborting");
-        return false;
-    }
-
-    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
-    if (!cave) {
-        LogDebug("InstallTextBoxHook: failed to allocate a nearby code cave");
-        return false;
-    }
-
-    unsigned char stub[64] = {};
-    size_t off = 0;
-    uint64_t flagAddr = (uint64_t)(uintptr_t)&g_textBoxActive;
-    uint64_t bufAddr = (uint64_t)(uintptr_t)&g_textBoxBuffer;
-
-    memcpy(stub + off, hookPtr, 8); off += 8; // replay original mov rdx,[r11+r10*8+disp32]
-
-    stub[off++] = 0x50; // push rax
-
-    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, flagAddr
-    memcpy(stub + off, &flagAddr, 8); off += 8;
-
-    stub[off++] = 0x80; stub[off++] = 0x38; stub[off++] = 0x01; // cmp byte ptr [rax],1
-
-    stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
-    size_t jneOperand = off; off += 4;
-
-    stub[off++] = 0xC6; stub[off++] = 0x00; stub[off++] = 0x00; // mov byte ptr [rax],0
-
-    stub[off++] = 0x48; stub[off++] = 0xBA; // mov rdx, bufAddr
-    memcpy(stub + off, &bufAddr, 8); off += 8;
-
-    size_t skipOverridePos = off;
-    stub[off++] = 0x58; // pop rax
-
-    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
-    size_t jmpBackOperand = off; off += 4;
-
-    size_t stubLen = off;
-    uintptr_t caveBase = (uintptr_t)cave;
-
-    int32_t jneRel = (int32_t)((int64_t)skipOverridePos - (int64_t)(jneOperand + 4));
-    memcpy(stub + jneOperand, &jneRel, 4);
-
-    int32_t jmpBackRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBackOperand + 4));
-    memcpy(stub + jmpBackOperand, &jmpBackRel, 4);
-
-    unsigned char patch[8];
-    patch[0] = 0xE9;
-    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
-    memcpy(patch + 1, &hookRel, 4);
-    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90; // NOP-pad the leftover 3 bytes of the 8-byte window
-
-    std::vector<HANDLE> threads = SuspendOtherThreads();
-
-    memcpy(cave, stub, stubLen);
-
-    DWORD oldProtect = 0;
-    VirtualProtect((void*)(uintptr_t)hookAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy((void*)(uintptr_t)hookAddr, patch, 8);
-    VirtualProtect((void*)(uintptr_t)hookAddr, 8, oldProtect, &oldProtect);
-
-    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 8);
-    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
-
-    ResumeThreads(threads);
-
-    g_textBoxHookInstalled = true;
-    LogDebug("InstallTextBoxHook: installed successfully");
-    return true;
-}
-
-// Lua-callable wrapper for the hook above,
-// takes the addresses as RVAs off the base.
-extern "C" int l_install_textbox_hook(void* L) {
-    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    bool ok = InstallTextBoxHook(base + hookRva, base + resumeRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-// Same as InstallTextBoxHook, for the per-character animation call site.
-static bool InstallTextBoxAnimHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
-    if (g_textBoxAnimHookInstalled) return true;
-
-    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
-    bool movRdx = (hookPtr[0] == 0x49) && (hookPtr[1] == 0x8B) && (hookPtr[2] == 0x14) && (hookPtr[3] == 0xD4);
-    bool callRel32 = (hookPtr[4] == 0xE8);
-    if (!movRdx || !callRel32) {
-        LogDebug("InstallTextBoxAnimHook: unexpected original bytes at hook address, aborting");
-        return false;
-    }
-
-    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
-    if (!cave) {
-        LogDebug("InstallTextBoxAnimHook: failed to allocate a nearby code cave");
-        return false;
-    }
-
-    unsigned char stub[64] = {};
-    size_t off = 0;
-    uint64_t flagAddr = (uint64_t)(uintptr_t)&g_textBoxActive;
-    uint64_t bufAddr = (uint64_t)(uintptr_t)&g_textBoxBuffer;
-
-    stub[off++] = 0x50; // push rax
-
-    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, flagAddr
-    memcpy(stub + off, &flagAddr, 8); off += 8;
-
-    stub[off++] = 0x80; stub[off++] = 0x38; stub[off++] = 0x01; // cmp byte ptr [rax],1
-
-    stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
-    size_t jneOperand = off; off += 4;
-
-    stub[off++] = 0xC6; stub[off++] = 0x00; stub[off++] = 0x00; // mov byte ptr [rax],0
-
-    stub[off++] = 0x48; stub[off++] = 0xBA; // mov rdx, bufAddr
-    memcpy(stub + off, &bufAddr, 8); off += 8;
-
-    stub[off++] = 0x58; // pop rax
-
-    stub[off++] = 0xE9; // jmp rel32 (patched below) -> continueCall
-    size_t jmpOperand = off; off += 4;
-
-    size_t useOriginalPos = off;
-    stub[off++] = 0x58; // pop rax
-    memcpy(stub + off, hookPtr, 4); off += 4; // replay original mov rdx,[r12+rdx*8]
-
-    size_t continueCallPos = off;
-    stub[off++] = 0xE8; // call rel32 (patched below)
-    size_t callOperand = off; off += 4;
-
-    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
-    size_t jmpBackOperand = off; off += 4;
-
-    size_t stubLen = off;
-    uintptr_t caveBase = (uintptr_t)cave;
-
-    int32_t jneRel = (int32_t)((int64_t)useOriginalPos - (int64_t)(jneOperand + 4));
-    memcpy(stub + jneOperand, &jneRel, 4);
-
-    int32_t jmpRel = (int32_t)((int64_t)continueCallPos - (int64_t)(jmpOperand + 4));
-    memcpy(stub + jmpOperand, &jmpRel, 4);
-
-    int32_t callRel = (int32_t)((int64_t)callTargetAddr - (int64_t)(caveBase + callOperand + 4));
-    memcpy(stub + callOperand, &callRel, 4);
-
-    int32_t jmpBackRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBackOperand + 4));
-    memcpy(stub + jmpBackOperand, &jmpBackRel, 4);
-
-    unsigned char patch[9];
-    patch[0] = 0xE9;
-    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
-    memcpy(patch + 1, &hookRel, 4);
-    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90; patch[8] = 0x90; // NOP-pad the leftover 4 bytes of the 9-byte window
-
-    std::vector<HANDLE> threads = SuspendOtherThreads();
-
-    memcpy(cave, stub, stubLen);
-
-    DWORD oldProtect = 0;
-    VirtualProtect((void*)(uintptr_t)hookAddr, 9, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy((void*)(uintptr_t)hookAddr, patch, 9);
-    VirtualProtect((void*)(uintptr_t)hookAddr, 9, oldProtect, &oldProtect);
-
-    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 9);
-    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
-
-    ResumeThreads(threads);
-
-    g_textBoxAnimHookInstalled = true;
-    LogDebug("InstallTextBoxAnimHook: installed successfully");
-    return true;
-}
-
-// Lua-callable wrapper for the hook above.
-extern "C" int l_install_textbox_anim_hook(void* L) {
-    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    unsigned long long callTargetRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
-    bool ok = InstallTextBoxAnimHook(base + hookRva, base + resumeRva, base + callTargetRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-// Copies the lua string (as a byte array) into
-// our buffer and flags the text box as active.
-extern "C" int l_set_textbox_text(void* L) {
-    unsigned long long len = p_lua_rawlen(L, 1);
-    const unsigned long long maxLen = sizeof(g_textBoxBuffer) - 1;
-    if (len > maxLen) len = maxLen;
-    for (unsigned long long i = 0; i < len; ++i) {
-        p_lua_rawgeti(L, 1, (long long)(i + 1));
-        g_textBoxBuffer[i] = (unsigned char)p_lua_tointegerx(L, -1, nullptr);
-        p_lua_settop(L, -2);
-    }
-    g_textBoxBuffer[len] = 0;
-    g_textBoxActive = 1;
-    return 0;
-}
-
-// Turns off the text box override flag.
-extern "C" int l_clear_textbox_text(void* L) {
-    g_textBoxActive = 0;
-    return 0;
-}
-
-// --- PENDING TEXT BOX TRACKING ---
-
-// Tracks the most recent text box so Lua can close it without tracking ids.
-static volatile long g_pendingTextBoxWindowId = -1;
-static volatile unsigned long long g_pendingTextBoxCloseRva = 0;
-
-// Records the window id and close function RVA
-// for the currently open text box.
-extern "C" int l_set_pending_text_box(void* L) {
-    g_pendingTextBoxWindowId = (long)p_lua_tointegerx(L, 1, nullptr);
-    g_pendingTextBoxCloseRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    return 0;
-}
-
-// Clears the tracked window without closing it.
-extern "C" int l_clear_pending_text_box(void* L) {
-    g_pendingTextBoxWindowId = -1;
-    g_pendingTextBoxCloseRva = 0;
-    return 0;
-}
-
-// Closes the tracked text box, mocking a scriptCtx like call_evdl_syscall.
-extern "C" int l_close_pending_text_box(void* L) {
-    if (g_pendingTextBoxWindowId < 0 || g_pendingTextBoxCloseRva == 0) {
-        p_lua_pushboolean(L, 0);
-        return 1;
-    }
-
-    memset(g_scratchScriptCtx, 0, sizeof(g_scratchScriptCtx));
-    int32_t windowId = (int32_t)g_pendingTextBoxWindowId;
-    memcpy(g_scratchScriptCtx + 408, &windowId, 4);
-    int32_t stackIdx = 0;
-    memcpy(g_scratchScriptCtx + 404, &stackIdx, 4);
-
-    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long address = base + g_pendingTextBoxCloseRva;
-    unsigned long long args[1] = { (unsigned long long)(uintptr_t)g_scratchScriptCtx };
-    unsigned long long result = 0;
-    bool ok = SafeCall(address, args, 1, result);
-
-    if (!ok) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "close_pending_text_box crashed: windowId=%ld rva=0x%llx",
-            g_pendingTextBoxWindowId, g_pendingTextBoxCloseRva);
-        LogDebug(msg);
-    }
-
-    g_pendingTextBoxWindowId = -1;
-    g_pendingTextBoxCloseRva = 0;
-
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-// Swaps our buffer into the prize popup's text pointer while the flag is set.
-static bool InstallPopupTextHook(unsigned long long hookAddr, unsigned long long resumeAddr, unsigned long long callTargetAddr) {
-    if (g_popupHookInstalled) return true;
-
-    unsigned char* hookPtr = (unsigned char*)(uintptr_t)hookAddr;
-    bool movRdiRax = (hookPtr[0] == 0x48) &&
-        ((hookPtr[1] == 0x8B && hookPtr[2] == 0xF8) || (hookPtr[1] == 0x89 && hookPtr[2] == 0xC7));
-    bool callRel32 = (hookPtr[3] == 0xE8);
-    if (!movRdiRax || !callRel32) {
-        LogDebug("InstallPopupTextHook: unexpected original bytes at hook address, aborting");
-        return false;
-    }
-
-    void* cave = AllocateNear((void*)(uintptr_t)hookAddr, 4096);
-    if (!cave) {
-        LogDebug("InstallPopupTextHook: failed to allocate a nearby code cave");
-        return false;
-    }
-
-    unsigned char stub[64] = {};
-    size_t off = 0;
-    uint64_t flagAddr = (uint64_t)(uintptr_t)&g_customTextActive;
-    uint64_t bufAddr = (uint64_t)(uintptr_t)&g_customTextBuffer;
-
-    stub[off++] = 0x50; // push rax
-
-    stub[off++] = 0x48; stub[off++] = 0xB8; // mov rax, flagAddr
-    memcpy(stub + off, &flagAddr, 8); off += 8;
-
-    stub[off++] = 0x80; stub[off++] = 0x38; stub[off++] = 0x01; // cmp byte ptr [rax],1
-
-    stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
-    size_t jneOperand = off; off += 4;
-
-    stub[off++] = 0x48; stub[off++] = 0xBF; // mov rdi, bufAddr
-    memcpy(stub + off, &bufAddr, 8); off += 8;
-
-    stub[off++] = 0x58; // pop rax
-
-    stub[off++] = 0xE9; // jmp rel32 (patched below) -> continueCall
-    size_t jmpOperand = off; off += 4;
-
-    size_t useOriginalPos = off;
-    stub[off++] = 0x58; // pop rax
-    stub[off++] = 0x48; stub[off++] = 0x8B; stub[off++] = 0xF8; // mov rdi,rax
-
-    size_t continueCallPos = off;
-    stub[off++] = 0xE8; // call rel32 (patched below)
-    size_t callOperand = off; off += 4;
-
-    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
-    size_t jmpBackOperand = off; off += 4;
-
-    size_t stubLen = off;
-    uintptr_t caveBase = (uintptr_t)cave;
-
-    int32_t jneRel = (int32_t)((int64_t)useOriginalPos - (int64_t)(jneOperand + 4));
-    memcpy(stub + jneOperand, &jneRel, 4);
-
-    int32_t jmpRel = (int32_t)((int64_t)continueCallPos - (int64_t)(jmpOperand + 4));
-    memcpy(stub + jmpOperand, &jmpRel, 4);
-
-    int32_t callRel = (int32_t)((int64_t)callTargetAddr - (int64_t)(caveBase + callOperand + 4));
-    memcpy(stub + callOperand, &callRel, 4);
-
-    int32_t jmpBackRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBackOperand + 4));
-    memcpy(stub + jmpBackOperand, &jmpBackRel, 4);
-
-    unsigned char patch[8];
-    patch[0] = 0xE9;
-    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(hookAddr + 5));
-    memcpy(patch + 1, &hookRel, 4);
-    patch[5] = 0x90; patch[6] = 0x90; patch[7] = 0x90; // NOP-pad the leftover 3 bytes of the 8-byte window
-
-    std::vector<HANDLE> threads = SuspendOtherThreads();
-
-    memcpy(cave, stub, stubLen);
-
-    DWORD oldProtect = 0;
-    VirtualProtect((void*)(uintptr_t)hookAddr, 8, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy((void*)(uintptr_t)hookAddr, patch, 8);
-    VirtualProtect((void*)(uintptr_t)hookAddr, 8, oldProtect, &oldProtect);
-
-    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)hookAddr, 8);
-    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
-
-    ResumeThreads(threads);
-
-    g_popupHookInstalled = true;
-    LogDebug("InstallPopupTextHook: installed successfully");
-    return true;
-}
-
-// Lua-callable wrapper for the hook above.
-extern "C" int l_install_popup_text_hook(void* L) {
-    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long hookRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    unsigned long long callTargetRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
-    bool ok = InstallPopupTextHook(base + hookRva, base + resumeRva, base + callTargetRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-// --- POPUP COMPLETION HOOK ---
-
-// Detects when the prize popup finishes so the custom-text flag can be cleared.
-
-// Previous popup state, so the transition back to 0 (closed) can be detected.
-static uint32_t g_prevPopupState = 0;
-static bool g_popupCompletionHookInstalled = false;
-
-// Watches the popup's state and clears the custom-text flag when it closes.
-static bool InstallPopupCompletionHook(unsigned long long tickAddr, unsigned long long resumeAddr, unsigned long long stateAddr) {
-    if (g_popupCompletionHookInstalled) return true;
-
-    unsigned char* tickPtr = (unsigned char*)(uintptr_t)tickAddr;
-    static const unsigned char expected[6] = { 0x48, 0x83, 0xEC, 0x28, 0x33, 0xD2 };
-    if (memcmp(tickPtr, expected, 6) != 0) {
-        LogDebug("InstallPopupCompletionHook: unexpected original bytes at tick address, aborting");
-        return false;
-    }
-
-    void* cave = AllocateNear((void*)(uintptr_t)tickAddr, 4096);
-    if (!cave) {
-        LogDebug("InstallPopupCompletionHook: failed to allocate a nearby code cave");
-        return false;
-    }
-
-    unsigned char stub[96] = {};
-    size_t off = 0;
-    uint64_t stateAddrImm = stateAddr;
-    uint64_t prevAddrImm = (uint64_t)(uintptr_t)&g_prevPopupState;
-    uint64_t flagAddrImm = (uint64_t)(uintptr_t)&g_customTextActive;
-
-    stub[off++] = 0x50;             // push rax
-    stub[off++] = 0x41; stub[off++] = 0x52; // push r10
-    stub[off++] = 0x41; stub[off++] = 0x53; // push r11
-
-    stub[off++] = 0x49; stub[off++] = 0xBA; // mov r10, stateAddr
-    memcpy(stub + off, &stateAddrImm, 8); off += 8;
-    stub[off++] = 0x41; stub[off++] = 0x8B; stub[off++] = 0x02; // mov eax, dword ptr [r10]
-
-    stub[off++] = 0x49; stub[off++] = 0xBB; // mov r11, prevAddr
-    memcpy(stub + off, &prevAddrImm, 8); off += 8;
-    stub[off++] = 0x45; stub[off++] = 0x8B; stub[off++] = 0x13; // mov r10d, dword ptr [r11]
-
-    stub[off++] = 0x41; stub[off++] = 0x83; stub[off++] = 0xFA; stub[off++] = 0x00; // cmp r10d,0
-    stub[off++] = 0x0F; stub[off++] = 0x84; // je rel32 (patched below)
-    size_t jeOperand = off; off += 4;
-
-    stub[off++] = 0x83; stub[off++] = 0xF8; stub[off++] = 0x00; // cmp eax,0
-    stub[off++] = 0x0F; stub[off++] = 0x85; // jne rel32 (patched below)
-    size_t jneOperand = off; off += 4;
-
-    stub[off++] = 0x49; stub[off++] = 0xBA; // mov r10, flagAddr
-    memcpy(stub + off, &flagAddrImm, 8); off += 8;
-    stub[off++] = 0x41; stub[off++] = 0xC6; stub[off++] = 0x02; stub[off++] = 0x00; // mov byte ptr [r10],0
-
-    size_t skipClearPos = off;
-    stub[off++] = 0x49; stub[off++] = 0xBA; // mov r10, prevAddr
-    memcpy(stub + off, &prevAddrImm, 8); off += 8;
-    stub[off++] = 0x41; stub[off++] = 0x89; stub[off++] = 0x02; // mov dword ptr [r10],eax
-
-    stub[off++] = 0x41; stub[off++] = 0x5B; // pop r11
-    stub[off++] = 0x41; stub[off++] = 0x5A; // pop r10
-    stub[off++] = 0x58;                     // pop rax
-
-    stub[off++] = 0x48; stub[off++] = 0x83; stub[off++] = 0xEC; stub[off++] = 0x28; // sub rsp,0x28
-    stub[off++] = 0x33; stub[off++] = 0xD2; // xor edx,edx
-
-    stub[off++] = 0xE9; // jmp rel32 (patched below) -> resumeAddr
-    size_t jmpBackOperand = off; off += 4;
-
-    size_t stubLen = off;
-    uintptr_t caveBase = (uintptr_t)cave;
-
-    int32_t jeRel = (int32_t)((int64_t)skipClearPos - (int64_t)(jeOperand + 4));
-    memcpy(stub + jeOperand, &jeRel, 4);
-
-    int32_t jneRel = (int32_t)((int64_t)skipClearPos - (int64_t)(jneOperand + 4));
-    memcpy(stub + jneOperand, &jneRel, 4);
-
-    int32_t jmpBackRel = (int32_t)((int64_t)resumeAddr - (int64_t)(caveBase + jmpBackOperand + 4));
-    memcpy(stub + jmpBackOperand, &jmpBackRel, 4);
-
-    unsigned char patch[6];
-    patch[0] = 0xE9;
-    int32_t hookRel = (int32_t)((int64_t)caveBase - (int64_t)(tickAddr + 5));
-    memcpy(patch + 1, &hookRel, 4);
-    patch[5] = 0x90; // NOP-pad the 1 leftover byte of the 6-byte window
-
-    std::vector<HANDLE> threads = SuspendOtherThreads();
-
-    memcpy(cave, stub, stubLen);
-
-    DWORD oldProtect = 0;
-    VirtualProtect((void*)(uintptr_t)tickAddr, 6, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy((void*)(uintptr_t)tickAddr, patch, 6);
-    VirtualProtect((void*)(uintptr_t)tickAddr, 6, oldProtect, &oldProtect);
-
-    FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)tickAddr, 6);
-    FlushInstructionCache(GetCurrentProcess(), cave, stubLen);
-
-    ResumeThreads(threads);
-
-    g_popupCompletionHookInstalled = true;
-    LogDebug("InstallPopupCompletionHook: installed successfully");
-    return true;
-}
-
-// Lua-callable wrapper for the hook above.
-extern "C" int l_install_popup_completion_hook(void* L) {
-    unsigned long long base = (unsigned long long)GetModuleHandleA(nullptr);
-    unsigned long long tickRva = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    unsigned long long resumeRva = (unsigned long long)p_lua_tointegerx(L, 2, nullptr);
-    unsigned long long stateRva = (unsigned long long)p_lua_tointegerx(L, 3, nullptr);
-    bool ok = InstallPopupCompletionHook(base + tickRva, base + resumeRva, base + stateRva);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-// Copies the lua string (as a byte array) into
-// our buffer and flags the popup text as active.
-extern "C" int l_set_custom_popup_text(void* L) {
-    unsigned long long len = p_lua_rawlen(L, 1);
-    const unsigned long long maxLen = sizeof(g_customTextBuffer) - 1;
-    if (len > maxLen) len = maxLen;
-    for (unsigned long long i = 0; i < len; ++i) {
-        p_lua_rawgeti(L, 1, (long long)(i + 1));
-        g_customTextBuffer[i] = (unsigned char)p_lua_tointegerx(L, -1, nullptr);
-        p_lua_settop(L, -2);
-    }
-    g_customTextBuffer[len] = 0;
-    g_customTextActive = 1;
-    return 0;
-}
-
-// Turns off the custom popup text flag.
-extern "C" int l_clear_custom_popup_text(void* L) {
-    g_customTextActive = 0;
-    return 0;
-}
 
 // Lets library Lua write into kh1_native.log, so script-side events (spawn queue changes)
 // interleave with the native spawn diagnostics they relate to.
@@ -905,23 +397,13 @@ static const luaL_Reg kh1_native_lib[] = {
     {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
     {"allocate", reinterpret_cast<void*>(l_allocate)},
+    {"allocate_near", reinterpret_cast<void*>(l_allocate_near)},
     {"free", reinterpret_cast<void*>(l_free)},
     {"copy_memory", reinterpret_cast<void*>(l_copy_memory)},
     {"write_bytes", reinterpret_cast<void*>(l_write_bytes)},
     {"patch_code", reinterpret_cast<void*>(l_patch_code)},
     {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
-    {"install_popup_text_hook", reinterpret_cast<void*>(l_install_popup_text_hook)},
-    {"install_popup_completion_hook", reinterpret_cast<void*>(l_install_popup_completion_hook)},
-    {"set_custom_popup_text", reinterpret_cast<void*>(l_set_custom_popup_text)},
-    {"clear_custom_popup_text", reinterpret_cast<void*>(l_clear_custom_popup_text)},
     {"call_evdl_syscall", reinterpret_cast<void*>(l_call_evdl_syscall)},
-    {"install_textbox_hook", reinterpret_cast<void*>(l_install_textbox_hook)},
-    {"install_textbox_anim_hook", reinterpret_cast<void*>(l_install_textbox_anim_hook)},
-    {"set_textbox_text", reinterpret_cast<void*>(l_set_textbox_text)},
-    {"clear_textbox_text", reinterpret_cast<void*>(l_clear_textbox_text)},
-    {"set_pending_text_box", reinterpret_cast<void*>(l_set_pending_text_box)},
-    {"clear_pending_text_box", reinterpret_cast<void*>(l_clear_pending_text_box)},
-    {"close_pending_text_box", reinterpret_cast<void*>(l_close_pending_text_box)},
     {nullptr, nullptr}
 };
 

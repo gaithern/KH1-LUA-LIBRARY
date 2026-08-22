@@ -1,7 +1,7 @@
 ---@diagnostic disable: undefined-global
 
 local kh1_native = require("kh1_native")
-local kh1_creature_data = require("kh1_lua_library.creature_data")
+local kh1_creature_data = require("modules.creature_data")
 
 local native_log = kh1_native.log_debug or function(_) end
 local function log(msg) native_log("[spawn_enemy] " .. msg) end

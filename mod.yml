@@ -18,6 +18,14 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/VersionCheck.lua
+- name: scripts/io_packages/helpers/code_cave.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/helpers/code_cave.lua
+- name: scripts/io_packages/helpers/khscii.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/helpers/khscii.lua
 - name: scripts/io_packages/json.lua
   method: copy
   source:
@@ -26,15 +34,27 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/kh1_lua_library.lua
-- name: scripts/io_packages/kh1_lua_library/creature_data.lua
-  method: copy
-  source:
-  - name: scripts/io_packages/kh1_lua_library/creature_data.lua
-- name: scripts/io_packages/kh1_lua_library/spawn_enemy.lua
-  method: copy
-  source:
-  - name: scripts/io_packages/kh1_lua_library/spawn_enemy.lua
 - name: scripts/io_packages/kh1_native.dll
   method: copy
   source:
   - name: scripts/io_packages/kh1_native.dll
+- name: scripts/io_packages/modules/creature_data.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/creature_data.lua
+- name: scripts/io_packages/modules/level_up_prompt.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/level_up_prompt.lua
+- name: scripts/io_packages/modules/prize_popup.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/prize_popup.lua
+- name: scripts/io_packages/modules/spawn_enemy.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/spawn_enemy.lua
+- name: scripts/io_packages/modules/text_boxes.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/text_boxes.lua
