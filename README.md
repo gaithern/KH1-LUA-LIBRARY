@@ -95,7 +95,8 @@ spelling instead would break the `/Yu"pch.h"` precompiled-header match.
 - **Writes**: animation speed, combo limits, movement speed, spell effectiveness/cost,
   attack/command data, gummi quantities, granting abilities, and more.
 - **Gameplay tweaks**: force scan mode, force combo master, allow summoning anywhere,
-  allow midair dodge roll guard, allow air items, multiply summon time.
+  allow midair dodge roll guard, allow air items, multiply summon time,
+  damage-cap control (on/off/fixed value, see below).
 - **UI**: on-screen input prompts, custom item popup text, spawning prizes, opening/closing
   custom text boxes, playing sound effects.
 - **Bit/byte helpers**: `ReadBit`/`WriteBit`/`ReadBits`, KHSCII string conversion
@@ -122,6 +123,17 @@ the real call.
 
 `code` is the same short refusal code `spawn_enemy` itself returns (and now passes to its
 callback as a fourth argument), so both paths can share one mapping table.
+
+### `set_damage_cap`
+
+Each enemy's `.bd` battle-param block carries a u16 "max damage per hit" cap (blob offset
+0x10, runtime battleParams+0xC2, applied in the hit-damage formula before elemental
+multipliers). `set_damage_cap(mode)` patches that clamp in place:
+
+- `"on"` (or `true`) — restore normal behavior: each enemy's own cap applies.
+- `"off"` (or `false`) — the clamp's JZ becomes a JMP; damage is never capped.
+- integer `N` (1..0x7FFFFFFF) — the clamp always applies with `N` for every enemy,
+  e.g. `set_damage_cap(1)` makes every hit deal 1 (before multipliers).
 
 Anything that needs to call into real game code (rather than just read/write memory) is
 routed through `kh1_native.dll` via `require("kh1_native")`.
