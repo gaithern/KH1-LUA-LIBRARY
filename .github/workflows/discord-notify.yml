@@ -27,7 +27,7 @@ jobs:
           pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
                 --jq '[.[] | select(.merged_at != null)][0] // empty' || true)
           if [ -n "$pr" ]; then
-            title=$(jq -r '.head.ref + ": " + .title + " — #" + (.number|tostring)' <<<"$pr")
+            title=$(jq -r '.title + " — #" + (.number|tostring)' <<<"$pr")
             url=$(jq -r '.html_url' <<<"$pr")
           else
             title="$(jq -r '.pusher.name' "$GITHUB_EVENT_PATH") pushed $count commit(s) to $(jq -r '.repository.name' "$GITHUB_EVENT_PATH"):main"
