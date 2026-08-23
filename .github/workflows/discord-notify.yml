@@ -1,0 +1,43 @@
+name: Discord notification
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post commits to Discord
+        env:
+          # One Discord webhook URL per slot; unset slots are skipped
+          WEBHOOK_URLS: |
+            ${{ secrets.DISCORD_WEBHOOK_URL }}
+            ${{ secrets.DISCORD_WEBHOOK_URL_2 }}
+            ${{ secrets.DISCORD_WEBHOOK_URL_3 }}
+            ${{ secrets.DISCORD_WEBHOOK_URL_4 }}
+        run: |
+          count=$(jq '.commits | length' "$GITHUB_EVENT_PATH")
+          if [ "$count" -eq 0 ]; then
+            echo "No commits in push event (tag/branch create?), skipping."
+            exit 0
+          fi
+          # Embed description: one line per commit, truncated to Discord's 4096-char limit
+          jq -n --slurpfile e "$GITHUB_EVENT_PATH" '
+            $e[0] as $ev |
+            ($ev.commits | map(
+              "[`" + .id[0:7] + "`](" + .url + ") " + (.message | split("\n")[0]) + " — " + .author.name
+            ) | join("\n") | .[0:4096]) as $desc |
+            {
+              embeds: [{
+                title: ("\($ev.commits | length) new commit(s) to \($ev.repository.name):main"),
+                url: $ev.compare,
+                description: $desc,
+                color: 5793266,
+                footer: { text: ("pushed by " + $ev.pusher.name) }
+              }]
+            }' > payload.json
+          echo "$WEBHOOK_URLS" | while IFS= read -r url; do
+            [ -n "$url" ] || continue
+            curl -sf -H "Content-Type: application/json" -d @payload.json "$url"
+          done
