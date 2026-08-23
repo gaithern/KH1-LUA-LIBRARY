@@ -95,36 +95,12 @@ spelling instead would break the `/Yu"pch.h"` precompiled-header match.
 - **Writes**: animation speed, combo limits, movement speed, spell effectiveness/cost,
   attack/command data, gummi quantities, granting abilities, and more.
 - **Gameplay tweaks**: force scan mode, force combo master, allow summoning anywhere,
-  allow midair dodge roll guard, allow air items, multiply summon time.
+  allow midair dodge roll guard, allow air items, multiply summon time,
+  damage-cap control (on/off/fixed value, see below).
 - **UI**: on-screen input prompts, custom item popup text, spawning prizes, opening/closing
   custom text boxes, playing sound effects.
 - **Bit/byte helpers**: `ReadBit`/`WriteBit`/`ReadBits`, KHSCII string conversion
   (`GetKHSCII`), table utilities (`contains`, `get_index`, `merge_tables`).
-- **Readiness check**: `can_spawn_enemy()` — ask whether a spawn would work *before*
-  attempting it. See below.
-
-### `can_spawn_enemy`
-
-Answers "would `spawn_enemy` refuse right now?" without doing anything:
-
-```lua
-local verdict, code, message = kh1.can_spawn_enemy("xa_ex_2020.mdls")
--- "ready" | "retry" (transient) | "unavailable" (needs a restart, or unsupported)
-```
-
-It runs the real `spawn_enemy` gates — they're shared functions in
-`packages/spawn_enemy.cpp`, not a reimplementation — but allocates nothing, triggers no
-asset load and constructs nothing, so it's safe to poll. Called with no model path it
-checks only the creature-independent gates and skips the per-creature slot search, which is
-much cheaper. A `"ready"` verdict is not a guarantee: refusals that only surface mid-flight
-(`blob_invalid`, `ctor_threw`, the room's concurrent-enemy budget) can still come back from
-the real call.
-
-`code` is the same short refusal code `spawn_enemy` itself returns (and now passes to its
-callback as a fourth argument), so both paths can share one mapping table.
-
-Anything that needs to call into real game code (rather than just read/write memory) is
-routed through `kh1_native.dll` via `require("kh1_native")`.
 
 ## Building the native module
 

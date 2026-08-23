@@ -7,6 +7,7 @@ buttonTypes = 0x2E20F20
 closeMenu = 0x2E94BA0
 cutscene = 0x233F1F4
 cutsceneFlagBase = 0x2DEB265
+damageCapBranch = 0x2BDAA8
 deathPointer = 0x2398838
 dest = 0x508280
 dialog = 0x299C508

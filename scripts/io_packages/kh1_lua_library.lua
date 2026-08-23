@@ -628,6 +628,27 @@ local function ko_sora()
     end
 end
 
+-- Original bytes at the 3 damage-cap patch sites
+local DMGCAP_JZ       = "\x74\x22"
+local DMGCAP_LOAD_ECX = "\x0F\xB7\x88\xC2\x00\x00\x00"
+local DMGCAP_LOAD_EBX = "\x0F\xB7\x98\xC2\x00\x00\x00"
+
+local function set_damage_cap(mode)
+    -- "on"/true: normal per-enemy caps. "off"/false: never cap. Integer N: cap every hit at N.
+    local jz = kh1_native.get_module_base() + damageCapBranch
+    local function p(addr, bytes) return kh1_native.patch_code(addr, bytes, 1) end
+    if mode == "on" or mode == true then
+        return p(jz, DMGCAP_JZ) and p(jz + 0xA, DMGCAP_LOAD_ECX) and p(jz + 0x1D, DMGCAP_LOAD_EBX)
+    elseif mode == "off" or mode == false then
+        return p(jz, "\xEB\x22") and p(jz + 0xA, DMGCAP_LOAD_ECX) and p(jz + 0x1D, DMGCAP_LOAD_EBX)
+    elseif math.type(mode) == "integer" and mode >= 1 and mode <= 0x7FFFFFFF then
+        local imm = string.pack("<i4", mode)
+        return p(jz, "\x90\x90") and p(jz + 0xA, "\xB9" .. imm .. "\x90\x90")
+            and p(jz + 0x1D, "\xBB" .. imm .. "\x90\x90")
+    end
+    return false
+end
+
 local function heartless_angel_sora()
     -- Sets Sora HP to 1 and MP to 0
     if not sora_koed() then
@@ -711,5 +732,6 @@ return {
     set_text_box_size = kh1_text_boxes.set_text_box_size,
     sora_koed = sora_koed,
     ko_sora = ko_sora,
-    heartless_angel_sora = heartless_angel_sora
+    heartless_angel_sora = heartless_angel_sora,
+    set_damage_cap = set_damage_cap
 }
