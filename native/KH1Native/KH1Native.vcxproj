@@ -155,11 +155,21 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
-    <ClInclude Include="kh1_native.h" />
     <ClInclude Include="pch.h" />
+    <ClInclude Include="log.h" />
+    <ClInclude Include="lua_api.h" />
+    <ClInclude Include="call_bridge.h" />
+    <ClInclude Include="process_memory.h" />
+    <ClInclude Include="evdl_syscall.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="log.cpp" />
+    <ClCompile Include="lua_api.cpp" />
+    <ClCompile Include="lua_bindings.cpp" />
+    <ClCompile Include="call_bridge.cpp" />
+    <ClCompile Include="process_memory.cpp" />
+    <ClCompile Include="evdl_syscall.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>

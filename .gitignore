@@ -13,3 +13,4 @@ native/**/*.exp
 native/**/*.tlog
 native/**/*.recipe
 native/**/*.pch
+*.log
