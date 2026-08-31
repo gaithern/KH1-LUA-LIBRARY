@@ -9,30 +9,35 @@ Steam and EGS builds.
 Below you'll find key components of the repository and their descriptions.
 
 - `dll/*`
-| File | Description |
-| :--- | ----------: |
-| `lua54.dll` | Bundled lua module |
+
+  | File | Description |
+  | :--- | :---------- |
+  | `lua54.dll` | Bundled lua module |
+
 - `native/KH1Native/*`
-| File | Description |
-| :--- | ----------: |
-| `call_bridge.cpp`| Handler for calling in-exe functions.  Handles varying numbers of input arugments. |
-| `dllmain.cpp`| Main entry point. |
-| `evdl_syscall.cpp` | Supports calls EVDL Syscalls for C++/Lua.  Creates a dummy scriptCtx for execution. |
-| `log.cpp` | Handles writing to a shared log for debugging purposes. |
-| `lua_api.cpp` | Identifies the Lua module and populate Lua C function pointers. |
-| `lua_bindings.cpp` | Exposes C++ to be used on the Lua side. |
-| `process_memory.cpp` | Toolset for working with game memory, including memory allocation, safe writes, etc. |
+
+  | File | Description |
+  | :--- | :---------- |
+  | `call_bridge.cpp`| Handler for calling in-exe functions.  Handles varying numbers of input arugments. |
+  | `dllmain.cpp`| Main entry point. |
+  | `evdl_syscall.cpp` | Supports calls EVDL Syscalls for C++/Lua.  Creates a dummy scriptCtx for execution. |
+  | `log.cpp` | Handles writing to a shared log for debugging purposes. |
+  | `lua_api.cpp` | Identifies the Lua module and populate Lua C function pointers. |
+  | `lua_bindings.cpp` | Exposes C++ to be used on the Lua side. |
+  | `process_memory.cpp` | Toolset for working with game memory, including memory allocation, safe writes, etc. |
+
 - `scripts/io_packages/*`
-| File | Description |
-| :--- | ----------: |
-| `helpers/*` | Generic helper lua modules. |
-| `modules/*` | Containers for complex lua function(s) pertaining to one subject area. |
-| `EGSGlobal_1_0_0_10.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.10. |
-| `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
-| `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
-| `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
-| `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.2. |
-| `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
+
+  | File | Description |
+  | :--- | :---------- |
+  | `helpers/*` | Generic helper lua modules. |
+  | `modules/*` | Containers for complex lua function(s) pertaining to one subject area. |
+  | `EGSGlobal_1_0_0_10.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.10. |
+  | `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
+  | `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
+  | `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
+  | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.2. |
+  | `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
 - `build.py`
   - Compiles `kh1_native.dll` from its source in `native/KH1Native/*`.
   - Creates relevant `mod.yml` by calling `generate_mod_yml.py`
