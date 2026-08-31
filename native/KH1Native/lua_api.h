@@ -1,9 +1,6 @@
 #pragma once
-// Shared internals between dllmain.cpp and the packages/ sources. Defined in dllmain.cpp.
-
 #include <cstddef>
 
-// --- Lua C API pointers, resolved at luaopen time ---
 typedef int          (__cdecl* t_lua_gettop)(void* L);
 typedef long long    (__cdecl* t_lua_tointegerx)(void* L, int idx, int* isnum);
 typedef double       (__cdecl* t_lua_tonumberx)(void* L, int idx, int* isnum);
@@ -30,9 +27,6 @@ extern t_lua_rawlen       p_lua_rawlen;
 extern t_lua_rawgeti      p_lua_rawgeti;
 extern t_lua_settop       p_lua_settop;
 
-// Appends a line to kh1_native.log next to the DLL.
-void LogDebug(const char* msg);
+struct luaL_Reg { const char* name; void* func; };
 
-// Calls base-relative game code SEH-wrapped; false means it faulted.
-bool SafeCall(unsigned long long address, const unsigned long long* args, int argCount,
-              unsigned long long& outResult);
+bool ResolveLuaApi();
