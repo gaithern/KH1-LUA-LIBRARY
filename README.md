@@ -127,14 +127,13 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `allow_air_items` | `on` | none | ASM patch that allows item use in mid air (currently affects mid-air spells too). Credits to KSX. |
 | `multiply_summon_time` | `mult` | none | Multiplies the summon duration factor. Credits to KSX. |
 | `is_pressed` | `button_array, only` | boolean | True if all buttons in `button_array` (e.g. `{"L1", "Triangle"}`) are pressed. With `only`, no other buttons may be held. |
-| `is_in_gummi_garage` | none | boolean | True anywhere in the Gummi ship menus (needs a rename — not just the garage). |
 | `is_in_gummi` | none | boolean | True while in a Gummi mission. |
 | `sora_koed` | none | boolean | True if Sora's current HP is 0. |
 | `ko_sora` | none | none | Triggers the in-game event script that KOs Sora. |
 | `heartless_angel_sora` | none | none | Sets Sora's HP to 1 and MP to 0. |
 | `set_damage_cap` | `mode` | boolean | `"on"`/`true`: normal per-enemy damage caps. `"off"`/`false`: never cap. Integer N: cap every hit at N. |
 | `spawn_prize` | `item_id` | boolean | Calls the in-game function to spawn a map prize at Sora's position. |
-| `spawn_enemy` | `model_path, x, y, z` | `boolean, reason` | Spawns an enemy by model path. Asynchronous: returns `false, "loading"` while assets load — call again each frame until it returns `true`. Coordinates default to Sora's position. |
+| `spawn_enemy` | `model_path, x, y, z` | `boolean, reason` | Spawns an enemy by model path.|
 | `play_se2` | `se_id, param_2` | boolean | Plays a sound effect using the in-game function. |
 | `show_prompt` | `input_title, input_party, duration, colour` | boolean | Shows level-up-style prompts over party members. `input_title` and `input_party` are tables indexed 1-3 (Sora/ally 1/ally 2); each party entry is 1-2 lines of text. |
 | `show_custom_item_popup` | `text` | boolean | Forces a map-prize pickup popup with custom text. |
