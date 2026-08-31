@@ -36,7 +36,7 @@ Below you'll find key components of the repository and their descriptions.
   | `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
   | `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
   | `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
-  | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.2. |
+  | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Steam v1.0.0.2. |
   | `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
 - `build.py`
   - Compiles `kh1_native.dll` from its source in `native/KH1Native/*`.
