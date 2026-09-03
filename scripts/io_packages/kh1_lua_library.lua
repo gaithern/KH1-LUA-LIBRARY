@@ -730,6 +730,7 @@ return {
     set_text_box_style = kh1_text_boxes.set_text_box_style,
     set_text_box_position = kh1_text_boxes.set_text_box_position,
     set_text_box_size = kh1_text_boxes.set_text_box_size,
+    set_text_box_tail_type = kh1_text_boxes.set_text_box_tail_type,
     sora_koed = sora_koed,
     ko_sora = ko_sora,
     heartless_angel_sora = heartless_angel_sora,

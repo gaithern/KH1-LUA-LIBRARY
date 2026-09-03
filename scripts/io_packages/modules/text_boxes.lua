@@ -110,10 +110,18 @@ local function set_text_box_size(window_id, width, height)
     return kh1_native.call_evdl_syscall(fnc_004_set_window_size, {window_id, width, height})
 end
 
-local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height)
+local function set_text_box_tail_type(window_id, tail_type)
+    window_id = window_id or 1
+    return kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {window_id, tail_type})
+end
+
+local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height, tail_type)
     window_id = window_id or 1
     if style ~= nil then
         set_text_box_style(window_id, style)
+    end
+    if tail_type ~= nil then
+        set_text_box_tail_type(window_id, tail_type)
     end
     if x ~= nil and y ~= nil then
         set_text_box_position(window_id, x, y)
@@ -161,6 +169,7 @@ return {
     set_text_box_style = set_text_box_style,
     set_text_box_position = set_text_box_position,
     set_text_box_size = set_text_box_size,
+    set_text_box_tail_type = set_text_box_tail_type,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,

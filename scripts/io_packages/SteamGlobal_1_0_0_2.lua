@@ -352,6 +352,7 @@ fnc_0B1_open_window_no_close = 0x1B9170
 fnc_005_set_window_type = 0x1B98F0
 fnc_003_set_window_position = 0x1B9770
 fnc_004_set_window_size = 0x1B97D0
+fnc_050_set_window_tail_type = 0x1B98B0
 fnc_116_game_over = 0x1ACC00
 fnc_trigger_ko_event_script = 0x1C43D0
 fnc_display_message_text_hook = 0x1B8E6C
