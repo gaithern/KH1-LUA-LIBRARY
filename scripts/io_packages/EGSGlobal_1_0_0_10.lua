@@ -340,6 +340,7 @@ fnc_trigger_ko_event_script = 0x1C2280
 fnc_display_message_text_hook = 0x1B6D1C
 fnc_display_message_text_resume = 0x1B6D24
 g_pEVStringDataPtr = 0x23927C0
+g_EVScriptLoaded = 0x238D7F8
 fnc_display_message_anim_hook = 0x1B6FE3
 fnc_play_se2 = 0x1766F0
 fnc_display_message_anim_resume = 0x1B6FEC

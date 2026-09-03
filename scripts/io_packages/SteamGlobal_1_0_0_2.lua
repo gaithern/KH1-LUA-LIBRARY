@@ -357,6 +357,7 @@ fnc_trigger_ko_event_script = 0x1C43D0
 fnc_display_message_text_hook = 0x1B8E6C
 fnc_display_message_text_resume = 0x1B8E74
 g_pEVStringDataPtr = 0x237C4E0
+g_EVScriptLoaded = 0x237F4E0
 fnc_display_message_anim_hook = 0x1B9133
 fnc_display_message_anim_resume = 0x1B913C
 fnc_display_message_anim_call_target = 0x1764E0
