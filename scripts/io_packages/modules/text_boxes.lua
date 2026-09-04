@@ -115,8 +115,17 @@ local function set_text_box_tail_type(window_id, tail_type)
     return kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {window_id, tail_type})
 end
 
+-- Per-window state byte kept by the EV window system: 0 = closed, 1 = opening/open,
+-- 2 = displaying a message. Non-zero also covers the close animation, during which
+-- fnc_0B1_open_window_no_close refuses to open the window again.
+local function is_text_box_busy(window_id)
+    window_id = window_id or 1
+    return ReadByte(g_EVWindowState + window_id) ~= 0
+end
+
 local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height, tail_type)
     window_id = window_id or 1
+    if is_text_box_busy(window_id) then return false end
     if style ~= nil then
         set_text_box_style(window_id, style)
     end
@@ -139,7 +148,15 @@ local function open_text_box(text, window_id, duration_seconds, style, x, y, wid
         open_world = get_world(),
         open_room = get_room(),
     }
-    return opened and displayed
+    return opened and displayed, message_id
+end
+
+-- Drop this state's bookkeeping for a window without closing it. Used by the shared queue
+-- driver, which tracks and closes its own boxes from the persistent queue block.
+local function forget_text_box(window_id)
+    window_id = window_id or 1
+    open_text_boxes[window_id] = nil
+    clear_pending_text_box()
 end
 
 local function close_text_box(window_id)
@@ -170,7 +187,9 @@ return {
     set_text_box_position = set_text_box_position,
     set_text_box_size = set_text_box_size,
     set_text_box_tail_type = set_text_box_tail_type,
+    is_text_box_busy = is_text_box_busy,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
+    forget_text_box = forget_text_box,
     update_text_boxes = update_text_boxes,
 }

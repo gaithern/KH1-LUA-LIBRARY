@@ -19,6 +19,7 @@ local kh1_native = require("kh1_native")
 local kh1_spawn_enemy = require("modules.spawn_enemy")
 local kh1_khscii = require("helpers.khscii")
 local kh1_text_boxes = require("modules.text_boxes")
+local kh1_text_box_queue = require("modules.text_box_queue")
 local kh1_prize_popup = require("modules.prize_popup")
 local kh1_level_up_prompt = require("modules.level_up_prompt")
 
@@ -724,9 +725,14 @@ return {
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
     play_se2 = play_se2,
+    is_text_box_busy = kh1_text_boxes.is_text_box_busy,
     open_text_box = kh1_text_boxes.open_text_box,
     close_text_box = kh1_text_boxes.close_text_box,
     update_text_boxes = kh1_text_boxes.update_text_boxes,
+    queue_text_box = kh1_text_box_queue.enqueue,
+    text_box_queue_pending = kh1_text_box_queue.pending_count,
+    text_box_driver_alive = kh1_text_box_queue.driver_alive,
+    text_box_queue_frame = kh1_text_box_queue.driver_frame,
     set_text_box_style = kh1_text_boxes.set_text_box_style,
     set_text_box_position = kh1_text_boxes.set_text_box_position,
     set_text_box_size = kh1_text_boxes.set_text_box_size,
