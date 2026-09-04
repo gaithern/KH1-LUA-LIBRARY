@@ -2,7 +2,7 @@
 
 LUAGUI_NAME = "KH1TextBoxDriver"
 LUAGUI_AUTH = "Gicu"
-LUAGUI_DESC = "Drives the shared text box queue (kh1_lua_library.queue_text_box)"
+LUAGUI_DESC = "Closes expired text boxes opened through kh1_lua_library.open_text_box"
 
 local kh1_lua_library = require("kh1_lua_library")
 
@@ -19,7 +19,7 @@ end
 
 function _OnFrame()
     if not canExecute then return end
-    local ok, err = pcall(kh1_lua_library.text_box_queue_frame)
+    local ok, err = pcall(kh1_lua_library.update_text_boxes)
     if ok then
         error_count = 0
         return

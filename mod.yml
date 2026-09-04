@@ -54,10 +54,6 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/spawn_enemy.lua
-- name: scripts/io_packages/modules/text_box_queue.lua
-  method: copy
-  source:
-  - name: scripts/io_packages/modules/text_box_queue.lua
 - name: scripts/io_packages/modules/text_boxes.lua
   method: copy
   source:
