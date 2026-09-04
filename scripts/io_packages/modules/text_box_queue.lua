@@ -101,10 +101,15 @@ local function enqueue(opts)
     if type(opts) ~= "table" or type(opts.text) ~= "string" then return false end
     local blk = block()
     if not blk then return false end
-    local count = ReadInt(blk + HDR_COUNT, true)
-    if count >= CAPACITY then return false end
-
     local head = ReadInt(blk + HDR_HEAD, true)
+    local count = ReadInt(blk + HDR_COUNT, true)
+    if count >= CAPACITY then
+        head = (head + 1) % CAPACITY
+        count = CAPACITY - 1
+        WriteInt(blk + HDR_HEAD, head, true)
+        WriteInt(blk + HDR_COUNT, count, true)
+    end
+
     local rec = record_addr(blk, head + count)
     local flags = 0
     write_text(rec + REC_TEXT, opts.text)
