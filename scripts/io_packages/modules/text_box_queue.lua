@@ -20,6 +20,7 @@ local HDR_CUR_DEADLINE = 0x20
 local HDR_CUR_WORLD    = 0x24
 local HDR_CUR_ROOM     = 0x28
 local HDR_CUR_SLOT     = 0x2C
+local HDR_GHOST_SINCE  = 0x30
 local HDR_SIZE         = 0x40
 
 local REC_TEXT      = 0x000
@@ -47,6 +48,7 @@ local BLOCK_SIZE = HDR_SIZE + CAPACITY * REC_SIZE
 
 local DEFAULT_WINDOW   = 6
 local DEFAULT_DURATION = 2.5
+local GHOST_TIMEOUT_MS = 2000
 
 local WINDOW_SLOTS      = 4
 local MSG_QUEUE_STRIDE  = 0x200
@@ -67,6 +69,7 @@ local function block()
         WriteInt(blk + HDR_COUNT, 0, true)
         WriteInt(blk + HDR_HEARTBEAT_MS, 0, true)
         WriteInt(blk + HDR_CUR_VALID, 0, true)
+        WriteInt(blk + HDR_GHOST_SINCE, 0, true)
     end
     return blk
 end
@@ -174,6 +177,16 @@ local function owns_window(window_id, slot)
     return last_message_id(window_id) == slot
 end
 
+local function message_count(window_id)
+    return ReadInt(g_EVWindowMsgCount + window_id * 4)
+end
+
+local function can_open()
+    if ReadInt(g_EVScriptLoaded) <= 0 then return false end
+    local w = ReadByte(world)
+    return w ~= 0 and w ~= 0xFF
+end
+
 -- ######################## --
 -- # Driver side          # --
 -- ######################## --
@@ -186,7 +199,9 @@ local function tend_current(blk)
     if ReadInt(blk + HDR_CUR_VALID, true) == 0 then return false end
     local window_id = ReadInt(blk + HDR_CUR_WINDOW, true)
     local slot = ReadInt(blk + HDR_CUR_SLOT, true)
-    if not owns_window(window_id, slot) then
+    local state = window_state(window_id)
+    local last = last_message_id(window_id)
+    if state ~= 0 and last ~= nil and last ~= slot then
         clear_current(blk)
         return false
     end
@@ -194,11 +209,28 @@ local function tend_current(blk)
     local moved = ReadByte(world) ~= ReadInt(blk + HDR_CUR_WORLD, true)
         or ReadByte(room) ~= ReadInt(blk + HDR_CUR_ROOM, true)
     if expired or moved then
-        kh1_text_boxes.close_text_box(window_id)
+        if state ~= 0 then
+            kh1_text_boxes.close_text_box(window_id)
+        end
         clear_current(blk)
         return false
     end
     return true
+end
+
+local function sweep_ghost(blk)
+    local window_id = ReadInt(blk + HDR_CUR_WINDOW, true)
+    if window_state(window_id) ~= 0 and message_count(window_id) == 0 then
+        local since = ReadInt(blk + HDR_GHOST_SINCE, true)
+        if since == 0 then
+            WriteInt(blk + HDR_GHOST_SINCE, now_ms(), true)
+        elseif now_ms() - since >= GHOST_TIMEOUT_MS then
+            kh1_text_boxes.close_text_box(window_id)
+            WriteInt(blk + HDR_GHOST_SINCE, 0, true)
+        end
+    else
+        WriteInt(blk + HDR_GHOST_SINCE, 0, true)
+    end
 end
 
 local function show_next(blk)
@@ -240,8 +272,10 @@ local function driver_frame()
     WriteInt(blk + HDR_HEARTBEAT_MS, now_ms(), true)
 
     if tend_current(blk) then return end
+    sweep_ghost(blk)
     if ReadInt(blk + HDR_COUNT, true) == 0 then return end
     if any_window_active() then return end
+    if not can_open() then return end
     show_next(blk)
 end
 
