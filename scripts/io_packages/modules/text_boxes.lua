@@ -1,238 +1,395 @@
 ---@diagnostic disable: undefined-global
 
+-- Notification text boxes on one shared window, queued by the game itself.
+--
+-- The EV window system keeps a per-window message queue and plays messages back to back. A
+-- control byte 06 lo hi inside a message holds it on screen for lo|hi<<8 ticks (30 per second)
+-- after it has been fully shown, and a window opened with Open_window closes itself once its
+-- queue is empty. So queue_text_box only appends: each message gets its own EV string slot and
+-- buffer, and the game handles ordering, timing and closing. The library's driver script runs
+-- update_text_boxes every frame to feed held messages, play per-message sounds and clean up a
+-- ghost window left behind by an EV script load. All state lives in a persistent block, so
+-- every Lua state shares one queue and nothing is lost on a hot reload.
+
 local kh1_native = require("kh1_native")
 local khscii = require("helpers.khscii")
 
 local GetKHSCII = khscii.GetKHSCII
 
-local STATE_KEY           = "kh1_textbox_state_v1"
-local STATE_SIZE          = 0x220
-local OFF_LEGACY_FLAG     = 0x000
-local OFF_SLOT_COUNT      = 0x00C
-local OFF_SLOT_VALID      = 0x018
-local OFF_SLOT            = 0x01C
-local OFF_BUF             = 0x020
-local BUF_MAX             = 511
-local EV_STRING_TABLE_MAX = 1536
-
--- Per-window box records, shared by every Lua state and kept across hot reloads, so the
--- library's driver script can close boxes that any script opened.
-local BOXES_KEY          = "kh1_textbox_boxes_v1"
-local BOXES_SIZE         = 0x100
-local WINDOW_COUNT       = 8
-local BOX_STRIDE         = 0x10
-local BOX_VALID          = 0x0
-local BOX_DEADLINE_MS    = 0x4
-local BOX_WORLD          = 0x8
-local BOX_ROOM           = 0xC
-local OFF_LAST_WINDOW    = 0x80
-local OFF_GHOST_SINCE_MS = 0x84
-local OFF_BOXES_MAGIC    = 0x88
-local BOXES_MAGIC        = 0x58425431
-
+local NOTIFY_WINDOW    = 6
+local SLOT_COUNT       = 32   -- EV string slots reserved at the top of the table = messages in flight
+local BUF_SIZE         = 512
+local HELD_COUNT       = 32   -- messages waiting while the window is busy or full
+local TICKS_PER_SECOND = 30
+local DEFAULT_DURATION = 2.5
 local GHOST_TIMEOUT_MS = 2000
+local EV_STRING_TABLE_MAX = 1536
+local WINDOW_SLOTS     = 4
+local MSG_QUEUE_STRIDE = 0x200
+local MSG_QUEUE_ENTRIES = 0x100
 
-local function state_block()
-    local blk = kh1_native.persistent_block(STATE_KEY, STATE_SIZE)
-    if blk == 0 or blk == nil then return nil end
-    return blk
-end
+local BLOCK_KEY  = "kh1_textbox_queue_v2"
+local MAGIC      = 0x54425132
 
-local function boxes_block()
-    local blk = kh1_native.persistent_block(BOXES_KEY, BOXES_SIZE)
-    if blk == 0 or blk == nil then return nil end
-    if ReadInt(blk + OFF_BOXES_MAGIC, true) ~= BOXES_MAGIC then
-        for w = 0, WINDOW_COUNT - 1 do
-            WriteInt(blk + w * BOX_STRIDE + BOX_VALID, 0, true)
-        end
-        WriteInt(blk + OFF_LAST_WINDOW, -1, true)
-        WriteInt(blk + OFF_GHOST_SINCE_MS, 0, true)
-        WriteInt(blk + OFF_BOXES_MAGIC, BOXES_MAGIC, true)
-    end
-    return blk
-end
+local HDR_MAGIC       = 0x00
+local HDR_SLOT_VALID  = 0x04
+local HDR_SLOT_BASE   = 0x08
+local HDR_SLOT_TABLE  = 0x0C  -- g_EVScriptLoaded value after our reservation
+local HDR_NEXT_BUF    = 0x10
+local HDR_HELD_HEAD   = 0x14
+local HDR_HELD_COUNT  = 0x18
+local HDR_LAST_POS    = 0x1C
+local HDR_LAST_STATE  = 0x20
+local HDR_GHOST_SINCE = 0x24
+local OFF_SOUNDS      = 0x40                                -- int32[MSG_QUEUE_ENTRIES], by queue position
+local OFF_BUFFERS     = OFF_SOUNDS + MSG_QUEUE_ENTRIES * 4  -- SLOT_COUNT * BUF_SIZE
+local OFF_HELD        = OFF_BUFFERS + SLOT_COUNT * BUF_SIZE
+local HELD_TEXT_MAX   = 511
+local HELD_DURATION   = 0x200
+local HELD_SOUND      = 0x204
+local HELD_STYLE      = 0x208
+local HELD_X          = 0x20C
+local HELD_Y          = 0x210
+local HELD_WIDTH      = 0x214
+local HELD_HEIGHT     = 0x218
+local HELD_TAIL       = 0x21C
+local HELD_FLAGS      = 0x220
+local HELD_STRIDE     = 0x240
+local BLOCK_SIZE      = OFF_HELD + HELD_COUNT * HELD_STRIDE
+
+local FLAG_STYLE = 1
+local FLAG_POS   = 2
+local FLAG_SIZE  = 4
+local FLAG_TAIL  = 8
+local FLAG_SOUND = 16
 
 local function now_ms()
     return math.floor(os.clock() * 1000)
 end
 
-local function get_world() return ReadByte(world) end
-local function get_room() return ReadByte(room) end
+local function block()
+    local blk = kh1_native.persistent_block(BLOCK_KEY, BLOCK_SIZE)
+    if blk == 0 or blk == nil then return nil end
+    if ReadInt(blk + HDR_MAGIC, true) ~= MAGIC then
+        WriteInt(blk + HDR_SLOT_VALID, 0, true)
+        WriteInt(blk + HDR_NEXT_BUF, 0, true)
+        WriteInt(blk + HDR_HELD_HEAD, 0, true)
+        WriteInt(blk + HDR_HELD_COUNT, 0, true)
+        WriteInt(blk + HDR_LAST_POS, -1, true)
+        WriteInt(blk + HDR_LAST_STATE, 0, true)
+        WriteInt(blk + HDR_GHOST_SINCE, 0, true)
+        WriteInt(blk + HDR_MAGIC, MAGIC, true)
+    end
+    return blk
+end
 
 -- ######################## --
--- # Custom message slot  # --
+-- # Game window state    # --
 -- ######################## --
 
-local function ev_string_slot(blk)
-    local count = ReadInt(g_EVScriptLoaded)
-    if ReadInt(blk + OFF_SLOT_VALID, true) == 1 then
-        local slot = ReadInt(blk + OFF_SLOT, true)
-        if count == ReadInt(blk + OFF_SLOT_COUNT, true) and slot == count - 1 then
-            return slot
+local function window_state()
+    return ReadByte(g_EVWindowState + NOTIFY_WINDOW)
+end
+
+local function message_count()
+    return ReadInt(g_EVWindowMsgCount + NOTIFY_WINDOW * 4)
+end
+
+local function message_position()
+    return ReadInt(g_EVWindowMsgPosition)
+end
+
+local function last_message_id()
+    local count = message_count()
+    if count < 1 or count > MSG_QUEUE_ENTRIES then return nil end
+    return ReadShort(g_EVWindowMsgQueue + NOTIFY_WINDOW * MSG_QUEUE_STRIDE + (count - 1) * 2)
+end
+
+local function window_closing()
+    for slot = 0, WINDOW_SLOTS - 1 do
+        if ReadByte(g_EVWindowStateArray + slot) == NOTIFY_WINDOW then
+            return ReadByte(g_EVWindowActivity + slot) == 3
         end
     end
-    if count >= EV_STRING_TABLE_MAX then return nil end
-    WriteInt(g_EVScriptLoaded, count + 1)
-    WriteInt(blk + OFF_SLOT, count, true)
-    WriteInt(blk + OFF_SLOT_COUNT, count + 1, true)
-    WriteInt(blk + OFF_SLOT_VALID, 1, true)
+    return false
+end
+
+local function is_text_box_busy(window_id)
+    return ReadByte(g_EVWindowState + (window_id or NOTIFY_WINDOW)) ~= 0
+end
+
+-- ######################## --
+-- # EV string slots      # --
+-- ######################## --
+
+local function ensure_slots(blk)
+    local count = ReadInt(g_EVScriptLoaded)
+    if ReadInt(blk + HDR_SLOT_VALID, true) == 1 then
+        local base = ReadInt(blk + HDR_SLOT_BASE, true)
+        if count == ReadInt(blk + HDR_SLOT_TABLE, true) and base == count - SLOT_COUNT then
+            return base
+        end
+    end
+    if count + SLOT_COUNT > EV_STRING_TABLE_MAX then return nil end
+    for i = 0, SLOT_COUNT - 1 do
+        WriteLong(g_pEVStringDataPtr + (count + i) * 8, blk + OFF_BUFFERS + i * BUF_SIZE)
+    end
+    WriteInt(g_EVScriptLoaded, count + SLOT_COUNT)
+    WriteInt(blk + HDR_SLOT_BASE, count, true)
+    WriteInt(blk + HDR_SLOT_TABLE, count + SLOT_COUNT, true)
+    WriteInt(blk + HDR_SLOT_VALID, 1, true)
+    WriteInt(blk + HDR_NEXT_BUF, 0, true)
     return count
 end
 
-local function set_textbox_text(text)
-    local blk = state_block()
-    if not blk then return nil end
-    local slot = ev_string_slot(blk)
-    if not slot then return nil end
-    local khs = GetKHSCII(text)
-    local n = math.min(#khs, BUF_MAX)
+local function owns_window(blk)
+    if window_state() == 0 then return false end
+    local id = last_message_id()
+    if id == nil then return false end
+    local base = ReadInt(blk + HDR_SLOT_BASE, true)
+    return ReadInt(blk + HDR_SLOT_VALID, true) == 1 and id >= base and id < base + SLOT_COUNT
+end
+
+-- Messages queued on the window that have not finished showing. The position global is only
+-- meaningful while the window is displaying or idle; while it is closed or still opening,
+-- everything queued is still ahead.
+local function in_flight()
+    local count = message_count()
+    local state = window_state()
+    if state ~= 2 and state ~= 4 then return count end
+    local pos = message_position()
+    if pos < 0 or pos > count then return count end
+    return count - pos
+end
+
+-- ######################## --
+-- # Showing a message    # --
+-- ######################## --
+
+local function dwell_escape(duration_seconds)
+    local ticks = math.floor((duration_seconds or DEFAULT_DURATION) * TICKS_PER_SECOND)
+    if ticks < 1 then ticks = 1 end
+    if ticks > 0xFFFF then ticks = 0xFFFF end
+    return string.format("{0x06}{0x%02X}{0x%02X}", ticks % 256, math.floor(ticks / 256))
+end
+
+local function write_buffer(blk, index, text, duration_seconds)
+    local khs = GetKHSCII(text .. dwell_escape(duration_seconds))
+    local n = math.min(#khs, BUF_SIZE - 1)
     local bytes = {}
     for i = 1, n do bytes[i] = khs[i] end
     bytes[n + 1] = 0
-    WriteArray(blk + OFF_BUF, bytes, true)
-    WriteLong(g_pEVStringDataPtr + slot * 8, blk + OFF_BUF)
-    WriteByte(blk + OFF_LEGACY_FLAG, 0, true)
-    return slot
+    WriteArray(blk + OFF_BUFFERS + index * BUF_SIZE, bytes, true)
 end
 
--- ######################## --
--- # Window helpers       # --
--- ######################## --
-
-local function set_text_box_style(window_id, style)
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_005_set_window_type, {window_id, style})
-end
-
-local function set_text_box_position(window_id, x, y)
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_003_set_window_position, {window_id, x, y})
-end
-
-local function set_text_box_size(window_id, width, height)
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_004_set_window_size, {window_id, width, height})
-end
-
-local function set_text_box_tail_type(window_id, tail_type)
-    window_id = window_id or 1
-    return kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {window_id, tail_type})
-end
-
--- Per-window state byte kept by the EV window system: 0 = closed, 1 = opening/open,
--- 2 = displaying a message, 4 = open and idle. Non-zero also covers the close animation,
--- during which fnc_0B1_open_window_no_close refuses to open the window again.
-local function is_text_box_busy(window_id)
-    window_id = window_id or 1
-    return ReadByte(g_EVWindowState + window_id) ~= 0
-end
-
-local function record_box(window_id, duration_seconds)
-    local blk = boxes_block()
-    if not blk then return end
-    local rec = blk + window_id * BOX_STRIDE
-    local deadline = 0
-    if duration_seconds and duration_seconds > 0 then
-        deadline = now_ms() + math.floor(duration_seconds * 1000)
+local function apply_look(m)
+    if m.style ~= nil then
+        kh1_native.call_evdl_syscall(fnc_005_set_window_type, {NOTIFY_WINDOW, m.style})
     end
-    WriteInt(rec + BOX_DEADLINE_MS, deadline, true)
-    WriteInt(rec + BOX_WORLD, get_world(), true)
-    WriteInt(rec + BOX_ROOM, get_room(), true)
-    WriteInt(rec + BOX_VALID, 1, true)
-    WriteInt(blk + OFF_LAST_WINDOW, window_id, true)
+    if m.tail ~= nil then
+        kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {NOTIFY_WINDOW, m.tail})
+    end
+    if m.x ~= nil and m.y ~= nil then
+        kh1_native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, m.x, m.y})
+    end
+    if m.width ~= nil and m.height ~= nil then
+        kh1_native.call_evdl_syscall(fnc_004_set_window_size, {NOTIFY_WINDOW, m.width, m.height})
+    end
 end
 
-local function forget_box(window_id)
-    local blk = boxes_block()
-    if not blk then return end
-    WriteInt(blk + window_id * BOX_STRIDE + BOX_VALID, 0, true)
+-- The window is free for us when it is closed, or open with our own message on it and not
+-- already closing. In-flight messages must not exceed our buffer ring.
+local function can_show(blk)
+    if in_flight() >= SLOT_COUNT then return false end
+    if window_state() == 0 then return true end
+    return owns_window(blk) and not window_closing()
 end
 
--- Opens a text box. When the window is already open the new message replaces the current one
--- in place (the native multi-message path), so it never has to wait for a close animation.
--- The box is closed by update_text_boxes, which the library's driver script runs every frame.
+local function show(blk, m)
+    local base = ensure_slots(blk)
+    if base == nil then return false end
+    if window_state() == 0 then
+        apply_look(m)
+        if not kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW}) then
+            return false
+        end
+    end
+    local index = ReadInt(blk + HDR_NEXT_BUF, true)
+    write_buffer(blk, index, m.text, m.duration)
+    local position = message_count()
+    if position >= 0 and position < MSG_QUEUE_ENTRIES then
+        WriteInt(blk + OFF_SOUNDS + position * 4, m.sound or -1, true)
+    end
+    kh1_native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, base + index})
+    WriteInt(blk + HDR_NEXT_BUF, (index + 1) % SLOT_COUNT, true)
+    return true
+end
+
+-- ######################## --
+-- # Held messages        # --
+-- ######################## --
+
+local function held_addr(blk, index)
+    return blk + OFF_HELD + (index % HELD_COUNT) * HELD_STRIDE
+end
+
+local function push_held(blk, m)
+    local head = ReadInt(blk + HDR_HELD_HEAD, true)
+    local count = ReadInt(blk + HDR_HELD_COUNT, true)
+    if count >= HELD_COUNT then
+        head = (head + 1) % HELD_COUNT
+        count = HELD_COUNT - 1
+        WriteInt(blk + HDR_HELD_HEAD, head, true)
+    end
+    local rec = held_addr(blk, head + count)
+    local n = math.min(#m.text, HELD_TEXT_MAX)
+    local bytes = {}
+    for i = 1, n do bytes[i] = m.text:byte(i) end
+    bytes[n + 1] = 0
+    WriteArray(rec, bytes, true)
+    local flags = 0
+    WriteInt(rec + HELD_DURATION, math.floor((m.duration or DEFAULT_DURATION) * 1000), true)
+    if m.sound ~= nil then flags = flags + FLAG_SOUND; WriteInt(rec + HELD_SOUND, m.sound, true) end
+    if m.style ~= nil then flags = flags + FLAG_STYLE; WriteInt(rec + HELD_STYLE, m.style, true) end
+    if m.x ~= nil and m.y ~= nil then
+        flags = flags + FLAG_POS
+        WriteInt(rec + HELD_X, m.x, true)
+        WriteInt(rec + HELD_Y, m.y, true)
+    end
+    if m.width ~= nil and m.height ~= nil then
+        flags = flags + FLAG_SIZE
+        WriteInt(rec + HELD_WIDTH, m.width, true)
+        WriteInt(rec + HELD_HEIGHT, m.height, true)
+    end
+    if m.tail ~= nil then flags = flags + FLAG_TAIL; WriteInt(rec + HELD_TAIL, m.tail, true) end
+    WriteInt(rec + HELD_FLAGS, flags, true)
+    WriteInt(blk + HDR_HELD_COUNT, count + 1, true)
+end
+
+local function peek_held(blk)
+    local head = ReadInt(blk + HDR_HELD_HEAD, true)
+    local count = ReadInt(blk + HDR_HELD_COUNT, true)
+    if count == 0 then return nil end
+    local rec = held_addr(blk, head)
+    local bytes = ReadArray(rec, HELD_TEXT_MAX + 1, true)
+    local chars = {}
+    for i = 1, #bytes do
+        if bytes[i] == 0 then break end
+        chars[#chars + 1] = string.char(bytes[i])
+    end
+    local flags = ReadInt(rec + HELD_FLAGS, true)
+    local function opt(flag, off)
+        if flags % (flag * 2) >= flag then return ReadInt(rec + off, true) end
+        return nil
+    end
+    local m = {
+        text = table.concat(chars),
+        duration = ReadInt(rec + HELD_DURATION, true) / 1000,
+        sound = opt(FLAG_SOUND, HELD_SOUND),
+        style = opt(FLAG_STYLE, HELD_STYLE),
+        x = opt(FLAG_POS, HELD_X),
+        y = opt(FLAG_POS, HELD_Y),
+        width = opt(FLAG_SIZE, HELD_WIDTH),
+        height = opt(FLAG_SIZE, HELD_HEIGHT),
+        tail = opt(FLAG_TAIL, HELD_TAIL),
+    }
+    return m
+end
+
+local function drop_held(blk)
+    local head = ReadInt(blk + HDR_HELD_HEAD, true)
+    local count = ReadInt(blk + HDR_HELD_COUNT, true)
+    if count == 0 then return end
+    WriteInt(blk + HDR_HELD_HEAD, (head + 1) % HELD_COUNT, true)
+    WriteInt(blk + HDR_HELD_COUNT, count - 1, true)
+end
+
+-- ######################## --
+-- # Public API           # --
+-- ######################## --
+
+-- opts: text (required), duration (seconds), sound, style, x, y, width, height, tail.
+-- The look is applied only when the window has to be opened; queued messages share it.
+local function queue_text_box(opts)
+    if type(opts) ~= "table" or type(opts.text) ~= "string" then return false end
+    local blk = block()
+    if not blk then return false end
+    if ReadInt(blk + HDR_HELD_COUNT, true) == 0 and can_show(blk) and show(blk, opts) then
+        return true
+    end
+    push_held(blk, opts)
+    return true
+end
+
 local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height, tail_type)
-    window_id = window_id or 1
-    local already_open = is_text_box_busy(window_id)
-    if not already_open then
-        if style ~= nil then
-            set_text_box_style(window_id, style)
-        end
-        if tail_type ~= nil then
-            set_text_box_tail_type(window_id, tail_type)
-        end
-        if x ~= nil and y ~= nil then
-            set_text_box_position(window_id, x, y)
-        end
-        if width ~= nil and height ~= nil then
-            set_text_box_size(window_id, width, height)
-        end
-    end
-    local message_id = set_textbox_text(text)
-    if message_id == nil then return false end
-    local opened = true
-    if not already_open then
-        opened = kh1_native.call_evdl_syscall(fnc_0B1_open_window_no_close, {window_id})
-    end
-    local displayed = kh1_native.call_evdl_syscall(fnc_001_display_message, {window_id, message_id})
-    record_box(window_id, duration_seconds)
-    return opened and displayed, message_id
+    return queue_text_box{
+        text = text, duration = duration_seconds, style = style,
+        x = x, y = y, width = width, height = height, tail = tail_type,
+    }
 end
 
 local function close_text_box(window_id)
-    window_id = window_id or 1
-    forget_box(window_id)
-    return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id})
+    return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id or NOTIFY_WINDOW})
+end
+
+local function pending_count()
+    local blk = block()
+    if not blk then return 0 end
+    return ReadInt(blk + HDR_HELD_COUNT, true) + in_flight()
 end
 
 -- An EV script load wipes the window bookkeeping but not the drawn window. A box left open at
 -- that moment later wakes as an open window with an empty message queue that nothing owns.
 local function close_ghost_window(blk)
-    local window_id = ReadInt(blk + OFF_LAST_WINDOW, true)
-    if window_id < 0 or window_id >= WINDOW_COUNT then return end
-    local open = ReadByte(g_EVWindowState + window_id) ~= 0
-    local empty = ReadInt(g_EVWindowMsgCount + window_id * 4) == 0
-    if not (open and empty) then
-        WriteInt(blk + OFF_GHOST_SINCE_MS, 0, true)
-        return
+    if window_state() ~= 0 and message_count() == 0 then
+        local since = ReadInt(blk + HDR_GHOST_SINCE, true)
+        if since == 0 then
+            WriteInt(blk + HDR_GHOST_SINCE, now_ms(), true)
+        elseif now_ms() - since >= GHOST_TIMEOUT_MS then
+            close_text_box(NOTIFY_WINDOW)
+            WriteInt(blk + HDR_GHOST_SINCE, 0, true)
+        end
+    else
+        WriteInt(blk + HDR_GHOST_SINCE, 0, true)
     end
-    local since = ReadInt(blk + OFF_GHOST_SINCE_MS, true)
-    if since == 0 then
-        WriteInt(blk + OFF_GHOST_SINCE_MS, now_ms(), true)
-    elseif now_ms() - since >= GHOST_TIMEOUT_MS then
-        close_text_box(window_id)
-        WriteInt(blk + OFF_GHOST_SINCE_MS, 0, true)
+end
+
+local function play_message_sound(blk)
+    local state = window_state()
+    local pos = message_position()
+    local last_pos = ReadInt(blk + HDR_LAST_POS, true)
+    local last_state = ReadInt(blk + HDR_LAST_STATE, true)
+    if state == 2 and (pos ~= last_pos or last_state ~= 2) and pos >= 0 and pos < message_count() then
+        local sound = ReadInt(blk + OFF_SOUNDS + pos * 4, true)
+        if sound >= 0 and fnc_play_se2 ~= nil then
+            kh1_native.call_function(fnc_play_se2, sound, 0)
+        end
+    end
+    WriteInt(blk + HDR_LAST_POS, pos, true)
+    WriteInt(blk + HDR_LAST_STATE, state, true)
+end
+
+local function feed_held(blk)
+    while ReadInt(blk + HDR_HELD_COUNT, true) > 0 and can_show(blk) do
+        local m = peek_held(blk)
+        if not m or not show(blk, m) then break end
+        drop_held(blk)
     end
 end
 
 local function update_text_boxes()
-    local blk = boxes_block()
+    local blk = block()
     if not blk then return end
-    local now = now_ms()
-    local current_world = get_world()
-    local current_room = get_room()
-    for window_id = 0, WINDOW_COUNT - 1 do
-        local rec = blk + window_id * BOX_STRIDE
-        if ReadInt(rec + BOX_VALID, true) == 1 then
-            local deadline = ReadInt(rec + BOX_DEADLINE_MS, true)
-            local timed_out = deadline > 0 and now >= deadline
-            local transitioned = current_world ~= ReadInt(rec + BOX_WORLD, true)
-                or current_room ~= ReadInt(rec + BOX_ROOM, true)
-            if timed_out or transitioned then
-                close_text_box(window_id)
-            end
-        end
-    end
     close_ghost_window(blk)
+    feed_held(blk)
+    play_message_sound(blk)
 end
 
 return {
-    set_text_box_style = set_text_box_style,
-    set_text_box_position = set_text_box_position,
-    set_text_box_size = set_text_box_size,
-    set_text_box_tail_type = set_text_box_tail_type,
-    is_text_box_busy = is_text_box_busy,
+    queue_text_box = queue_text_box,
     open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,
+    is_text_box_busy = is_text_box_busy,
+    pending_count = pending_count,
 }
