@@ -24,12 +24,13 @@ local TICKS_PER_SECOND = 30
 local DEFAULT_DURATION = 2.5
 local GHOST_GRACE_MS   = 500  -- an open window with nothing queued for this long belongs to nobody
 local EV_STRING_TABLE_MAX = 1536
+local SLOT_BASE        = EV_STRING_TABLE_MAX - SLOT_COUNT  -- 1504..1535: above any script, never refilled
 local WINDOW_SLOTS     = 4
 local MSG_QUEUE_STRIDE = 0x200
 local MSG_QUEUE_ENTRIES = 0x100
 
-local BLOCK_KEY  = "kh1_textbox_queue_v6"
-local MAGIC      = 0x54425136
+local BLOCK_KEY  = "kh1_textbox_queue_v8"
+local MAGIC      = 0x54425138
 local TEMPLATE_SIZE = 0xD0
 local INSTANCE_SIZE = 0xD0
 local INST_CLOSE_SPEED = 0x12  -- u16 frames on a live instance (looked up from the index at open)
@@ -37,11 +38,9 @@ local TPL_CLOSE_SPEED_INDEX = 0xE  -- u16 index into the close speed table {0, 4
 local INST_STATE = 0x20        -- 0 none, 1 opening, 2 open, 3 close requested, 4 closing, 5 finishing
 local INST_CALLBACK = 0x18     -- completion callback pointer
 local INST_STATE_FINISH = 5
+local INST_TEXT_PTR = 0x88     -- KHSCII pointer of the message the instance is showing
 
 local HDR_MAGIC       = 0x00
-local HDR_SLOT_VALID  = 0x04
-local HDR_SLOT_BASE   = 0x08
-local HDR_SLOT_TABLE  = 0x0C  -- g_EVScriptLoaded value after our reservation
 local HDR_NEXT_BUF    = 0x10
 local HDR_HELD_HEAD   = 0x14
 local HDR_HELD_COUNT  = 0x18
@@ -62,7 +61,8 @@ local HDR_LOOK_Y      = 0x50
 local HDR_LOOK_WIDTH  = 0x54
 local HDR_LOOK_HEIGHT = 0x58
 local HDR_LOOK_TAIL   = 0x5C
-local OFF_SOUNDS      = 0x80                                -- int32[MSG_QUEUE_ENTRIES], by queue position
+local HDR_LAST_TEXT   = 0x60  -- text pointer last seen on our window (8 bytes)
+local OFF_SOUNDS      = 0x80                                -- int32[MSG_QUEUE_ENTRIES], by buffer index
 local OFF_BUFFERS     = OFF_SOUNDS + MSG_QUEUE_ENTRIES * 4  -- SLOT_COUNT * BUF_SIZE
 local OFF_HELD        = OFF_BUFFERS + SLOT_COUNT * BUF_SIZE
 local HELD_TEXT_MAX   = 511
@@ -95,7 +95,6 @@ local function block()
     local blk = kh1_native.persistent_block(BLOCK_KEY, BLOCK_SIZE)
     if blk == 0 or blk == nil then return nil end
     if ReadInt(blk + HDR_MAGIC, true) ~= MAGIC then
-        WriteInt(blk + HDR_SLOT_VALID, 0, true)
         WriteInt(blk + HDR_NEXT_BUF, 0, true)
         WriteInt(blk + HDR_HELD_HEAD, 0, true)
         WriteInt(blk + HDR_HELD_COUNT, 0, true)
@@ -110,6 +109,7 @@ local function block()
         WriteInt(blk + HDR_GHOST_SINCE, 0, true)
         WriteInt(blk + HDR_SHOWN_AT_MS, 0, true)
         WriteInt(blk + HDR_LOOK_FLAGS, 0, true)
+        WriteLong(blk + HDR_LAST_TEXT, 0, true)
         WriteInt(blk + HDR_MAGIC, MAGIC, true)
     end
     return blk
@@ -163,6 +163,23 @@ local function window_syscalls_enabled()
     return ReadByte(inCutscene) % 2 == 0 and ReadInt(g_EVCutsceneCheck) == 0
 end
 
+-- Bit 1 of the same byte is event mode: Enter_event_mode sets it, Exit_event_mode clears it.
+-- Notifications wait it out so they never sit on top of story dialogue; the held ring keeps them.
+local function event_active()
+    return math.floor(ReadByte(inCutscene) / 2) % 2 == 1
+end
+
+-- The buffer index our window is currently showing, or nil. Read from the instance itself, so
+-- other windows opening or advancing cannot confuse it (the position global is shared).
+local function showing_index(blk)
+    local slot = instance_slot()
+    if not slot or window_state() ~= 2 then return nil end
+    local ptr = ReadLong(g_EVWindowInstances + slot * INSTANCE_SIZE + INST_TEXT_PTR)
+    local rel = ptr - (blk + OFF_BUFFERS)
+    if rel < 0 or rel % BUF_SIZE ~= 0 or rel / BUF_SIZE >= SLOT_COUNT then return nil end
+    return rel / BUF_SIZE
+end
+
 local function is_text_box_busy(window_id)
     return ReadByte(g_EVWindowState + (window_id or NOTIFY_WINDOW)) ~= 0
 end
@@ -171,50 +188,41 @@ end
 -- # EV string slots      # --
 -- ######################## --
 
--- Our reservation stays valid while the table has only grown above it (the game appends its own
--- chest / munny / gift strings at the top, which must not disturb messages in flight) and our
--- pointers are still in place. An EV script load resets the count below us or refills our
--- entries; only then do we reserve again, at the new top. The buffer ring is never reset: a
--- message still on screen keeps its buffer until 32 newer ones have gone by.
+-- Our messages use the top 32 entries of the EV string table. Script loads refill indices
+-- 0..count-1 only and the game appends its own strings at count, so nothing else ever writes
+-- there as long as the loaded script has fewer than 1504 strings. We never touch the count. The
+-- pointers are checked on every show and rewritten if anything clobbered them.
 local function ensure_slots(blk)
-    local count = ReadInt(g_EVScriptLoaded)
-    if ReadInt(blk + HDR_SLOT_VALID, true) == 1 then
-        local base = ReadInt(blk + HDR_SLOT_BASE, true)
-        if count >= base + SLOT_COUNT
-            and ReadLong(g_pEVStringDataPtr + base * 8) == blk + OFF_BUFFERS then
-            return base
+    if ReadInt(g_EVScriptLoaded) > SLOT_BASE then return nil end
+    if ReadLong(g_pEVStringDataPtr + SLOT_BASE * 8) ~= blk + OFF_BUFFERS then
+        for i = 0, SLOT_COUNT - 1 do
+            WriteLong(g_pEVStringDataPtr + (SLOT_BASE + i) * 8, blk + OFF_BUFFERS + i * BUF_SIZE)
         end
+        ConsolePrint(string.format("kh1_lua_library: EV string slots %d..%d pointed at the notification buffers", SLOT_BASE, SLOT_BASE + SLOT_COUNT - 1))
     end
-    if count + SLOT_COUNT > EV_STRING_TABLE_MAX then return nil end
-    for i = 0, SLOT_COUNT - 1 do
-        WriteLong(g_pEVStringDataPtr + (count + i) * 8, blk + OFF_BUFFERS + i * BUF_SIZE)
-    end
-    WriteInt(g_EVScriptLoaded, count + SLOT_COUNT)
-    WriteInt(blk + HDR_SLOT_BASE, count, true)
-    WriteInt(blk + HDR_SLOT_TABLE, count + SLOT_COUNT, true)
-    WriteInt(blk + HDR_SLOT_VALID, 1, true)
-    ConsolePrint(string.format("kh1_lua_library: reserved EV string slots %d..%d", count, count + SLOT_COUNT - 1))
-    return count
+    return SLOT_BASE
 end
 
 local function owns_window(blk)
     if window_state() == 0 then return false end
     local id = last_message_id()
-    if id == nil then return false end
-    local base = ReadInt(blk + HDR_SLOT_BASE, true)
-    return ReadInt(blk + HDR_SLOT_VALID, true) == 1 and id >= base and id < base + SLOT_COUNT
+    return id ~= nil and id >= SLOT_BASE and id < SLOT_BASE + SLOT_COUNT
 end
 
 -- Messages queued on the window that have not finished showing. The position global is only
 -- meaningful while the window is displaying or idle; while it is closed or still opening,
 -- everything queued is still ahead.
-local function in_flight()
+local function in_flight(blk)
     local count = message_count()
     local state = window_state()
-    if state ~= 2 and state ~= 4 then return count end
-    local pos = message_position()
-    if pos < 0 or pos > count then return count end
-    return count - pos
+    if state == 4 then return 0 end
+    if state ~= 2 then return count end
+    local index = showing_index(blk)
+    if index == nil then return count end
+    for pos = count - 1, 0, -1 do
+        if ReadByte(blk + OFF_POS_BUF + pos, true) == index then return count - pos end
+    end
+    return count
 end
 
 -- ######################## --
@@ -364,8 +372,8 @@ end
 -- The window is free for a message when it is closed, or open with our own messages on it, not
 -- already closing, and opened with the same look. In-flight messages must not exceed our ring.
 local function can_show(blk, m)
-    if not window_syscalls_enabled() then return false end
-    if in_flight() >= SLOT_COUNT then return false end
+    if not window_syscalls_enabled() or event_active() then return false end
+    if in_flight(blk) >= SLOT_COUNT then return false end
     if window_state() == 0 then return true end
     return owns_window(blk) and not window_closing() and look_matches(blk, m)
 end
@@ -390,8 +398,8 @@ local function show(blk, m)
     write_buffer(blk, index, m.text, m.duration)
     write_record(blk + OFF_MIRROR + index * HELD_STRIDE, m)
     local position = message_count()
+    WriteInt(blk + OFF_SOUNDS + index * 4, m.sound or -1, true)
     if position >= 0 and position < MSG_QUEUE_ENTRIES then
-        WriteInt(blk + OFF_SOUNDS + position * 4, m.sound or -1, true)
         WriteByte(blk + OFF_POS_BUF + position, index, true)
     end
     kh1_native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, base + index})
@@ -464,7 +472,7 @@ end
 local function pending_count()
     local blk = block()
     if not blk then return 0 end
-    return ReadInt(blk + HDR_HELD_COUNT, true) + in_flight()
+    return ReadInt(blk + HDR_HELD_COUNT, true) + in_flight(blk)
 end
 
 -- Put the messages that were still ahead on the wiped window back at the front of the held ring,
@@ -601,27 +609,42 @@ local function log_script_loads(blk)
 end
 
 local function play_message_sound(blk)
+    local slot = instance_slot()
     local state = window_state()
-    local pos = message_position()
-    local last_pos = ReadInt(blk + HDR_LAST_POS, true)
-    local last_state = ReadInt(blk + HDR_LAST_STATE, true)
-    if state == 2 and (pos ~= last_pos or last_state ~= 2) and pos >= 0 and pos < message_count() then
-        local shown_at = ReadInt(blk + HDR_SHOWN_AT_MS, true)
-        ConsolePrint(string.format("kh1_lua_library: window %d showing message %d of %d (%d ms after the previous)",
-            NOTIFY_WINDOW, pos + 1, message_count(), shown_at > 0 and (now_ms() - shown_at) or 0))
-        WriteInt(blk + HDR_SHOWN_AT_MS, now_ms(), true)
-        local sound = ReadInt(blk + OFF_SOUNDS + pos * 4, true)
-        if sound >= 0 and fnc_play_se2 ~= nil then
-            kh1_native.call_function(fnc_play_se2, sound, 0)
+    local ptr = 0
+    if slot and state == 2 then
+        ptr = ReadLong(g_EVWindowInstances + slot * INSTANCE_SIZE + INST_TEXT_PTR)
+    end
+    local last = ReadLong(blk + HDR_LAST_TEXT, true)
+    if ptr ~= last then
+        WriteLong(blk + HDR_LAST_TEXT, ptr, true)
+        local index = showing_index(blk)
+        if index ~= nil then
+            local shown_at = ReadInt(blk + HDR_SHOWN_AT_MS, true)
+            ConsolePrint(string.format("kh1_lua_library: window %d showing a message (%d ms after the previous, %d queued)",
+                NOTIFY_WINDOW, shown_at > 0 and (now_ms() - shown_at) or 0, message_count()))
+            WriteInt(blk + HDR_SHOWN_AT_MS, now_ms(), true)
+            local sound = ReadInt(blk + OFF_SOUNDS + index * 4, true)
+            if sound >= 0 and fnc_play_se2 ~= nil then
+                kh1_native.call_function(fnc_play_se2, sound, 0)
+            end
         end
     end
-    WriteInt(blk + HDR_LAST_POS, pos, true)
+    WriteInt(blk + HDR_LAST_POS, message_position(), true)
     WriteInt(blk + HDR_LAST_STATE, state, true)
     local count = message_count()
     WriteInt(blk + HDR_LAST_COUNT, count, true)
-    if count > 0 and (state == 2 or state == 4) and pos >= 0 and pos <= count then
-        WriteInt(blk + HDR_GOOD_POS, pos, true)
-        WriteInt(blk + HDR_GOOD_COUNT, count, true)
+    if count > 0 and state == 2 then
+        local index = showing_index(blk)
+        if index ~= nil then
+            for pos = count - 1, 0, -1 do
+                if ReadByte(blk + OFF_POS_BUF + pos, true) == index then
+                    WriteInt(blk + HDR_GOOD_POS, pos, true)
+                    WriteInt(blk + HDR_GOOD_COUNT, count, true)
+                    break
+                end
+            end
+        end
     end
 end
 
