@@ -725,7 +725,6 @@ return {
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
     play_se2 = play_se2,
     queue_text_box = kh1_text_boxes.queue_text_box,
-    open_text_box = kh1_text_boxes.open_text_box,
     close_text_box = kh1_text_boxes.close_text_box,
     update_text_boxes = kh1_text_boxes.update_text_boxes,
     is_text_box_busy = kh1_text_boxes.is_text_box_busy,

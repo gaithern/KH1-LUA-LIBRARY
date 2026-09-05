@@ -2,7 +2,7 @@
 
 LUAGUI_NAME = "KH1TextBoxDriver"
 LUAGUI_AUTH = "Gicu"
-LUAGUI_DESC = "Closes expired text boxes opened through kh1_lua_library.open_text_box"
+LUAGUI_DESC = "Drives the kh1_lua_library notification text box queue every frame"
 
 local kh1_lua_library = require("kh1_lua_library")
 

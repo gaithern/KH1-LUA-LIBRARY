@@ -137,10 +137,8 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `play_se2` | `se_id, param_2` | boolean | Plays a sound effect using the in-game function. |
 | `show_prompt` | `input_title, input_party, duration, colour` | boolean | Shows level-up-style prompts over party members. `input_title` and `input_party` are tables indexed 1-3 (Sora/ally 1/ally 2); each party entry is 1-2 lines of text. |
 | `show_custom_item_popup` | `text` | boolean | Forces a map-prize pickup popup with custom text. |
-| `open_text_box` | `text, window_id, duration_seconds, style, x, y, width, height, tail_type` | boolean | Opens a text box with custom text. Only `text` is required; `duration_seconds` auto-closes it. |
-| `close_text_box` | `window_id` | boolean | Closes an open text box (`window_id` defaults to 1). |
-| `update_text_boxes` | none | none | Handles timed closing of open text boxes; call every frame from `_OnFrame`. |
-| `set_text_box_style` | `window_id, style` | boolean | Sets a text box's style. |
-| `set_text_box_position` | `window_id, x, y` | boolean | Sets a text box's on-screen position. |
-| `set_text_box_size` | `window_id, width, height` | boolean | Sets a text box's width/height. |
-| `set_text_box_tail_type` | `window_id, tail_type` | boolean | Sets a text box's tail. 0 = plain box; 1 and 2 are the tailed/thought-bubble variants. |
+| `queue_text_box` | `{text, duration, sound, style, x, y, width, height, tail, auto_width}` | boolean | Queues a notification text box on the shared notification window. Only `text` is required. |
+| `close_text_box` | none | boolean | Closes the notification window. |
+| `update_text_boxes` | none | none | Feeds held messages, plays their sounds and repairs the window after an event script load. The library's driver script already calls this every frame; outside consumers shouldn't need to use this. |
+| `is_text_box_busy` | none | boolean | True while the notification window is open. |
+| `text_box_pending` | none | integer | Number of messages still held or waiting on the window's queue. |

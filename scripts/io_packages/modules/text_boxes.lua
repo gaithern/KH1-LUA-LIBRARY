@@ -165,8 +165,8 @@ local function showing_index(blk)
     return rel / BUF_SIZE
 end
 
-local function is_text_box_busy(window_id)
-    return ReadByte(g_EVWindowState + (window_id or NOTIFY_WINDOW)) ~= 0
+local function is_text_box_busy()
+    return ReadByte(g_EVWindowState + NOTIFY_WINDOW) ~= 0
 end
 
 local function ensure_slots(blk)
@@ -409,15 +409,8 @@ local function queue_text_box(opts)
     return true
 end
 
-local function open_text_box(text, window_id, duration_seconds, style, x, y, width, height, tail_type)
-    return queue_text_box{
-        text = text, duration = duration_seconds, style = style,
-        x = x, y = y, width = width, height = height, tail = tail_type,
-    }
-end
-
-local function close_text_box(window_id)
-    return kh1_native.call_evdl_syscall(fnc_002_close_window, {window_id or NOTIFY_WINDOW})
+local function close_text_box()
+    return kh1_native.call_evdl_syscall(fnc_002_close_window, {NOTIFY_WINDOW})
 end
 
 local function pending_count()
@@ -606,7 +599,6 @@ end
 
 return {
     queue_text_box = queue_text_box,
-    open_text_box = open_text_box,
     close_text_box = close_text_box,
     update_text_boxes = update_text_boxes,
     is_text_box_busy = is_text_box_busy,
