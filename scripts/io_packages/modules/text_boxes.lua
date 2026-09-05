@@ -73,6 +73,7 @@ local FLAG_POS   = 2
 local FLAG_SIZE  = 4
 local FLAG_TAIL  = 8
 local FLAG_SOUND = 16
+local FLAG_AUTO  = 32
 
 local function now_ms()
     return math.floor(os.clock() * 1000)
@@ -223,6 +224,7 @@ local function write_record(rec, m)
         WriteInt(rec + HELD_HEIGHT, m.height, true)
     end
     if m.tail ~= nil then flags = flags + FLAG_TAIL; WriteInt(rec + HELD_TAIL, m.tail, true) end
+    if m.auto_width then flags = flags + FLAG_AUTO end
     WriteInt(rec + HELD_FLAGS, flags, true)
 end
 
@@ -248,6 +250,7 @@ local function read_record(rec)
         width = opt(FLAG_SIZE, HELD_WIDTH),
         height = opt(FLAG_SIZE, HELD_HEIGHT),
         tail = opt(FLAG_TAIL, HELD_TAIL),
+        auto_width = (flags % (FLAG_AUTO * 2) >= FLAG_AUTO) or nil,
     }
     return m
 end
@@ -284,18 +287,20 @@ local function restore_template(blk)
     WriteInt(blk + HDR_LOOK_DIRTY, 0, true)
 end
 
-local function apply_look(m)
+local function apply_look(m, string_id)
     if m.style ~= nil then
         kh1_native.call_evdl_syscall(fnc_005_set_window_type, {NOTIFY_WINDOW, m.style})
     end
     if m.tail ~= nil then
         kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {NOTIFY_WINDOW, m.tail})
     end
-    if m.x ~= nil and m.y ~= nil then
-        kh1_native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, m.x, m.y})
-    end
     if m.width ~= nil and m.height ~= nil then
         kh1_native.call_evdl_syscall(fnc_004_set_window_size, {NOTIFY_WINDOW, m.width, m.height})
+    end
+    if m.auto_width and string_id ~= nil and fnc_16D_set_window_width_auto ~= nil then
+        kh1_native.call_evdl_syscall(fnc_16D_set_window_width_auto, {NOTIFY_WINDOW, string_id, m.x or 0, m.y or 0})
+    elseif m.x ~= nil and m.y ~= nil then
+        kh1_native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, m.x, m.y})
     end
 end
 
@@ -332,15 +337,19 @@ local function can_show(blk, m)
     if not window_syscalls_enabled() or event_active() then return false end
     if in_flight(blk) >= SLOT_COUNT then return false end
     if window_state() == 0 then return true end
+    if m.auto_width then return false end
     return owns_window(blk) and not window_closing() and look_matches(blk, m)
 end
 
 local function show(blk, m)
     local base = ensure_slots(blk)
     if base == nil then return false end
+    local index = ReadInt(blk + HDR_NEXT_BUF, true)
+    write_buffer(blk, index, m.text, m.duration)
+    write_record(blk + OFF_MIRROR + index * HELD_STRIDE, m)
     if window_state() == 0 then
         save_template(blk)
-        apply_look(m)
+        apply_look(m, base + index)
         record_look(blk, m) 
         WriteShort(template_addr() + TPL_CLOSE_SPEED_INDEX, 0)   
         local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
@@ -349,9 +358,6 @@ local function show(blk, m)
         end
         WriteInt(blk + HDR_OUR_WINDOW, 1, true)
     end
-    local index = ReadInt(blk + HDR_NEXT_BUF, true)
-    write_buffer(blk, index, m.text, m.duration)
-    write_record(blk + OFF_MIRROR + index * HELD_STRIDE, m)
     local position = message_count()
     WriteInt(blk + OFF_SOUNDS + index * 4, m.sound or -1, true)
     if position >= 0 and position < MSG_QUEUE_ENTRIES then

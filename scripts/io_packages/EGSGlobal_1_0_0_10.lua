@@ -335,6 +335,7 @@ fnc_0B1_open_window_no_close = 0x1B7020
 fnc_005_set_window_type = 0x1B77A0
 fnc_003_set_window_position = 0x1B7620
 fnc_004_set_window_size = 0x1B7680
+fnc_16D_set_window_width_auto = 0x1B5B30
 fnc_050_set_window_tail_type = 0x1B7760
 fnc_116_game_over = 0x1AA940
 fnc_trigger_ko_event_script = 0x1C2280
