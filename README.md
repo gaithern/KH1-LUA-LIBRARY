@@ -137,7 +137,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `play_se2` | `se_id, param_2` | boolean | Plays a sound effect using the in-game function. |
 | `show_prompt` | `input_title, input_party, duration, colour` | boolean | Shows level-up-style prompts over party members. `input_title` and `input_party` are tables indexed 1-3 (Sora/ally 1/ally 2); each party entry is 1-2 lines of text. |
 | `show_custom_item_popup` | `text` | boolean | Forces a map-prize pickup popup with custom text. |
-| `open_text_box` | `text, window_id, duration_seconds, style, x, y, width, height, tail_type` | boolean | Opens a text box with custom text. Only `text` is required; `duration_seconds` auto-closes it (requires `update_text_boxes`). |
+| `open_text_box` | `text, window_id, duration_seconds, style, x, y, width, height, tail_type` | boolean | Opens a text box with custom text. Only `text` is required; `duration_seconds` auto-closes it. |
 | `close_text_box` | `window_id` | boolean | Closes an open text box (`window_id` defaults to 1). |
 | `update_text_boxes` | none | none | Handles timed closing of open text boxes; call every frame from `_OnFrame`. |
 | `set_text_box_style` | `window_id, style` | boolean | Sets a text box's style. |
