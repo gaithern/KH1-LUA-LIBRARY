@@ -477,7 +477,6 @@ local function enable_ability(ability)
     elseif ability == "Second Chance"   then memory_location = {experienceMult - 0x94DC,  5}
     elseif ability == "Berserk"         then memory_location = {experienceMult - 0x94DC,  6}
     elseif ability == "Leaf Bracer"     then memory_location = {experienceMult - 0x94DC,  7} end
-
     if memory_location then
         WriteBit(memory_location[1], memory_location[2], 1)
     end
