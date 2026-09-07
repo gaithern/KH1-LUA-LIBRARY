@@ -449,6 +449,9 @@ end
 local function enable_ability(ability)
     -- Enables an ability even if Sora doesn't have it or it isn't equipped
     local memory_location = nil
+
+    -- Counterattack in Atlantica can cause freezes, so we should refuse to set it there.
+    if get_world() == 9 and ability == "Counterattack" then return end
     
         if ability == "Vortex"          then memory_location = {soraHP + 0x1FC4,          1}
     elseif ability == "Aerial Sweep"    then memory_location = {soraHP + 0x1FC4,          2}
@@ -474,7 +477,7 @@ local function enable_ability(ability)
     elseif ability == "Second Chance"   then memory_location = {experienceMult - 0x94DC,  5}
     elseif ability == "Berserk"         then memory_location = {experienceMult - 0x94DC,  6}
     elseif ability == "Leaf Bracer"     then memory_location = {experienceMult - 0x94DC,  7} end
-    
+
     if memory_location then
         WriteBit(memory_location[1], memory_location[2], 1)
     end
