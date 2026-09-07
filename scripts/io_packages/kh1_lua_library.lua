@@ -617,6 +617,12 @@ local function play_se2(se_id, param_2)
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
 end
 
+local function apply_world_set_row(world_id, set_index)
+    -- Applies one row of allset.set: the game's own pre-authored per-room map-state
+    -- ("set number") table for a world.
+    kh1_native.call_function(fnc_apply_allset_row, world_id, set_index)
+end
+
 local function sora_koed()
     -- Returns if Sora's current HP is 0
     return ReadByte(maxHP - 0x1) == 0
@@ -726,6 +732,7 @@ return {
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
     play_se2 = play_se2,
+    apply_world_set_row = apply_world_set_row,
     queue_text_box = kh1_text_boxes.queue_text_box,
     close_text_box = kh1_text_boxes.close_text_box,
     update_text_boxes = kh1_text_boxes.update_text_boxes,

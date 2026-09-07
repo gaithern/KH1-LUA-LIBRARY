@@ -371,3 +371,4 @@ g_PartyMember1ObjectPtr = 0x2D37C88
 g_PartyMember2ObjPtr    = 0x2D37C90
 entityPoolBase          = 0x2D37CA0
 text_slot_table_base = 0x2678C80
+fnc_apply_allset_row = 0x17AB90

@@ -374,3 +374,4 @@ fnc_display_message_anim_hook = 0x1B9133
 fnc_display_message_anim_resume = 0x1B913C
 fnc_display_message_anim_call_target = 0x1764E0
 fnc_play_se2 = 0x1787D0
+fnc_apply_allset_row = 0x17CC70
