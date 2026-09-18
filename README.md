@@ -36,6 +36,7 @@ Below you'll find key components of the repository and their descriptions.
   | `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
   | `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
   | `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
+  | `memory_locations.lua` | Named save-block addresses (`saveData1`/`saveData2` + offset), loaded by `VersionCheck` after the version file. Names match `save_data_labels.json` in KH1-EVDL-TOOLS. |
   | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Steam v1.0.0.2. |
   | `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
 - `build.py`
