@@ -18,6 +18,7 @@ DAY_2_MATERIALS_REQUIRED        = saveData1 + 0x04A -- RANDO ONLY
 HOMECOMING_MATERIALS_REQUIRED   = saveData1 + 0x04B -- RANDO ONLY
 SHORTEN_GO_MODE                 = saveData1 + 0x04C -- RANDO ONLY
 HOMECOMING_ARRIVAL_PENDING      = saveData1 + 0x04D -- RANDO ONLY
+AERITH_GIFT_GIVEN               = saveData1 + 0x10F
 CID_PREREQUISITE                = saveData1 + 0x11A
 NATURESPARK_IN_BAG              = saveData1 + 0x128
 WATERGLEAM_IN_BAG               = saveData1 + 0x129
