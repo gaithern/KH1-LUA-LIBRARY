@@ -171,7 +171,7 @@ HALLOWEEN_TOWN_PROGRESS         = saveData1 + 0x90C
 NEVERLAND_PROGRESS              = saveData1 + 0x90D
 HOLLOW_BASTION_PROGRESS         = saveData1 + 0x90E
 END_OF_THE_WORLD_PROGRESS       = saveData1 + 0x90F
-TRAVERSE_TOWN_PROGRESS_2        = saveData1 + 0x912 -- save_data2
+TRAVERSE_TOWN_PROGRESS_2        = saveData1 + 0x912
 
 -- save_data2
 PREVIOUS_WORLD                  = saveData2 + 0x000
@@ -203,7 +203,7 @@ TT_SAFE_POSTCARD                = saveData2 + 0x0B7
 OPPOSITE_STATE                  = saveData2 + 0x0B8
 TT_GIZMO_SHOP_SWITCHES          = saveData2 + 0x0BD
 POSTCARDS_MAILED                = saveData2 + 0x0BF
-EVIDENCE_BOXES_OPENED           = saveData2 + 0x10E -- bit 7 Footprints, 6 Claw Marks, 5 Stench, 4 Antenna box opened (bits 0-3 written on pickup, never read)
+EVIDENCE_BOXES_OPENED           = saveData2 + 0x10E
 DJ_RECIPE_CARD_110_TAKEN        = saveData2 + 0x110
 DJ_RECIPE_CARD_114_TAKEN        = saveData2 + 0x114
 DJ_RECIPE_CARD_115_TAKEN        = saveData2 + 0x115
@@ -270,10 +270,10 @@ DH04_SET_NUMBER                 = saveData2 + 0x46F
 DH05_SET_NUMBER                 = saveData2 + 0x470
 DH06_SET_NUMBER                 = saveData2 + 0x471
 DH07_SET_NUMBER                 = saveData2 + 0x472
-DI01_SET_NUMBER                 = saveData2 + 0x473 -- room set-number table entry; 0 = Day 1 map, 2 = Day 2
+DI01_SET_NUMBER                 = saveData2 + 0x473
 DI02_SET_NUMBER                 = saveData2 + 0x474
 DI03_SET_NUMBER                 = saveData2 + 0x475
-DI04_SET_NUMBER                 = saveData2 + 0x476 -- room set-number table entry
+DI04_SET_NUMBER                 = saveData2 + 0x476
 DI05_SET_NUMBER                 = saveData2 + 0x477
 DI06_SET_NUMBER                 = saveData2 + 0x478
 DI07_SET_NUMBER                 = saveData2 + 0x479
