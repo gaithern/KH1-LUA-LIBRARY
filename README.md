@@ -36,6 +36,7 @@ Below you'll find key components of the repository and their descriptions.
   | `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
   | `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
   | `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
+  | `memory_locations.lua` | Named save-block addresses (`saveData1`/`saveData2` + offset), loaded by `VersionCheck` after the version file. Names match `save_data_labels.json` in KH1-EVDL-TOOLS. |
   | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Steam v1.0.0.2. |
   | `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
 - `build.py`
@@ -135,6 +136,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `spawn_prize` | `item_id` | boolean | Calls the in-game function to spawn a map prize at Sora's position. |
 | `spawn_enemy` | `model_path, x, y, z` | `boolean, reason` | Spawns an enemy by model path.|
 | `play_se2` | `se_id, param_2` | boolean | Plays a sound effect using the in-game function. |
+| `apply_world_set_row` | `world_id, set_index` | none | Applies one row of `allset.set` (the game's pre-authored per-room map states) to a world. |
 | `show_prompt` | `input_title, input_party, duration, colour` | boolean | Shows level-up-style prompts over party members. `input_title` and `input_party` are tables indexed 1-3 (Sora/ally 1/ally 2); each party entry is 1-2 lines of text. |
 | `show_custom_item_popup` | `text` | boolean | Forces a map-prize pickup popup with custom text. |
 | `queue_text_box` | `{text, duration, sound, style, x, y, width, height, tail, auto_width}` | boolean | Queues a notification text box on the shared notification window. Only `text` is required. |
