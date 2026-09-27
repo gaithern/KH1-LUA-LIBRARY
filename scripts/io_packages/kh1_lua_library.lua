@@ -591,7 +591,7 @@ end
 local function grant_shared_ability(shared_ability_value)
     -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
-    if current_shared_abilities_qty < 8 then
+    if current_shared_abilities_qty < 9 then
         WriteByte(sharedAbilities + current_shared_abilities_qty, shared_ability_value + 128)
     end
 end
