@@ -21,6 +21,7 @@ local kh1_khscii = require("helpers.khscii")
 local kh1_text_boxes = require("modules.text_boxes")
 local kh1_prize_popup = require("modules.prize_popup")
 local kh1_level_up_prompt = require("modules.level_up_prompt")
+local kh1_abilities = require("modules.abilities")
 
 local GetKHSCII = kh1_khscii.GetKHSCII
 
@@ -591,7 +592,7 @@ end
 local function grant_shared_ability(shared_ability_value)
     -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
-    if current_shared_abilities_qty < 8 then
+    if current_shared_abilities_qty < 9 then
         WriteByte(sharedAbilities + current_shared_abilities_qty, shared_ability_value + 128)
     end
 end
@@ -728,6 +729,7 @@ return {
     is_in_gummi = is_in_gummi,
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
+    register_ability = kh1_abilities.register_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
