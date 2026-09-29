@@ -38,6 +38,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/kh1_native.dll
+- name: scripts/io_packages/memory_locations.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/memory_locations.lua
 - name: scripts/io_packages/modules/creature_data.lua
   method: copy
   source:

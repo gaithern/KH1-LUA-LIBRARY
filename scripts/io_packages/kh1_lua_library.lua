@@ -591,7 +591,7 @@ end
 local function grant_shared_ability(shared_ability_value)
     -- Grants the party a shared ability
     local current_shared_abilities_qty = #get_shared_abilities()
-    if current_shared_abilities_qty < 8 then
+    if current_shared_abilities_qty < 9 then
         WriteByte(sharedAbilities + current_shared_abilities_qty, shared_ability_value + 128)
     end
 end
@@ -615,6 +615,12 @@ end
 local function play_se2(se_id, param_2)
     -- Plays a sound effect using the in game function.
     return kh1_native.call_function(fnc_play_se2, se_id, param_2)
+end
+
+local function apply_world_set_row(world_id, set_index)
+    -- Applies one row of allset.set: the game's own pre-authored per-room map-state
+    -- ("set number") table for a world.
+    kh1_native.call_function(fnc_apply_allset_row, world_id, set_index)
 end
 
 local function sora_koed()
@@ -726,6 +732,7 @@ return {
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
     play_se2 = play_se2,
+    apply_world_set_row = apply_world_set_row,
     queue_text_box = kh1_text_boxes.queue_text_box,
     close_text_box = kh1_text_boxes.close_text_box,
     update_text_boxes = kh1_text_boxes.update_text_boxes,

@@ -48,6 +48,10 @@ for _, version_name in ipairs(versions) do
 	end
 end
 
+if saveData1 then
+	importVars("memory_locations")
+end
+
 if not canExecute then
 	ConsolePrint("\n\n!!!!!!!! VERSION ERROR !!!!!!!!\n\nVersion check failed, check variable file version numbers against game version")
 end
