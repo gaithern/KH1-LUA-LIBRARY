@@ -6,6 +6,8 @@
 #include "call_bridge.h"
 #include "process_memory.h"
 #include "evdl_syscall.h"
+#include "c_hooks.h"
+#include "symbols.h"
 
 // Allows calling LogDebug from Lua
 extern "C" int l_log_debug(void* L) {
@@ -174,6 +176,20 @@ extern "C" int l_call_evdl_syscall(void* L) {
     return 2;
 }
 
+// Compiles a hook .c file (path relative to io_packages) and runs its
+// install(). Addresses come from the calling script's globals, so
+// VersionCheck must have run first.
+extern "C" int l_install_c(void* L) {
+    const char* path = p_lua_tolstring(L, 1, nullptr);
+    bool ok = false;
+    if (path) {
+        LoadSymbols(L);
+        ok = InstallC(path);
+    }
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
 // Name to function registration table.
 // The DLL's public API surface - those
 // features to be exposed to Lua.
@@ -190,6 +206,7 @@ static const luaL_Reg kh1_native_lib[] = {
     {"patch_code", reinterpret_cast<void*>(l_patch_code)},
     {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
     {"call_evdl_syscall", reinterpret_cast<void*>(l_call_evdl_syscall)},
+    {"install_c", reinterpret_cast<void*>(l_install_c)},
     {nullptr, nullptr}
 };
 

@@ -153,6 +153,19 @@
       <ProgramDatabaseFile>$(ProjectDir)x64\Release\$(TargetName).pdb</ProgramDatabaseFile>
     </Link>
   </ItemDefinitionGroup>
+  <!-- Dependencies are not vendored: build_deps.py fetches SafetyHook (+ Zydis) into
+       external\safetyhook and libtcc.dll into scripts\io_packages before anything compiles.
+       kh1_native.h lives in scripts\io_packages because TinyCC reads it there at runtime. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)external\safetyhook;$(ProjectDir)..\..\scripts\io_packages;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <PreBuildEvent>
+      <Command>python "$(ProjectDir)..\..\build_deps.py" || py "$(ProjectDir)..\..\build_deps.py"</Command>
+      <Message>Fetching SafetyHook and TinyCC</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
@@ -161,6 +174,9 @@
     <ClInclude Include="call_bridge.h" />
     <ClInclude Include="process_memory.h" />
     <ClInclude Include="evdl_syscall.h" />
+    <ClInclude Include="c_hooks.h" />
+    <ClInclude Include="hooks.h" />
+    <ClInclude Include="symbols.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
@@ -170,6 +186,15 @@
     <ClCompile Include="call_bridge.cpp" />
     <ClCompile Include="process_memory.cpp" />
     <ClCompile Include="evdl_syscall.cpp" />
+    <ClCompile Include="c_hooks.cpp" />
+    <ClCompile Include="hooks.cpp" />
+    <ClCompile Include="symbols.cpp" />
+    <ClCompile Include="external\safetyhook\safetyhook.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="external\safetyhook\Zydis.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
