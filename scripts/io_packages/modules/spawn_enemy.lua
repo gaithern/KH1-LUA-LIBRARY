@@ -7,20 +7,17 @@ local native_log = kh1_native.log_debug or function(_) end
 local function log(msg) native_log("[spawn_enemy] " .. msg) end
 
 -- ############################################################ --
--- # Species-table redirect: persistent control block + caves  # --
+-- # Species-table redirect: persistent control block           # --
 -- ############################################################ --
 
+-- The hooks are C in hooks/species_redirect.c; this side registers buffer
+-- rows and polls the load-complete fields. Layout must match its Ctrl struct.
 local CTRL_KEY  = "kh1_species_redirect_v2"
 local CTRL_SIZE = 0x4000
-local MAGIC     = 0x52454432  -- 'RED2'
 
-local OFF_MAGIC     = 0x00
-local OFF_VERSION   = 0x04
-local OFF_CAVE2     = 0x08
-local OFF_COMP      = 0x10   -- address of the file-load completion cave
-local OFF_BLOB_BASE = 0x18
+local OFF_COMP      = 0x10   -- address of the native file-load completion callback
 local OFF_REG_COUNT = 0x28
-local OFF_DONE_FLAG = 0x30   -- completion cave sets this to 1
+local OFF_DONE_FLAG = 0x30   -- completion callback sets this to 1
 local OFF_DONE_SIZE = 0x34   -- loaded size (ECX)
 local OFF_DONE_DEST = 0x38   -- loaded dest (R8)
 
@@ -28,20 +25,15 @@ local ROWS_BASE  = 0x100
 local ROW_STRIDE = 0x40
 local ROW_BUFBASE = 0x00
 local ROW_BUFEND  = 0x08
-local ROW_MOTION  = 0x10   -- motion blob pointer (returned by cave2)
+local ROW_MOTION  = 0x10   -- motion blob pointer (returned by the reverse-blob hook)
 local ROW_ACTIVE  = 0x18
 local ROW_TAG     = 0x1C
 local MAX_ROWS = (CTRL_SIZE - ROWS_BASE) // ROW_STRIDE
 
-local HOOK2_SPLICE_LEN = 14
-
 local ctrl = nil
-local module_base = nil
 
-local function abs(rva) return module_base + rva end
 local function ci(off) return ReadInt(ctrl + off, true) end
 local function wi(off, v) WriteInt(ctrl + off, v, true) end
-local function wl(off, v) WriteLong(ctrl + off, v, true) end
 local function row_addr(i) return ctrl + ROWS_BASE + i * ROW_STRIDE end
 
 local function rd_claim(buf_base, buf_end, tag)
@@ -97,76 +89,10 @@ local function rd_poll_done()
     return ReadLong(ctrl + OFF_DONE_DEST, true), ReadInt(ctrl + OFF_DONE_SIZE, true) & 0xFFFFFFFF
 end
 
-local sc = string.char
-local function jmp_abs(target)
-    return sc(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00) .. string.pack("<I8", target)
-end
-
--- hook2 (FUN_140285db0) splice. For a blob addr inside one of our rows, return that row's motion
--- pointer and RET; otherwise recompute the reverse-math index and fall through to the game's own
--- species-table lookup at hook2_resume. Byte layout verified against capstone (jump offsets fixed).
-local function build_cave2()
-    return
-        sc(0x4C,0x8B,0xD1) ..                                   -- mov r10, rcx
-        sc(0x48,0xB8) .. string.pack("<I8", ctrl) ..            -- mov rax, ctrl
-        sc(0x44,0x8B,0x58,0x28) ..                              -- mov r11d, [rax+0x28]  (regCount)
-        sc(0x45,0x85,0xDB) ..                                   -- test r11d, r11d
-        sc(0x0F,0x84,0x3D,0x00,0x00,0x00) ..                    -- jz FALLBACK
-        sc(0x4C,0x8D,0x80,0x00,0x01,0x00,0x00) ..               -- lea r8, [rax+0x100] (rows)
-        sc(0x41,0x83,0x78,0x18,0x00) ..                         -- LOOP: cmp dword [r8+0x18], 0 (active)
-        sc(0x0F,0x84,0x1E,0x00,0x00,0x00) ..                    -- jz NEXT
-        sc(0x49,0x8B,0x00) ..                                   -- mov rax, [r8]      (bufBase)
-        sc(0x49,0x39,0xC2) ..                                   -- cmp r10, rax
-        sc(0x0F,0x82,0x12,0x00,0x00,0x00) ..                    -- jb NEXT
-        sc(0x49,0x8B,0x40,0x08) ..                              -- mov rax, [r8+8]    (bufEnd)
-        sc(0x49,0x39,0xC2) ..                                   -- cmp r10, rax
-        sc(0x0F,0x83,0x05,0x00,0x00,0x00) ..                    -- jae NEXT
-        sc(0x49,0x8B,0x40,0x10) ..                              -- mov rax, [r8+0x10] (motionPtr)
-        sc(0xC3) ..                                             -- ret
-        sc(0x49,0x83,0xC0,0x40) ..                              -- NEXT: add r8, 0x40
-        sc(0x41,0xFF,0xCB) ..                                   -- dec r11d
-        sc(0x0F,0x85,0xCA,0xFF,0xFF,0xFF) ..                    -- jnz LOOP
-        sc(0x48,0xB8) .. string.pack("<I8", abs(speciesResourceTable)) .. -- FALLBACK: mov rax, blob_base
-        sc(0x48,0x2B,0xC8) ..                                   -- sub rcx, rax
-        sc(0x48,0xC1,0xE9,0x12) ..                              -- shr rcx, 0x12
-        jmp_abs(abs(fnc_reverse_blob_to_slot_ptr + HOOK2_SPLICE_LEN)) -- jmp hook2_resume
-end
-
--- File-load completion callback: (ECX=size, R8=dest). Stash both and raise a flag the driver polls.
-local function build_completion()
-    return
-        sc(0x48,0xB8) .. string.pack("<I8", ctrl + OFF_DONE_DEST) .. sc(0x4C,0x89,0x00) ..  -- mov [dest], r8
-        sc(0x48,0xB8) .. string.pack("<I8", ctrl + OFF_DONE_SIZE) .. sc(0x89,0x08) ..        -- mov [size], ecx
-        sc(0x48,0xB8) .. string.pack("<I8", ctrl + OFF_DONE_FLAG) .. sc(0xC7,0x00,0x01,0x00,0x00,0x00) .. -- mov [flag], 1
-        sc(0xC3)
-end
-
-local function rd_is_installed()
-    return ctrl ~= nil and ci(OFF_MAGIC) == MAGIC
-end
-
 local function rd_install()
-    module_base = kh1_native.get_module_base()
     ctrl = kh1_native.persistent_block(CTRL_KEY, CTRL_SIZE)
     if ctrl == 0 or ctrl == nil then return false, "persistent_block failed" end
-    if rd_is_installed() then return true, "already installed" end
-
-    local cave2 = kh1_native.allocate(0x200, 1)
-    local comp = kh1_native.allocate(0x80, 1)
-    if cave2 == 0 or comp == 0 then return false, "cave alloc failed" end
-
-    wl(OFF_BLOB_BASE, abs(speciesResourceTable))
-    wl(OFF_CAVE2, cave2)
-    wl(OFF_COMP, comp)
-    wi(OFF_REG_COUNT, 0)
-    wi(OFF_DONE_FLAG, 0)
-
-    kh1_native.write_bytes(cave2, build_cave2())
-    kh1_native.write_bytes(comp, build_completion())
-    kh1_native.patch_code(abs(fnc_reverse_blob_to_slot_ptr), jmp_abs(cave2))
-
-    wi(OFF_VERSION, 2)
-    wi(OFF_MAGIC, MAGIC)
+    if not kh1_native.install_c("hooks/species_redirect.c") then return false, "native install failed" end
     return true, "installed"
 end
 
@@ -536,7 +462,7 @@ local function drive_pending(model_path, p)
         if not motion_fixup(p.motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
         p.stage = 2
     end
-    -- stage 2: construct (motion resolves through cave2 -> row.motion)
+    -- stage 2: construct (motion resolves through the reverse-blob hook -> row.motion)
     local entity = construct_entity(p.ctx, p.buf)
     pending_spawns[model_path] = nil
     if entity then return true, entity end

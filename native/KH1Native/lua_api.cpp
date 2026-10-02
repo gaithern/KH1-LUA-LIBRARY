@@ -17,12 +17,17 @@ t_lua_createtable  p_lua_createtable  = nullptr;
 t_lua_rawlen       p_lua_rawlen       = nullptr;
 t_lua_rawgeti      p_lua_rawgeti      = nullptr;
 t_lua_settop       p_lua_settop       = nullptr;
+t_lua_next         p_lua_next         = nullptr;
+t_lua_type         p_lua_type         = nullptr;
+t_lua_isinteger    p_lua_isinteger    = nullptr;
+t_lua_pushnil      p_lua_pushnil      = nullptr;
 
 // List of Lua C API entry points to find
 static const char* const kRequiredLuaExports[] = {
     "lua_gettop", "lua_tointegerx", "lua_tonumberx", "lua_tolstring", "lua_pushinteger",
     "lua_pushboolean", "lua_pushstring", "luaL_setfuncs", "lua_createtable",
-    "lua_rawlen", "lua_rawgeti", "lua_settop",
+    "lua_rawlen", "lua_rawgeti", "lua_settop", "lua_next", "lua_type", "lua_isinteger",
+    "lua_pushnil",
 };
 
 // Checks to ensure the lua module found
@@ -93,9 +98,14 @@ bool ResolveLuaApi() {
         p_lua_rawlen      = (t_lua_rawlen)      GetProcAddress(hLua, "lua_rawlen");
         p_lua_rawgeti     = (t_lua_rawgeti)     GetProcAddress(hLua, "lua_rawgeti");
         p_lua_settop      = (t_lua_settop)      GetProcAddress(hLua, "lua_settop");
+        p_lua_next        = (t_lua_next)        GetProcAddress(hLua, "lua_next");
+        p_lua_type        = (t_lua_type)        GetProcAddress(hLua, "lua_type");
+        p_lua_isinteger   = (t_lua_isinteger)   GetProcAddress(hLua, "lua_isinteger");
+        p_lua_pushnil     = (t_lua_pushnil)     GetProcAddress(hLua, "lua_pushnil");
     }
 
     return p_lua_gettop && p_lua_tointegerx && p_lua_tonumberx && p_lua_tolstring
         && p_lua_pushinteger && p_lua_pushboolean && p_lua_pushstring && p_luaL_setfuncs
-        && p_lua_createtable && p_lua_rawlen && p_lua_rawgeti && p_lua_settop;
+        && p_lua_createtable && p_lua_rawlen && p_lua_rawgeti && p_lua_settop
+        && p_lua_next && p_lua_type && p_lua_isinteger && p_lua_pushnil;
 }
