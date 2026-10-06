@@ -20,28 +20,37 @@ Below you'll find key components of the repository and their descriptions.
   | :--- | :---------- |
   | `call_bridge.cpp`| Handler for calling in-exe functions.  Handles varying numbers of input arugments. |
   | `dllmain.cpp`| Main entry point. |
+  | `c_hooks.cpp` | `kh1_native.install_c`: compiles a hook `.c` file with TinyCC at load time and runs its `install()`. |
   | `evdl_syscall.cpp` | Supports calls EVDL Syscalls for C++/Lua.  Creates a dummy scriptCtx for execution. |
+  | `hooks.cpp` | Named inline, mid-function and function-pointer hooks, built on [SafetyHook](https://github.com/cursey/safetyhook). |
   | `log.cpp` | Handles writing to a shared log for debugging purposes. |
   | `lua_api.cpp` | Identifies the Lua module and populate Lua C function pointers. |
   | `lua_bindings.cpp` | Exposes C++ to be used on the Lua side. |
   | `process_memory.cpp` | Toolset for working with game memory, including memory allocation, safe writes, etc. |
+  | `symbols.cpp` | Address table for C++, read from the calling script's Steam/EGS globals. |
 
 - `scripts/io_packages/*`
 
   | File | Description |
   | :--- | :---------- |
   | `helpers/*` | Generic helper lua modules. |
+  | `hooks/*` | Exe hooks in C, compiled at load time by `kh1_native.install_c`: `prize_popup.c` (behind `modules/prize_popup.lua`) and `species_redirect.c` (behind `modules/spawn_enemy.lua`). |
   | `modules/*` | Containers for complex lua function(s) pertaining to one subject area. |
   | `EGSGlobal_1_0_0_10.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.10. |
   | `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
   | `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
   | `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
+  | `kh1_native.h` | The header hook `.c` files include. See [Native hooks](#native-hooks). |
+  | `libtcc.dll` | [TinyCC](https://bellard.org/tcc/) 0.9.27, which compiles hook `.c` files at load time. LGPL, see `libtcc_LICENSE.txt`. |
   | `memory_locations.lua` | Named save-block addresses (`saveData1`/`saveData2` + offset), loaded by `VersionCheck` after the version file. Names match `save_data_labels.json` in KH1-EVDL-TOOLS. |
   | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Steam v1.0.0.2. |
   | `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
 - `build.py`
-  - Compiles `kh1_native.dll` from its source in `native/KH1Native/*`.
+  - Fetches SafetyHook and TinyCC (`build_deps.py`) and compiles `kh1_native.dll` from its source in `native/KH1Native/*`.
   - Creates relevant `mod.yml` by calling `generate_mod_yml.py`
+- `build_deps.py`
+  - Downloads the pinned SafetyHook + Zydis sources into `native/KH1Native/external/` (not committed) and
+    `libtcc.dll` + its license into `scripts/io_packages/` (committed, since the mod ships them).
 - `generate_mod_yml.py`
   - Generates `mod.yml` by iterating through `scripts/io_packages/`.
 - `icon.png`
@@ -55,6 +64,26 @@ Below you'll find key components of the repository and their descriptions.
 
 ## Building mod/making changes
 If any script or CPP code needs to be changed, those changes should be accurately picked up and compiled by running `python build.py`.
+
+## Native hooks
+Exe hooks are written in C, not as hand-assembled code caves. A mod ships a `.c` file under
+`scripts/io_packages/` and installs it from Lua after `VersionCheck` has run:
+
+```lua
+require("VersionCheck")
+kh1_native.install_c("hooks/my_feature.c")  -- path relative to io_packages
+```
+
+kh1_native compiles the file in memory with TinyCC and calls its `int install(void)`. The file
+includes only `kh1_native.h`: `kh1_symbol` looks up any name from the globals files, and
+`kh1_hook_inline`, `kh1_hook_mid` (every register readable and writable, via `KH1Context`) and
+`kh1_hook_pointer` install named hooks on top of [SafetyHook](https://github.com/cursey/safetyhook).
+There is no C library; `memcmp`/`memcpy`/`memset`, `kh1_log` and `kh1_persistent_block` (the same block
+Lua gets from `kh1_native.persistent_block`, for state shared with Lua) are provided. Compile errors
+and hook results go to `kh1_native.log`. Installing a hook name twice is a no-op, so script
+reloads are safe, but an edited `.c` file only takes effect after restarting the game. See
+`scripts/io_packages/hooks/` here (the modules install them for you) and KH1-RANDOMIZER's
+`mod/scripts/io_packages/hooks/` for working examples.
 
 ## Currently shipped features for modders using this project
 All functions below are available on the table returned by `require("kh1_lua_library")`.
@@ -121,6 +150,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `enable_ability` | `ability` | none | Force-enables an ability by name (e.g. `"Dodge Roll"`, `"Guard"`) even if unowned/unequipped. |
 | `give_sora_ability` | `ability_value` | none | Grants Sora an ability by ID (unequipped). |
 | `give_shared_ability` | `shared_ability_value` | none | Grants the party a shared ability by ID (unequipped). |
+| `register_ability` | `id, ap, sort, name, help` | `boolean, reason` | Adds a new ability (id `0x42`-`0x7F`) to the game's ability table with its AP cost, menu sort order (`0xC8` = Combo Master's), name and help text (`\n` = line break). Returns `false, "ability table not loaded"` until btltbl.bin has loaded, so call it from `_OnFrame` until it returns true. The ability can then be granted with `give_sora_ability`; its effect is up to the calling mod. |
 | `force_scan` | `on` | none | ASM patch that forces Scan on/off. Credits to KSX. |
 | `force_combo_master` | `on` | none | ASM patch that forces Combo Master on/off. Credits to KSX. |
 | `allow_summon_anywhere` | `on` | none | ASM patch that allows summons outside of combat. Credits to KSX. |

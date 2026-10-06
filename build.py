@@ -2,7 +2,8 @@
 """
 build.py — full build: compile KH1Native, then regenerate mod.yml.
 
-Runs the KH1Native MSBuild project (its Release|x64 output drops
+Runs build_deps.py to fetch SafetyHook and TinyCC (what KH1Native hooks
+and compiles hook .c files with), then the KH1Native MSBuild project (its Release|x64 output drops
 kh1_native.dll straight into scripts/io_packages/), then
 generate_mod_yml.py.
 
@@ -51,6 +52,12 @@ def build_native():
         print('\nWarning: MSBuild not found, skipping KH1Native build.', file=sys.stderr)
         print('Install Visual Studio (with the C++ workload) or set MSBUILD_PATH.', file=sys.stderr)
         return True
+
+    # SafetyHook and TinyCC are not vendored; fetch the pinned copies.
+    deps = subprocess.run([sys.executable, str(ROOT / 'build_deps.py')])
+    if deps.returncode != 0:
+        print('\nCould not fetch SafetyHook or TinyCC.', file=sys.stderr)
+        return False
 
     result = subprocess.run([
         msbuild, str(NATIVE_SLN),
