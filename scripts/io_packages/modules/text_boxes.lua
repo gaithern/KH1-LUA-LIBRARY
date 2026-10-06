@@ -341,6 +341,15 @@ local function can_show(blk, m)
     return owns_window(blk) and not window_closing() and look_matches(blk, m)
 end
 
+-- Open with the per-room localisation width pad zeroed (e.g. +4 in the DI Cove), restoring it after.
+local function open_window()
+    local pad = g_EVWindowWidthPad and ReadFloat(g_EVWindowWidthPad)
+    if pad then WriteFloat(g_EVWindowWidthPad, 0) end
+    local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
+    if pad then WriteFloat(g_EVWindowWidthPad, pad) end
+    return ok, result
+end
+
 local function show(blk, m)
     local base = ensure_slots(blk)
     if base == nil then return false end
@@ -352,7 +361,7 @@ local function show(blk, m)
         apply_look(m, base + index)
         record_look(blk, m) 
         WriteShort(template_addr() + TPL_CLOSE_SPEED_INDEX, 0)   
-        local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
+        local ok, result = open_window()
         if not ok or result ~= 2 or window_state() == 0 then
             return false
         end

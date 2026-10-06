@@ -372,6 +372,7 @@ g_EVWindowTemplates = 0x23D4560
 g_EVWindowInstances = 0x23D4220
 g_EVCutsceneCheck = 0x23404EC
 g_EVWindowJobPool = 0x22EC0C0
+g_EVWindowWidthPad = 0x22EC1C4
 fnc_display_message_anim_hook = 0x1B9133
 fnc_display_message_anim_resume = 0x1B913C
 fnc_display_message_anim_call_target = 0x1764E0

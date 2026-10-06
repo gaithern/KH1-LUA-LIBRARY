@@ -353,6 +353,7 @@ g_EVWindowActivity = 0x23957C0
 g_EVWindowStateArray = 0x23967F0
 g_EVWindowTemplates = 0x23D4F60
 g_EVWindowInstances = 0x23D4C20
+g_EVWindowWidthPad = 0x22ECBA4
 g_EVCutsceneCheck = 0x2340E3C
 fnc_display_message_anim_hook = 0x1B6FE3
 fnc_play_se2 = 0x1766F0
