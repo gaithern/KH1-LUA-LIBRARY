@@ -15,6 +15,7 @@ local GHOST_GRACE_MS        = 500
 local EV_STRING_TABLE_MAX   = 1536
 local SLOT_BASE             = EV_STRING_TABLE_MAX - SLOT_COUNT  
 local WINDOW_SLOTS          = 4
+local SUMMON_ACTIVE_FLAG    = 0x2000
 local MSG_QUEUE_STRIDE      = 0x200
 local MSG_QUEUE_ENTRIES     = 0x100
 local BLOCK_KEY             = "kh1_textbox_queue_v8"
@@ -152,6 +153,10 @@ end
 
 local function event_active()
     return math.floor(ReadByte(inCutscene) / 2) % 2 == 1
+end
+
+local function summon_active()
+    return math.floor(ReadInt(stateFlag) / SUMMON_ACTIVE_FLAG) % 2 == 1
 end
 
 
@@ -334,7 +339,7 @@ local function look_matches(blk, m)
 end
 
 local function can_show(blk, m)
-    if not window_syscalls_enabled() or event_active() then return false end
+    if not window_syscalls_enabled() or event_active() or summon_active() then return false end
     if in_flight(blk) >= SLOT_COUNT then return false end
     if window_state() == 0 then return true end
     if m.auto_width then return false end
