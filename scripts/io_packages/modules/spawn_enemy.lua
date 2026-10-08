@@ -237,7 +237,7 @@ local function intern_path(path)
     if interned_paths[path] then return interned_paths[path] end
     local addr = kh1_native.allocate(#path + 1)
     if addr == 0 then return 0 end
-    kh1_native.write_bytes(addr, path .. "\0")
+    WriteArray(addr, {(path .. "\0"):byte(1, -1)}, true)
     interned_paths[path] = addr
     return addr
 end
@@ -263,7 +263,7 @@ local function splice_placement_record(template, char_id, x, y, z)
     end
 
     local record = buffer + old_count * PLACEMENT_RECORD_SIZE
-    kh1_native.write_bytes(record, template)
+    WriteArray(record, {template:byte(1, -1)}, true)
 
     local id = (RECORD_CATEGORY_ACTOR << 16) | (old_count & 0xFFFF)
     WriteInt(record + PLACEMENT_ID_OFF, id, true)

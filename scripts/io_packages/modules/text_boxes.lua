@@ -453,21 +453,6 @@ local function requeue_in_flight(blk)
     return #records
 end
 
-local function job_pool_report()
-    if g_EVWindowJobPool == nil then return "" end
-    local parts = {}
-    for j = 0, WINDOW_SLOTS - 1 do
-        local inst = ReadLong(g_EVWindowJobPool + j * 0x38 + 0x28)
-        local idx = "none"
-        if inst ~= 0 then
-            local rel = inst - (kh1_native.get_module_base() + g_EVWindowInstances)
-            idx = (rel >= 0 and rel % INSTANCE_SIZE == 0) and ("inst" .. (rel / INSTANCE_SIZE)) or string.format("%X", inst)
-        end
-        parts[#parts + 1] = string.format("job%d=%s", j, idx)
-    end
-    return " [" .. table.concat(parts, " ") .. "]"
-end
-
 local function force_close(slot)
     if slot then
         local inst = g_EVWindowInstances + slot * INSTANCE_SIZE
@@ -481,7 +466,7 @@ end
 
 local function close_now(slot, inst_state)
     if slot and (inst_state == 3 or inst_state == 4 or inst_state == 5) then
-        ConsolePrint("kh1_lua_library: close did not progress (instance " .. inst_state .. "), finishing it" .. job_pool_report())
+        ConsolePrint("kh1_lua_library: close did not progress (instance " .. inst_state .. "), finishing it")
         force_close(slot)
         return
     end
