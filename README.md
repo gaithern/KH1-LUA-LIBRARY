@@ -150,7 +150,6 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `enable_ability` | `ability` | none | Force-enables an ability by name (e.g. `"Dodge Roll"`, `"Guard"`) even if unowned/unequipped. |
 | `give_sora_ability` | `ability_value` | none | Grants Sora an ability by ID (unequipped). |
 | `give_shared_ability` | `shared_ability_value` | none | Grants the party a shared ability by ID (unequipped). |
-| `register_ability` | `id, ap, sort, name, help` | `boolean, reason` | Adds a new ability (id `0x42`-`0x7F`) to the game's ability table with its AP cost, menu sort order (`0xC8` = Combo Master's), name and help text (`\n` = line break). Returns `false, "ability table not loaded"` until btltbl.bin has loaded, so call it from `_OnFrame` until it returns true. The ability can then be granted with `give_sora_ability`; its effect is up to the calling mod. |
 | `force_scan` | `on` | none | ASM patch that forces Scan on/off. Credits to KSX. |
 | `force_combo_master` | `on` | none | ASM patch that forces Combo Master on/off. Credits to KSX. |
 | `allow_summon_anywhere` | `on` | none | ASM patch that allows summons outside of combat. Credits to KSX. |
