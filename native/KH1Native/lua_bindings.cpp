@@ -135,18 +135,6 @@ extern "C" int l_write_bytes(void* L) {
     return 1;
 }
 
-// Allows writing an array of bytecode to a
-// destination address in a safe way from Lua.
-extern "C" int l_patch_code(void* L) {
-    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    size_t len = 0;
-    const char* src = p_lua_tolstring(L, 2, &len);
-    bool suspend = p_lua_tointegerx(L, 3, nullptr) != 0;
-    bool ok = PatchCode((void*)(uintptr_t)dest, src, len, suspend);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
 // Allows calling EVDL Syscalls, requiring
 // a mocked script context, from Lua.
 extern "C" int l_call_evdl_syscall(void* L) {
@@ -203,7 +191,6 @@ static const luaL_Reg kh1_native_lib[] = {
     {"free", reinterpret_cast<void*>(l_free)},
     {"copy_memory", reinterpret_cast<void*>(l_copy_memory)},
     {"write_bytes", reinterpret_cast<void*>(l_write_bytes)},
-    {"patch_code", reinterpret_cast<void*>(l_patch_code)},
     {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
     {"call_evdl_syscall", reinterpret_cast<void*>(l_call_evdl_syscall)},
     {"install_c", reinterpret_cast<void*>(l_install_c)},

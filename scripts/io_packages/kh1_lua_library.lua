@@ -637,24 +637,27 @@ local function ko_sora()
 end
 
 -- Original bytes at the 3 damage-cap patch sites
-local DMGCAP_JZ       = "\x74\x22"
-local DMGCAP_LOAD_ECX = "\x0F\xB7\x88\xC2\x00\x00\x00"
-local DMGCAP_LOAD_EBX = "\x0F\xB7\x98\xC2\x00\x00\x00"
+local DMGCAP_JZ       = {0x74, 0x22}
+local DMGCAP_LOAD_ECX = {0x0F, 0xB7, 0x88, 0xC2, 0x00, 0x00, 0x00}
+local DMGCAP_LOAD_EBX = {0x0F, 0xB7, 0x98, 0xC2, 0x00, 0x00, 0x00}
 
 local function set_damage_cap(mode)
     -- "on"/true: normal per-enemy caps. "off"/false: never cap. Integer N: cap every hit at N.
-    local jz = kh1_native.get_module_base() + damageCapBranch
-    local function p(addr, bytes) return kh1_native.patch_code(addr, bytes, 1) end
-    if mode == "on" or mode == true then
-        return p(jz, DMGCAP_JZ) and p(jz + 0xA, DMGCAP_LOAD_ECX) and p(jz + 0x1D, DMGCAP_LOAD_EBX)
-    elseif mode == "off" or mode == false then
-        return p(jz, "\xEB\x22") and p(jz + 0xA, DMGCAP_LOAD_ECX) and p(jz + 0x1D, DMGCAP_LOAD_EBX)
+    local jz, ecx, ebx = DMGCAP_JZ, DMGCAP_LOAD_ECX, DMGCAP_LOAD_EBX
+    if mode == "off" or mode == false then
+        jz = {0xEB, 0x22}
     elseif math.type(mode) == "integer" and mode >= 1 and mode <= 0x7FFFFFFF then
-        local imm = string.pack("<i4", mode)
-        return p(jz, "\x90\x90") and p(jz + 0xA, "\xB9" .. imm .. "\x90\x90")
-            and p(jz + 0x1D, "\xBB" .. imm .. "\x90\x90")
+        local b1, b2, b3, b4 = string.pack("<i4", mode):byte(1, 4)
+        jz = {0x90, 0x90}
+        ecx = {0xB9, b1, b2, b3, b4, 0x90, 0x90}
+        ebx = {0xBB, b1, b2, b3, b4, 0x90, 0x90}
+    elseif not (mode == "on" or mode == true) then
+        return false
     end
-    return false
+    WriteArray(damageCapBranch, jz)
+    WriteArray(damageCapBranch + 0xA, ecx)
+    WriteArray(damageCapBranch + 0x1D, ebx)
+    return true
 end
 
 local function heartless_angel_sora()

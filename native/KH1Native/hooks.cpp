@@ -80,7 +80,7 @@ bool HookPointer(const char* name, uintptr_t slot, void* expected, void* detour,
     if (AlreadyInstalled(name, original)) return true;
     void** p = reinterpret_cast<void**>(slot);
     if (!slot || !detour || *p != expected) { LogHook(name, slot, "slot does not hold the expected pointer"); return false; }
-    if (!PatchCode(p, &detour, sizeof(detour), false)) { LogHook(name, slot, "patch failed"); return false; }
+    if (!PatchCode(p, &detour, sizeof(detour))) { LogHook(name, slot, "patch failed"); return false; }
     InstalledHook& h = g_hooks[name];
     h.original = expected;
     if (original) *original = expected;
