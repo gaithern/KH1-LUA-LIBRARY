@@ -6,6 +6,8 @@
 #include "call_bridge.h"
 #include "process_memory.h"
 #include "evdl_syscall.h"
+#include "c_hooks.h"
+#include "symbols.h"
 
 // Allows calling LogDebug from Lua
 extern "C" int l_log_debug(void* L) {
@@ -46,12 +48,6 @@ extern "C" int l_call_function(void* L) {
     p_lua_pushboolean(L, 1);
     p_lua_pushinteger(L, (long long)result);
     return 2;
-}
-
-// Allows getting the module base from Lua.
-extern "C" int l_get_module_base(void* L) {
-    p_lua_pushinteger(L, (long long)GetGameBase());
-    return 1;
 }
 
 static const int MAX_SCRATCH_FLOATS = 16;
@@ -122,29 +118,6 @@ extern "C" int l_copy_memory(void* L) {
     return 1;
 }
 
-// Allows writing a Lua string's raw bytes to a 
-// specific destination address from Lua.
-extern "C" int l_write_bytes(void* L) {
-    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    size_t len = 0;
-    const char* src = p_lua_tolstring(L, 2, &len);
-    bool ok = dest != 0 && src && len > 0 && GuardedMemcpy((void*)(uintptr_t)dest, src, len);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-// Allows writing an array of bytecode to a
-// destination address in a safe way from Lua.
-extern "C" int l_patch_code(void* L) {
-    unsigned long long dest = (unsigned long long)p_lua_tointegerx(L, 1, nullptr);
-    size_t len = 0;
-    const char* src = p_lua_tolstring(L, 2, &len);
-    bool suspend = p_lua_tointegerx(L, 3, nullptr) != 0;
-    bool ok = PatchCode((void*)(uintptr_t)dest, src, len, suspend);
-    p_lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
 // Allows calling EVDL Syscalls, requiring
 // a mocked script context, from Lua.
 extern "C" int l_call_evdl_syscall(void* L) {
@@ -174,22 +147,33 @@ extern "C" int l_call_evdl_syscall(void* L) {
     return 2;
 }
 
+// Compiles a hook .c file (path relative to io_packages) and runs its
+// install().
+extern "C" int l_install_c(void* L) {
+    const char* path = p_lua_tolstring(L, 1, nullptr);
+    bool ok = false;
+    if (path) {
+        LoadSymbols(L);
+        ok = InstallC(path);
+    }
+    p_lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
 // Name to function registration table.
 // The DLL's public API surface - those
 // features to be exposed to Lua.
 static const luaL_Reg kh1_native_lib[] = {
     {"log_debug", reinterpret_cast<void*>(l_log_debug)},
     {"call_function", reinterpret_cast<void*>(l_call_function)},
-    {"get_module_base", reinterpret_cast<void*>(l_get_module_base)},
     {"write_floats", reinterpret_cast<void*>(l_write_floats)},
     {"allocate", reinterpret_cast<void*>(l_allocate)},
     {"allocate_near", reinterpret_cast<void*>(l_allocate_near)},
     {"free", reinterpret_cast<void*>(l_free)},
     {"copy_memory", reinterpret_cast<void*>(l_copy_memory)},
-    {"write_bytes", reinterpret_cast<void*>(l_write_bytes)},
-    {"patch_code", reinterpret_cast<void*>(l_patch_code)},
     {"persistent_block", reinterpret_cast<void*>(l_persistent_block)},
     {"call_evdl_syscall", reinterpret_cast<void*>(l_call_evdl_syscall)},
+    {"install_c", reinterpret_cast<void*>(l_install_c)},
     {nullptr, nullptr}
 };
 

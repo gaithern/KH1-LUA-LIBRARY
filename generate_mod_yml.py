@@ -14,7 +14,7 @@ ROOT = Path(__file__).parent
 OUTPUT = ROOT / "mod.yml"
 
 ASSET_DIRS = [
-    "scripts/io_packages",
+    "scripts",
     "dll",
 ]
 

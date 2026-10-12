@@ -13,6 +13,15 @@ typedef void         (__cdecl* t_lua_createtable)(void* L, int narr, int nrec);
 typedef unsigned long long (__cdecl* t_lua_rawlen)(void* L, int idx);
 typedef int          (__cdecl* t_lua_rawgeti)(void* L, int idx, long long n);
 typedef void         (__cdecl* t_lua_settop)(void* L, int idx);
+typedef int          (__cdecl* t_lua_next)(void* L, int idx);
+typedef int          (__cdecl* t_lua_type)(void* L, int idx);
+typedef int          (__cdecl* t_lua_isinteger)(void* L, int idx);
+typedef void         (__cdecl* t_lua_pushnil)(void* L);
+
+// Lua 5.4 constants from lua.h / luaconf.h.
+static const int LUA_REGISTRYINDEX = -1000000 - 1000;
+static const long long LUA_RIDX_GLOBALS = 2;
+static const int LUA_TSTRING = 4;
 
 extern t_lua_gettop       p_lua_gettop;
 extern t_lua_tointegerx   p_lua_tointegerx;
@@ -26,6 +35,10 @@ extern t_lua_createtable  p_lua_createtable;
 extern t_lua_rawlen       p_lua_rawlen;
 extern t_lua_rawgeti      p_lua_rawgeti;
 extern t_lua_settop       p_lua_settop;
+extern t_lua_next         p_lua_next;
+extern t_lua_type         p_lua_type;
+extern t_lua_isinteger    p_lua_isinteger;
+extern t_lua_pushnil      p_lua_pushnil;
 
 struct luaL_Reg { const char* name; void* func; };
 

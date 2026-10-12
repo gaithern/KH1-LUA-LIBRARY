@@ -10,4 +10,4 @@ void* PersistentBlock(const char* key, size_t keyLen, size_t size);
 
 bool GuardedMemcpy(void* dst, const void* src, size_t len);
 
-bool PatchCode(void* dest, const void* src, size_t len, bool suspendThreads);
+bool PatchCode(void* dest, const void* src, size_t len);

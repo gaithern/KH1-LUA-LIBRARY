@@ -1,7 +1,5 @@
 #include "pch.h"
-#include <tlhelp32.h>
 #include <cstring>
-#include <vector>
 #include "process_memory.h"
 
 // Allocates a block of memory of a specified size.
@@ -71,52 +69,10 @@ bool GuardedMemcpy(void* dst, const void* src, size_t len) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// Suspends every other thread and returns a
-// a list of what was paused, so that patch_code
-// can overwrite live instructions wihtout another
-// thread running a half-written patch.
-static std::vector<HANDLE> SuspendOtherThreads() {
-    std::vector<HANDLE> handles;
-    DWORD selfTid = GetCurrentThreadId();
-    DWORD pid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return handles;
-
-    THREADENTRY32 te = {};
-    te.dwSize = sizeof(te);
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.dwSize >= (FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(te.th32OwnerProcessID))) {
-                if (te.th32OwnerProcessID == pid && te.th32ThreadID != selfTid) {
-                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                    if (h) {
-                        SuspendThread(h);
-                        handles.push_back(h);
-                    }
-                }
-            }
-            te.dwSize = sizeof(te);
-        } while (Thread32Next(snap, &te));
-    }
-    CloseHandle(snap);
-    return handles;
-}
-
-// Undo for function above.
-static void ResumeThreads(std::vector<HANDLE>& handles) {
-    for (HANDLE h : handles) {
-        ResumeThread(h);
-        CloseHandle(h);
-    }
-    handles.clear();
-}
-
-// Uses the functions above.  Suspends the
-// threads, writes the patch, and resumes.
-bool PatchCode(void* dest, const void* src, size_t len, bool suspendThreads) {
+// Writes over read-only or executable memory
+// by unprotecting it for the length of the copy.
+bool PatchCode(void* dest, const void* src, size_t len) {
     if (!dest || !src || len == 0) return false;
-    std::vector<HANDLE> threads;
-    if (suspendThreads) threads = SuspendOtherThreads();
     bool ok = false;
     DWORD oldProtect = 0;
     if (VirtualProtect(dest, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -125,6 +81,5 @@ bool PatchCode(void* dest, const void* src, size_t len, bool suspendThreads) {
         VirtualProtect(dest, len, oldProtect, &tmp);
         FlushInstructionCache(GetCurrentProcess(), dest, len);
     }
-    if (suspendThreads) ResumeThreads(threads);
     return ok;
 }

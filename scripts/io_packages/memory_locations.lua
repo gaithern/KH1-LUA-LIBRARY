@@ -23,6 +23,7 @@ INTERACT_IN_BATTLE              = saveData1 + 0x04E -- RANDO ONLY
 SKIP_100_ACRE_WOOD_MINIGAMES    = saveData1 + 0x04F -- RANDO ONLY
 CUPS_STANDARD                   = saveData1 + 0x050 -- RANDO ONLY
 CUPS_SOLO_TT                    = saveData1 + 0x051 -- RANDO ONLY
+SKIP_SUMMON_ANIMATIONS          = saveData1 + 0x052 -- RANDO ONLY
 DIVE_TO_THE_HEART_WEAPON_CHOSEN = saveData1 + 0x100
 DIVE_TO_THE_HEART_WEAPON_GIVEN_UP = saveData1 + 0x101
 LEON_GIFT_GIVEN                 = saveData1 + 0x10D

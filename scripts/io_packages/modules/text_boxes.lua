@@ -15,6 +15,7 @@ local GHOST_GRACE_MS        = 500
 local EV_STRING_TABLE_MAX   = 1536
 local SLOT_BASE             = EV_STRING_TABLE_MAX - SLOT_COUNT  
 local WINDOW_SLOTS          = 4
+local SUMMON_ACTIVE_FLAG    = 0x2000
 local MSG_QUEUE_STRIDE      = 0x200
 local MSG_QUEUE_ENTRIES     = 0x100
 local BLOCK_KEY             = "kh1_textbox_queue_v8"
@@ -152,6 +153,10 @@ end
 
 local function event_active()
     return math.floor(ReadByte(inCutscene) / 2) % 2 == 1
+end
+
+local function summon_active()
+    return math.floor(ReadInt(stateFlag) / SUMMON_ACTIVE_FLAG) % 2 == 1
 end
 
 
@@ -334,11 +339,20 @@ local function look_matches(blk, m)
 end
 
 local function can_show(blk, m)
-    if not window_syscalls_enabled() or event_active() then return false end
+    if not window_syscalls_enabled() or event_active() or summon_active() then return false end
     if in_flight(blk) >= SLOT_COUNT then return false end
     if window_state() == 0 then return true end
     if m.auto_width then return false end
     return owns_window(blk) and not window_closing() and look_matches(blk, m)
+end
+
+-- Open with the per-room localisation width pad zeroed (e.g. +4 in the DI Cove), restoring it after.
+local function open_window()
+    local pad = g_EVWindowWidthPad and ReadFloat(g_EVWindowWidthPad)
+    if pad then WriteFloat(g_EVWindowWidthPad, 0) end
+    local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
+    if pad then WriteFloat(g_EVWindowWidthPad, pad) end
+    return ok, result
 end
 
 local function show(blk, m)
@@ -352,7 +366,7 @@ local function show(blk, m)
         apply_look(m, base + index)
         record_look(blk, m) 
         WriteShort(template_addr() + TPL_CLOSE_SPEED_INDEX, 0)   
-        local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
+        local ok, result = open_window()
         if not ok or result ~= 2 or window_state() == 0 then
             return false
         end
@@ -439,21 +453,6 @@ local function requeue_in_flight(blk)
     return #records
 end
 
-local function job_pool_report()
-    if g_EVWindowJobPool == nil then return "" end
-    local parts = {}
-    for j = 0, WINDOW_SLOTS - 1 do
-        local inst = ReadLong(g_EVWindowJobPool + j * 0x38 + 0x28)
-        local idx = "none"
-        if inst ~= 0 then
-            local rel = inst - (kh1_native.get_module_base() + g_EVWindowInstances)
-            idx = (rel >= 0 and rel % INSTANCE_SIZE == 0) and ("inst" .. (rel / INSTANCE_SIZE)) or string.format("%X", inst)
-        end
-        parts[#parts + 1] = string.format("job%d=%s", j, idx)
-    end
-    return " [" .. table.concat(parts, " ") .. "]"
-end
-
 local function force_close(slot)
     if slot then
         local inst = g_EVWindowInstances + slot * INSTANCE_SIZE
@@ -467,7 +466,7 @@ end
 
 local function close_now(slot, inst_state)
     if slot and (inst_state == 3 or inst_state == 4 or inst_state == 5) then
-        ConsolePrint("kh1_lua_library: close did not progress (instance " .. inst_state .. "), finishing it" .. job_pool_report())
+        ConsolePrint("kh1_lua_library: close did not progress (instance " .. inst_state .. "), finishing it")
         force_close(slot)
         return
     end
@@ -523,6 +522,18 @@ local function repair_window(blk)
         return
     end
     WriteInt(blk + HDR_GHOST_SINCE, 0, true)
+end
+
+local function hold_for_summon(blk)
+    if not summon_active() or not owns_window(blk) or window_closing() then return end
+    local count = message_count()
+    local slot = instance_slot()
+    WriteInt(blk + HDR_GOOD_POS, count - in_flight(blk), true)
+    WriteInt(blk + HDR_GOOD_COUNT, count, true)
+    local requeued = requeue_in_flight(blk)
+    ConsolePrint(string.format("kh1_lua_library: summon active, closing window %d, %d requeued", NOTIFY_WINDOW, requeued))
+    close_now(slot, slot and instance_state(slot) or 0)
+    WriteInt(blk + HDR_OUR_WINDOW, 0, true)
 end
 
 local function log_script_loads(blk)
@@ -590,6 +601,7 @@ local function update_text_boxes()
     if not blk then return end
     log_script_loads(blk)
     repair_window(blk)
+    hold_for_summon(blk)
     feed_held(blk)
     if window_state() == 0 and ReadInt(blk + HDR_HELD_COUNT, true) == 0 then
         restore_template(blk)

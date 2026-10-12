@@ -13,4 +13,5 @@ native/**/*.exp
 native/**/*.tlog
 native/**/*.recipe
 native/**/*.pch
+native/KH1Native/external/
 *.log
