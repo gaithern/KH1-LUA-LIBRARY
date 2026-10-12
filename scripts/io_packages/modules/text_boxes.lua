@@ -524,6 +524,18 @@ local function repair_window(blk)
     WriteInt(blk + HDR_GHOST_SINCE, 0, true)
 end
 
+local function hold_for_summon(blk)
+    if not summon_active() or not owns_window(blk) or window_closing() then return end
+    local count = message_count()
+    local slot = instance_slot()
+    WriteInt(blk + HDR_GOOD_POS, count - in_flight(blk), true)
+    WriteInt(blk + HDR_GOOD_COUNT, count, true)
+    local requeued = requeue_in_flight(blk)
+    ConsolePrint(string.format("kh1_lua_library: summon active, closing window %d, %d requeued", NOTIFY_WINDOW, requeued))
+    close_now(slot, slot and instance_state(slot) or 0)
+    WriteInt(blk + HDR_OUR_WINDOW, 0, true)
+end
+
 local function log_script_loads(blk)
     local table_count = ReadInt(g_EVScriptLoaded)
     local last = ReadInt(blk + HDR_LAST_TABLE, true)
@@ -589,6 +601,7 @@ local function update_text_boxes()
     if not blk then return end
     log_script_loads(blk)
     repair_window(blk)
+    hold_for_summon(blk)
     feed_held(blk)
     if window_state() == 0 and ReadInt(blk + HDR_HELD_COUNT, true) == 0 then
         restore_template(blk)
