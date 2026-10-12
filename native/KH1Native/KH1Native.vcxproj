@@ -153,9 +153,6 @@
       <ProgramDatabaseFile>$(ProjectDir)x64\Release\$(TargetName).pdb</ProgramDatabaseFile>
     </Link>
   </ItemDefinitionGroup>
-  <!-- Dependencies are not vendored: build_deps.py fetches SafetyHook (+ Zydis) into
-       external\safetyhook and libtcc.dll into scripts\io_packages before anything compiles.
-       kh1_native.h lives in scripts\io_packages because TinyCC reads it there at runtime. -->
   <ItemDefinitionGroup>
     <ClCompile>
       <LanguageStandard>stdcpplatest</LanguageStandard>

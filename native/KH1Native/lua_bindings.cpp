@@ -148,8 +148,7 @@ extern "C" int l_call_evdl_syscall(void* L) {
 }
 
 // Compiles a hook .c file (path relative to io_packages) and runs its
-// install(). Addresses come from the calling script's globals, so
-// VersionCheck must have run first.
+// install().
 extern "C" int l_install_c(void* L) {
     const char* path = p_lua_tolstring(L, 1, nullptr);
     bool ok = false;
