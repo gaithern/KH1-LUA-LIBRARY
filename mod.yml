@@ -78,6 +78,14 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/text_boxes.lua
+- name: scripts/io_packages/modules/text_boxes/message_store.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/text_boxes/message_store.lua
+- name: scripts/io_packages/modules/text_boxes/notify_window.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/text_boxes/notify_window.lua
 - name: scripts/kh1_text_box_driver.lua
   method: copy
   source:
