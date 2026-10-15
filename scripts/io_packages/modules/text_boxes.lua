@@ -141,7 +141,7 @@ local function instance_slot()
 end
 
 local function instance_state(slot)
-    return ReadInt(g_EVWindowInstances + slot * INSTANCE_SIZE + INST_STATE)
+    return ReadInt(g_EVScreenBoxes + slot * INSTANCE_SIZE + INST_STATE)
 end
 
 
@@ -164,7 +164,7 @@ end
 local function showing_index(blk)
     local slot = instance_slot()
     if not slot or window_state() ~= 2 then return nil end
-    local ptr = ReadLong(g_EVWindowInstances + slot * INSTANCE_SIZE + INST_TEXT_PTR)
+    local ptr = ReadLong(g_EVScreenBoxes + slot * INSTANCE_SIZE + INST_TEXT_PTR)
     local rel = ptr - (blk + OFF_BUFFERS)
     if rel < 0 or rel % BUF_SIZE ~= 0 or rel / BUF_SIZE >= SLOT_COUNT then return nil end
     return rel / BUF_SIZE
@@ -455,7 +455,7 @@ end
 
 local function force_close(slot)
     if slot then
-        local inst = g_EVWindowInstances + slot * INSTANCE_SIZE
+        local inst = g_EVScreenBoxes + slot * INSTANCE_SIZE
         WriteLong(inst + INST_CALLBACK, 0)
         WriteInt(inst + INST_STATE, INST_STATE_FINISH)
         WriteByte(g_EVWindowActivity + slot, 0)
@@ -472,7 +472,7 @@ local function close_now(slot, inst_state)
     end
     if slot then
         WriteByte(g_EVWindowActivity + slot, 2)
-        WriteShort(g_EVWindowInstances + slot * INSTANCE_SIZE + INST_CLOSE_SPEED, 0)
+        WriteShort(g_EVScreenBoxes + slot * INSTANCE_SIZE + INST_CLOSE_SPEED, 0)
     end
     WriteByte(g_EVWindowState + NOTIFY_WINDOW, 2)
     close_text_box(NOTIFY_WINDOW)
@@ -553,7 +553,7 @@ local function play_message_sound(blk)
     local state = window_state()
     local ptr = 0
     if slot and state == 2 then
-        ptr = ReadLong(g_EVWindowInstances + slot * INSTANCE_SIZE + INST_TEXT_PTR)
+        ptr = ReadLong(g_EVScreenBoxes + slot * INSTANCE_SIZE + INST_TEXT_PTR)
     end
     local last = ReadLong(blk + HDR_LAST_TEXT, true)
     if ptr ~= last then
