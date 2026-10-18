@@ -159,6 +159,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `show_custom_item_popup` | `text` | boolean | Forces a map-prize pickup popup with custom text. |
 | `update_prize_popup` | none | none | Clears the custom popup text once the popup closes. The library's driver script already calls this every frame. |
 | `set_show_skipped_rewards` | `turn_on` | boolean | Ends a cutscene skip right before a gift popup opens, so the reward is shown. |
+| `set_skip_summon_animations` | `turn_on` | boolean | Shortens the summon opener (camera swing, fades and the first three step durations). The entrance itself needs edited `xs_*.dat` event scripts, which the calling mod ships. Returns false if the call sites don't look as expected. |
 | `queue_text_box` | `{text, duration, sound, style, x, y, width, height, tail, auto_width}` | boolean | Queues a notification text box on the shared notification window. Only `text` is required. |
 | `close_text_box` | none | boolean | Closes the notification window. |
 | `update_text_boxes` | none | none | Feeds held messages, plays their sounds and repairs the window after an event script load. The library's driver script already calls this every frame; outside consumers shouldn't need to use this. |

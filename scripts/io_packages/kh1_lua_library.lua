@@ -22,6 +22,7 @@ local kh1_text_boxes = require("modules.text_boxes")
 local kh1_prize_popup = require("modules.prize_popup")
 local kh1_level_up_prompt = require("modules.level_up_prompt")
 local kh1_show_skipped_rewards = require("modules.show_skipped_rewards")
+local kh1_skip_summon_animations = require("modules.skip_summon_animations")
 
 local GetKHSCII = kh1_khscii.GetKHSCII
 
@@ -747,5 +748,6 @@ return {
     ko_sora = ko_sora,
     heartless_angel_sora = heartless_angel_sora,
     set_damage_cap = set_damage_cap,
-    set_show_skipped_rewards = kh1_show_skipped_rewards.set_show_skipped_rewards
+    set_show_skipped_rewards = kh1_show_skipped_rewards.set_show_skipped_rewards,
+    set_skip_summon_animations = kh1_skip_summon_animations.set_skip_summon_animations
 }

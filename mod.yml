@@ -66,6 +66,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/show_skipped_rewards.lua
+- name: scripts/io_packages/modules/skip_summon_animations.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/skip_summon_animations.lua
 - name: scripts/io_packages/modules/spawn_enemy.lua
   method: copy
   source:
