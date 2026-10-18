@@ -15,7 +15,7 @@ Below you'll find key components of the repository and their descriptions.
   | `lua54.dll` | Bundled lua module |
 
 - `scripts/kh1_text_box_driver.lua`
-  - Runs every frame to drive the notification text box queue and clear custom prize popup text.
+  - Runs every frame to drive the notification text box queue and clear custom text/text boxes.
 
 - `scripts/io_packages/*`
 
