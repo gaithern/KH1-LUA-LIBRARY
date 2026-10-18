@@ -18,18 +18,26 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/VersionCheck.lua
+- name: scripts/io_packages/cffi.dll
+  method: copy
+  source:
+  - name: scripts/io_packages/cffi.dll
+- name: scripts/io_packages/cffi_LICENSE.txt
+  method: copy
+  source:
+  - name: scripts/io_packages/cffi_LICENSE.txt
+- name: scripts/io_packages/helpers/call_redirect.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/helpers/call_redirect.lua
 - name: scripts/io_packages/helpers/khscii.lua
   method: copy
   source:
   - name: scripts/io_packages/helpers/khscii.lua
-- name: scripts/io_packages/hooks/prize_popup.c
+- name: scripts/io_packages/helpers/native.lua
   method: copy
   source:
-  - name: scripts/io_packages/hooks/prize_popup.c
-- name: scripts/io_packages/hooks/species_redirect.c
-  method: copy
-  source:
-  - name: scripts/io_packages/hooks/species_redirect.c
+  - name: scripts/io_packages/helpers/native.lua
 - name: scripts/io_packages/json.lua
   method: copy
   source:
@@ -38,22 +46,6 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/kh1_lua_library.lua
-- name: scripts/io_packages/kh1_native.dll
-  method: copy
-  source:
-  - name: scripts/io_packages/kh1_native.dll
-- name: scripts/io_packages/kh1_native.h
-  method: copy
-  source:
-  - name: scripts/io_packages/kh1_native.h
-- name: scripts/io_packages/libtcc.dll
-  method: copy
-  source:
-  - name: scripts/io_packages/libtcc.dll
-- name: scripts/io_packages/libtcc_LICENSE.txt
-  method: copy
-  source:
-  - name: scripts/io_packages/libtcc_LICENSE.txt
 - name: scripts/io_packages/memory_locations.lua
   method: copy
   source:
@@ -70,6 +62,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/prize_popup.lua
+- name: scripts/io_packages/modules/show_skipped_rewards.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/show_skipped_rewards.lua
 - name: scripts/io_packages/modules/spawn_enemy.lua
   method: copy
   source:

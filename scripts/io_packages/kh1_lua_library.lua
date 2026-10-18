@@ -15,12 +15,13 @@
     possible, but some additional memory addresses may need to added.
 --]]
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 local kh1_spawn_enemy = require("modules.spawn_enemy")
 local kh1_khscii = require("helpers.khscii")
 local kh1_text_boxes = require("modules.text_boxes")
 local kh1_prize_popup = require("modules.prize_popup")
 local kh1_level_up_prompt = require("modules.level_up_prompt")
+local kh1_show_skipped_rewards = require("modules.show_skipped_rewards")
 
 local GetKHSCII = kh1_khscii.GetKHSCII
 
@@ -607,20 +608,20 @@ end
 local function spawn_prize(item_id)
     --Uses the in game function to spawn a map prize
     local pos = get_sora_pos()
-    local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
-    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
+    local pos_ptr = native.write_floats(pos["X"], pos["Y"], pos["Z"])
+    local spawned = native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
     return spawned
 end
 
 local function play_se2(se_id, param_2)
     -- Plays a sound effect using the in game function.
-    return kh1_native.call_function(fnc_play_se2, se_id, param_2)
+    return native.call_function(fnc_play_se2, se_id, param_2)
 end
 
 local function apply_world_set_row(world_id, set_index)
     -- Applies one row of allset.set: the game's own pre-authored per-room map-state
     -- ("set number") table for a world.
-    kh1_native.call_function(fnc_apply_allset_row, world_id, set_index)
+    native.call_function(fnc_apply_allset_row, world_id, set_index)
 end
 
 local function sora_koed()
@@ -632,7 +633,7 @@ end
 local function ko_sora()
     -- Triggers the in game functions to KO Sora.
     if not sora_koed() then
-        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
+        native.call_function(fnc_trigger_ko_event_script, 0xC8)
     end
 end
 
@@ -734,6 +735,7 @@ return {
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
+    update_prize_popup = kh1_prize_popup.update_prize_popup,
     play_se2 = play_se2,
     apply_world_set_row = apply_world_set_row,
     queue_text_box = kh1_text_boxes.queue_text_box,
@@ -744,5 +746,6 @@ return {
     sora_koed = sora_koed,
     ko_sora = ko_sora,
     heartless_angel_sora = heartless_angel_sora,
-    set_damage_cap = set_damage_cap
+    set_damage_cap = set_damage_cap,
+    set_show_skipped_rewards = kh1_show_skipped_rewards.set_show_skipped_rewards
 }

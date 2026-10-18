@@ -2,7 +2,7 @@
 
 LUAGUI_NAME = "KH1TextBoxDriver"
 LUAGUI_AUTH = "Gicu"
-LUAGUI_DESC = "Drives the kh1_lua_library notification text box queue every frame"
+LUAGUI_DESC = "Drives the kh1_lua_library notification text box queue and custom prize popups every frame"
 
 local kh1_lua_library = require("kh1_lua_library")
 
@@ -17,9 +17,14 @@ function _OnInit()
     end
 end
 
+local function update()
+    kh1_lua_library.update_text_boxes()
+    kh1_lua_library.update_prize_popup()
+end
+
 function _OnFrame()
     if not canExecute then return end
-    local ok, err = pcall(kh1_lua_library.update_text_boxes)
+    local ok, err = pcall(update)
     if ok then
         error_count = 0
         return

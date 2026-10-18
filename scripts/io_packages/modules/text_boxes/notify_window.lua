@@ -1,6 +1,6 @@
 ---@diagnostic disable: undefined-global
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 
 local NOTIFY_WINDOW = 6
 
@@ -134,21 +134,21 @@ end
 
 local function apply_look(message, string_id)
     if message.style ~= nil then
-        kh1_native.call_evdl_syscall(fnc_005_set_window_type, {NOTIFY_WINDOW, message.style})
+        native.call_evdl_syscall(fnc_005_set_window_type, {NOTIFY_WINDOW, message.style})
     end
     if message.tail ~= nil then
-        kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {NOTIFY_WINDOW, message.tail})
+        native.call_evdl_syscall(fnc_050_set_window_tail_type, {NOTIFY_WINDOW, message.tail})
     end
     if message.width ~= nil then
-        kh1_native.call_evdl_syscall(fnc_004_set_window_size, {NOTIFY_WINDOW, message.width, message.height})
+        native.call_evdl_syscall(fnc_004_set_window_size, {NOTIFY_WINDOW, message.width, message.height})
     end
     local can_auto_width = fnc_16D_set_window_width_auto ~= nil
     if message.auto_width and can_auto_width then
         local x = message.x or 0
         local y = message.y or 0
-        kh1_native.call_evdl_syscall(fnc_16D_set_window_width_auto, {NOTIFY_WINDOW, string_id, x, y})
+        native.call_evdl_syscall(fnc_16D_set_window_width_auto, {NOTIFY_WINDOW, string_id, x, y})
     elseif message.x ~= nil then
-        kh1_native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, message.x, message.y})
+        native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, message.x, message.y})
     end
 end
 
@@ -158,7 +158,7 @@ local function open_without_width_pad()
         saved_pad = ReadFloat(g_EVWindowWidthPad)
         WriteFloat(g_EVWindowWidthPad, 0)
     end
-    local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
+    local ok, result = native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
     if saved_pad ~= nil then
         WriteFloat(g_EVWindowWidthPad, saved_pad)
     end
@@ -169,11 +169,11 @@ local function open_without_width_pad()
 end
 
 local function display(string_id)
-    kh1_native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, string_id})
+    native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, string_id})
 end
 
 local function close()
-    return kh1_native.call_evdl_syscall(fnc_002_close_window, {NOTIFY_WINDOW})
+    return native.call_evdl_syscall(fnc_002_close_window, {NOTIFY_WINDOW})
 end
 
 local function reset_bookkeeping(box)

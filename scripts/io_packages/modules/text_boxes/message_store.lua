@@ -1,6 +1,6 @@
 ---@diagnostic disable: undefined-global
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 local notify_window = require("modules.text_boxes.notify_window")
 
 local BLOCK_KEY = "kh1_textbox_queue_v9"
@@ -52,7 +52,7 @@ local function open()
     if block_address ~= nil then
         return true
     end
-    local address = kh1_native.persistent_block(BLOCK_KEY, BLOCK_SIZE)
+    local address = native.persistent_block(BLOCK_KEY, BLOCK_SIZE)
     if address == nil or address == 0 then
         return false
     end
