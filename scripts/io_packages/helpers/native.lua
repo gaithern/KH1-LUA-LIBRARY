@@ -28,6 +28,7 @@ local LOG_FILE_NAME = "kh1_lua_library.log"
 local scratch_floats = nil
 local script_context = nil
 local log_path = nil
+local slot_views = {}
 
 local function to_address(pointer)
     return cffi.tonumber(cffi.cast("uintptr_t", pointer))
@@ -116,13 +117,31 @@ local function copy_memory(destination, source, size)
 end
 
 local function persistent_slot(key)
+    if slot_views[key] ~= nil then
+        return slot_views[key]
+    end
     local name = "Local\\kh1_lua_library_" .. cffi.C.GetCurrentProcessId() .. "_" .. key
     local invalid_handle = cffi.cast("void*", -1)
     local mapping = cffi.C.CreateFileMappingA(invalid_handle, nil, PAGE_READWRITE, 0, 8, name)
     if to_address(mapping) == 0 then
         return 0
     end
-    return to_address(cffi.C.MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 8))
+    local view = to_address(cffi.C.MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 8))
+    if view == 0 then
+        return 0
+    end
+    slot_views[key] = view
+    return view
+end
+
+local function read_slot(slot)
+    local pointer = cffi.cast("uint64_t*", slot)
+    return cffi.tonumber(pointer[0])
+end
+
+local function write_slot(slot, value)
+    local pointer = cffi.cast("uint64_t*", slot)
+    pointer[0] = value
 end
 
 local function persistent_block(key, size)
@@ -130,10 +149,10 @@ local function persistent_block(key, size)
     if slot == 0 then
         return 0
     end
-    if ReadLong(slot, true) == 0 then
-        WriteLong(slot, allocate(size, false), true)
+    if read_slot(slot) == 0 then
+        write_slot(slot, allocate(size, false))
     end
-    return ReadLong(slot, true)
+    return read_slot(slot)
 end
 
 local function find_log_path()
@@ -166,6 +185,8 @@ return {
     free = free,
     copy_memory = copy_memory,
     persistent_slot = persistent_slot,
+    read_slot = read_slot,
+    write_slot = write_slot,
     persistent_block = persistent_block,
     log_debug = log_debug,
 }

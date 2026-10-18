@@ -52,7 +52,6 @@ After changing scripts, run `python build.py` to regenerate `mod.yml`.
 
 ## Calling game code
 Everything that runs game code is Lua, using [cffi-lua](https://github.com/q66/cffi-lua) (`require("cffi")`).
-There is no native project to build.
 
 - **Calling a game function**: `helpers/native.lua`'s `call_function(rva, ...)` casts `BASE_ADDR + rva` to a
   function taking that many `uint64_t` arguments and calls it. It returns `true, result`. `call_evdl_syscall(rva, stack)`
@@ -63,16 +62,8 @@ There is no native project to build.
   or targeted by a redirected `call` (`helpers/call_redirect.lua`, used by `prize_popup` and `spawn_enemy`).
   Event scripts and LuaBackend's `_OnFrame` run on the same thread, so these callbacks never run at the same time as other Lua.
 - **Memory that outlives a script**: `persistent_block(key, size)` returns the same zeroed block to every script and
-  after every F1 reload, for the life of the game process.
-
-Things to know:
-- A crash inside a called game function crashes the game. There is no exception guard.
-- 64-bit values from cffi are cdata. Convert them with `cffi.tonumber` before comparing or doing maths.
-  `cdata == 0` is always false.
-- Anything the game can call into is put back when the Lua state closes (F1 reload), and is also overwritten
-  by the next `_OnInit`, so a reload never leaves the game pointing at a Lua function that no longer exists.
-- Redirected callbacks forward the first four integer arguments only.
-- `log_debug` writes to `scripts/io_packages/kh1_lua_library.log`.
+  after every F1 reload, for the life of the game process. The 8-byte slot holding its address is a named file
+  mapping view.
 
 ## Currently shipped features for modders using this project
 All functions below are available on the table returned by `require("kh1_lua_library")`.

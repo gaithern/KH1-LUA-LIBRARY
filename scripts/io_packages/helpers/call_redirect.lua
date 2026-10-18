@@ -50,16 +50,16 @@ local function stub_for(call_site)
     if slot == 0 then
         return 0
     end
-    if ReadLong(slot, true) == 0 then
+    if native.read_slot(slot) == 0 then
         local stub_address = native.allocate_near(BASE_ADDR + call_site, JUMP_STUB_LENGTH)
         if stub_address == 0 then
             return 0
         end
         local jump_to_address_below = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 }
         WriteArray(stub_address, jump_to_address_below, true)
-        WriteLong(slot, stub_address, true)
+        native.write_slot(slot, stub_address)
     end
-    return ReadLong(slot, true)
+    return native.read_slot(slot)
 end
 
 local function restore(call_site)
