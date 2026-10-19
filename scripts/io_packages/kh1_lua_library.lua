@@ -638,28 +638,13 @@ local function ko_sora()
     end
 end
 
--- Original bytes at the 3 damage-cap patch sites
-local DMGCAP_JZ       = {0x74, 0x22}
-local DMGCAP_LOAD_ECX = {0x0F, 0xB7, 0x88, 0xC2, 0x00, 0x00, 0x00}
-local DMGCAP_LOAD_EBX = {0x0F, 0xB7, 0x98, 0xC2, 0x00, 0x00, 0x00}
-
-local function set_damage_cap(mode)
-    -- "on"/true: normal per-enemy caps. "off"/false: never cap. Integer N: cap every hit at N.
-    local jz, ecx, ebx = DMGCAP_JZ, DMGCAP_LOAD_ECX, DMGCAP_LOAD_EBX
-    if mode == "off" or mode == false then
-        jz = {0xEB, 0x22}
-    elseif math.type(mode) == "integer" and mode >= 1 and mode <= 0x7FFFFFFF then
-        local b1, b2, b3, b4 = string.pack("<i4", mode):byte(1, 4)
-        jz = {0x90, 0x90}
-        ecx = {0xB9, b1, b2, b3, b4, 0x90, 0x90}
-        ebx = {0xBB, b1, b2, b3, b4, 0x90, 0x90}
-    elseif not (mode == "on" or mode == true) then
-        return false
+local function set_damage_cap(enabled)
+    -- Enables or disables the damage cap
+    if enabled then
+        WriteArray(damageCapBranch, {0x74, 0x22})
+    else
+        WriteArray(damageCapBranch, {0xEB, 0x22})
     end
-    WriteArray(damageCapBranch, jz)
-    WriteArray(damageCapBranch + 0xA, ecx)
-    WriteArray(damageCapBranch + 0x1D, ebx)
-    return true
 end
 
 local function heartless_angel_sora()

@@ -141,7 +141,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `sora_koed` | none | boolean | True if Sora's current HP is 0. |
 | `ko_sora` | none | none | Triggers the in-game event script that KOs Sora. |
 | `heartless_angel_sora` | none | none | Sets Sora's HP to 1 and MP to 0. |
-| `set_damage_cap` | `mode` | boolean | `"on"`/`true`: normal per-enemy damage caps. `"off"`/`false`: never cap. Integer N: cap every hit at N. |
+| `set_damage_cap` | `enabled` | none | `true`: normal per-enemy damage caps. `false`: never cap. |
 | `spawn_prize` | `item_id` | boolean | Calls the in-game function to spawn a map prize at Sora's position. |
 | `spawn_enemy` | `model_path, x, y, z` | `boolean, reason` | Spawns an enemy by model path.|
 | `play_se2` | `se_id, param_2` | boolean | Plays a sound effect using the in-game function. |
