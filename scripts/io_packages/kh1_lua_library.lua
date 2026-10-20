@@ -15,12 +15,14 @@
     possible, but some additional memory addresses may need to added.
 --]]
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 local kh1_spawn_enemy = require("modules.spawn_enemy")
 local kh1_khscii = require("helpers.khscii")
 local kh1_text_boxes = require("modules.text_boxes")
 local kh1_prize_popup = require("modules.prize_popup")
 local kh1_level_up_prompt = require("modules.level_up_prompt")
+local kh1_show_skipped_rewards = require("modules.show_skipped_rewards")
+local kh1_skip_summon_animations = require("modules.skip_summon_animations")
 
 local GetKHSCII = kh1_khscii.GetKHSCII
 
@@ -98,6 +100,14 @@ end
 -- ########### --
 -- # Getters # --
 -- ########### --
+local function get_btltbl_address()
+    return jumpHeights - 0xAC
+end
+
+local function is_btltbl_loaded()
+    return ReadByte(get_btltbl_address()) ~= 0x0
+end
+
 local function get_world()
     -- Get current world
     return ReadByte(world)
@@ -395,7 +405,55 @@ local function set_spell_cost(spell, value)
             WriteShort(memory_location, possible_magic_costs[value])
         end
     end
-end    
+end
+
+local function set_weapon_stats(character, weapon_number, stats)
+    local first_weapon_offset = nil
+        if character == "Sora"   then first_weapon_offset = 0x94F8
+    elseif character == "Donald" then first_weapon_offset = 0x9C88
+    elseif character == "Goofy"  then first_weapon_offset = 0xA208 end
+    if first_weapon_offset == nil then
+        return
+    end
+    local weapon_record_size = 0x58
+    local record_address = get_btltbl_address() + first_weapon_offset + weapon_record_size * (weapon_number - 1)
+    for stat, value in pairs(stats) do
+        local stat_offset = nil
+            if stat == "STR" then stat_offset = 0x30
+        elseif stat == "CRR" then stat_offset = 0x31
+        elseif stat == "CRB" then stat_offset = 0x32
+        elseif stat == "REC" then stat_offset = 0x33
+        elseif stat == "MP"  then stat_offset = 0x38 end
+        if stat_offset ~= nil then
+            WriteByte(record_address + stat_offset, value)
+        end
+    end
+end
+
+local function write_level_up_table(table_address, values)
+    for index, value in ipairs(values) do
+        WriteByte(table_address + index - 1, value)
+    end
+end
+
+local function set_party_level_up_table(party_member, stats, abilities)
+    local stats_offset = nil
+        if party_member == 1 then stats_offset = 0x3EB8
+    elseif party_member == 2 then stats_offset = 0x4050
+    elseif party_member == 3 then stats_offset = 0x41E8
+    elseif party_member == 4 then stats_offset = 0x4380
+    elseif party_member == 5 then stats_offset = 0x4518
+    elseif party_member == 6 then stats_offset = 0x46B0
+    elseif party_member == 7 then stats_offset = 0x4848
+    elseif party_member == 8 then stats_offset = 0x49E0 end
+    if stats_offset == nil then
+        return
+    end
+    local distance_from_stats_to_abilities = 0x68
+    local abilities_offset = stats_offset + distance_from_stats_to_abilities
+    write_level_up_table(get_btltbl_address() + stats_offset, stats)
+    write_level_up_table(get_btltbl_address() + abilities_offset, abilities)
+end
 
 local function set_attack_animation_data(index, animation_data)
     -- Overwrites attack animation data
@@ -604,23 +662,45 @@ local function grant_sora_ability(ability_value)
     end
 end
 
+local function get_party_member_ability_list(party_member)
+    local party_member_record_size = 0x74
+    return soraCurAbilities + party_member * party_member_record_size
+end
+
+local function get_party_member_ability_count(party_member)
+    local ability_list = get_party_member_ability_list(party_member)
+    local count = 0
+    while count < 48 and ReadByte(ability_list + count) ~= 0 do
+        count = count + 1
+    end
+    return count
+end
+
+local function grant_party_member_ability(party_member, ability_value)
+    local ability_list = get_party_member_ability_list(party_member)
+    local count = get_party_member_ability_count(party_member)
+    if count < 48 then
+        WriteByte(ability_list + count, ability_value + 128)
+    end
+end
+
 local function spawn_prize(item_id)
     --Uses the in game function to spawn a map prize
     local pos = get_sora_pos()
-    local pos_ptr = kh1_native.write_floats(pos["X"], pos["Y"], pos["Z"])
-    local spawned = kh1_native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
+    local pos_ptr = native.write_floats(pos["X"], pos["Y"], pos["Z"])
+    local spawned = native.call_function(fnc_spawn_prize, item_id, pos_ptr, 0)
     return spawned
 end
 
 local function play_se2(se_id, param_2)
     -- Plays a sound effect using the in game function.
-    return kh1_native.call_function(fnc_play_se2, se_id, param_2)
+    return native.call_function(fnc_play_se2, se_id, param_2)
 end
 
 local function apply_world_set_row(world_id, set_index)
     -- Applies one row of allset.set: the game's own pre-authored per-room map-state
     -- ("set number") table for a world.
-    kh1_native.call_function(fnc_apply_allset_row, world_id, set_index)
+    native.call_function(fnc_apply_allset_row, world_id, set_index)
 end
 
 local function sora_koed()
@@ -632,32 +712,17 @@ end
 local function ko_sora()
     -- Triggers the in game functions to KO Sora.
     if not sora_koed() then
-        kh1_native.call_function(fnc_trigger_ko_event_script, 0xC8)
+        native.call_function(fnc_trigger_ko_event_script, 0xC8)
     end
 end
 
--- Original bytes at the 3 damage-cap patch sites
-local DMGCAP_JZ       = {0x74, 0x22}
-local DMGCAP_LOAD_ECX = {0x0F, 0xB7, 0x88, 0xC2, 0x00, 0x00, 0x00}
-local DMGCAP_LOAD_EBX = {0x0F, 0xB7, 0x98, 0xC2, 0x00, 0x00, 0x00}
-
-local function set_damage_cap(mode)
-    -- "on"/true: normal per-enemy caps. "off"/false: never cap. Integer N: cap every hit at N.
-    local jz, ecx, ebx = DMGCAP_JZ, DMGCAP_LOAD_ECX, DMGCAP_LOAD_EBX
-    if mode == "off" or mode == false then
-        jz = {0xEB, 0x22}
-    elseif math.type(mode) == "integer" and mode >= 1 and mode <= 0x7FFFFFFF then
-        local b1, b2, b3, b4 = string.pack("<i4", mode):byte(1, 4)
-        jz = {0x90, 0x90}
-        ecx = {0xB9, b1, b2, b3, b4, 0x90, 0x90}
-        ebx = {0xBB, b1, b2, b3, b4, 0x90, 0x90}
-    elseif not (mode == "on" or mode == true) then
-        return false
+local function set_damage_cap(enabled)
+    -- Enables or disables the damage cap
+    if enabled then
+        WriteArray(damageCapBranch, {0x74, 0x22})
+    else
+        WriteArray(damageCapBranch, {0xEB, 0x22})
     end
-    WriteArray(damageCapBranch, jz)
-    WriteArray(damageCapBranch + 0xA, ecx)
-    WriteArray(damageCapBranch + 0x1D, ebx)
-    return true
 end
 
 local function heartless_angel_sora()
@@ -711,6 +776,10 @@ return {
     set_sora_run_speed = set_sora_run_speed,
     set_spell_effectiveness = set_spell_effectiveness,
     set_spell_cost = set_spell_cost,
+    set_weapon_stats = set_weapon_stats,
+    set_party_level_up_table = set_party_level_up_table,
+    get_btltbl_address = get_btltbl_address,
+    is_btltbl_loaded = is_btltbl_loaded,
     set_attack_animation_data = set_attack_animation_data,
     set_command_data = set_command_data,
     set_gummi_qty_at_index = set_gummi_qty_at_index,
@@ -731,9 +800,11 @@ return {
     is_in_gummi = is_in_gummi,
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
+    give_party_member_ability = grant_party_member_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
+    update_prize_popup = kh1_prize_popup.update_prize_popup,
     play_se2 = play_se2,
     apply_world_set_row = apply_world_set_row,
     queue_text_box = kh1_text_boxes.queue_text_box,
@@ -744,5 +815,7 @@ return {
     sora_koed = sora_koed,
     ko_sora = ko_sora,
     heartless_angel_sora = heartless_angel_sora,
-    set_damage_cap = set_damage_cap
+    set_damage_cap = set_damage_cap,
+    set_show_skipped_rewards = kh1_show_skipped_rewards.set_show_skipped_rewards,
+    set_skip_summon_animations = kh1_skip_summon_animations.set_skip_summon_animations
 }

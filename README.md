@@ -14,43 +14,28 @@ Below you'll find key components of the repository and their descriptions.
   | :--- | :---------- |
   | `lua54.dll` | Bundled lua module |
 
-- `native/KH1Native/*`
-
-  | File | Description |
-  | :--- | :---------- |
-  | `call_bridge.cpp`| Handler for calling in-exe functions.  Handles varying numbers of input arugments. |
-  | `dllmain.cpp`| Main entry point. |
-  | `c_hooks.cpp` | `kh1_native.install_c`: compiles a hook `.c` file with TinyCC at load time and runs its `install()`. |
-  | `evdl_syscall.cpp` | Supports calls EVDL Syscalls for C++/Lua.  Creates a dummy scriptCtx for execution. |
-  | `hooks.cpp` | Named inline, mid-function and function-pointer hooks, built on [SafetyHook](https://github.com/cursey/safetyhook). |
-  | `log.cpp` | Handles writing to a shared log for debugging purposes. |
-  | `lua_api.cpp` | Identifies the Lua module and populate Lua C function pointers. |
-  | `lua_bindings.cpp` | Exposes C++ to be used on the Lua side. |
-  | `process_memory.cpp` | Toolset for working with game memory, including memory allocation, safe writes, etc. |
-  | `symbols.cpp` | Address table for C++, read from the calling script's Steam/EGS globals. |
+- `scripts/kh1_text_box_driver.lua`
+  - Runs every frame to drive the notification text box queue and clear custom text/text boxes.
 
 - `scripts/io_packages/*`
 
   | File | Description |
   | :--- | :---------- |
-  | `helpers/*` | Generic helper lua modules. |
-  | `hooks/*` | Exe hooks in C, compiled at load time by `kh1_native.install_c`: `prize_popup.c` (behind `modules/prize_popup.lua`) and `species_redirect.c` (behind `modules/spawn_enemy.lua`). |
+  | `helpers/native.lua` | Calls game functions and EVDL syscalls, and allocates native memory, through cffi. See [Calling game code](#calling-game-code). |
+  | `helpers/call_redirect.lua` | Points one `call` instruction in the game at a Lua function. |
+  | `helpers/*` | Other generic helper lua modules. |
   | `modules/*` | Containers for complex lua function(s) pertaining to one subject area. |
+  | `cffi.dll` | [cffi-lua](https://github.com/q66/cffi-lua), a C FFI for Lua, built against `dll/lua54.dll` by `build_cffi.py`. MIT, see `cffi_LICENSE.txt`. |
   | `EGSGlobal_1_0_0_10.lua` | Mapped RVAs for KH1 Epic Game Store v1.0.0.10. |
   | `json.lua` | Generic lua helper.  From [RXI's json.lua](https://github.com/rxi/json.lua). |
   | `kh1_lua_library.lua` | Main script to be used for outside mods.  Contains callers for all functionality. |
-  | `kh1_native.dll` | Compiled binary from `native/KH1Native/*`. |
-  | `kh1_native.h` | The header hook `.c` files include. See [Native hooks](#native-hooks). |
-  | `libtcc.dll` | [TinyCC](https://bellard.org/tcc/) 0.9.27, which compiles hook `.c` files at load time. LGPL, see `libtcc_LICENSE.txt`. |
   | `memory_locations.lua` | Named save-block addresses (`saveData1`/`saveData2` + offset), loaded by `VersionCheck` after the version file. Names match `save_data_labels.json` in KH1-EVDL-TOOLS. |
   | `SteamGlobal_1_0_0_2.lua` | Mapped RVAs for KH1 Steam v1.0.0.2. |
   | `VersionCheck.lua` | [KHPCSpeedrunTools](https://github.com/Denhonator/KHPCSpeedrunTools/blob/main/1FMMods/scripts/io_packages/VersionCheck.lua)'s methodology of determining active game version. |
 - `build.py`
-  - Fetches SafetyHook and TinyCC (`build_deps.py`) and compiles `kh1_native.dll` from its source in `native/KH1Native/*`.
-  - Creates relevant `mod.yml` by calling `generate_mod_yml.py`
-- `build_deps.py`
-  - Downloads the pinned SafetyHook + Zydis sources into `native/KH1Native/external/` (not committed) and
-    `libtcc.dll` + its license into `scripts/io_packages/` (committed, since the mod ships them).
+  - Creates relevant `mod.yml` by calling `generate_mod_yml.py`. With `--cffi`, rebuilds `cffi.dll` first.
+- `build_cffi.py`
+  - Rebuilds `cffi.dll` from a pinned cffi-lua commit with MSYS2's UCRT64 toolchain. Only needed when changing the cffi-lua version, since the built dll is committed.
 - `generate_mod_yml.py`
   - Generates `mod.yml` by iterating through `scripts/io_packages/`.
 - `icon.png`
@@ -63,27 +48,22 @@ Below you'll find key components of the repository and their descriptions.
   - This doc.
 
 ## Building mod/making changes
-If any script or CPP code needs to be changed, those changes should be accurately picked up and compiled by running `python build.py`.
+After changing scripts, run `python build.py` to regenerate `mod.yml`.
 
-## Native hooks
-Exe hooks are written in C, not as hand-assembled code caves. A mod ships a `.c` file under
-`scripts/io_packages/` and installs it from Lua after `VersionCheck` has run:
+## Calling game code
+Everything that runs game code is Lua, using [cffi-lua](https://github.com/q66/cffi-lua) (`require("cffi")`).
 
-```lua
-require("VersionCheck")
-kh1_native.install_c("hooks/my_feature.c")  -- path relative to io_packages
-```
-
-kh1_native compiles the file in memory with TinyCC and calls its `int install(void)`. The file
-includes only `kh1_native.h`: `kh1_symbol` looks up any name from the globals files, and
-`kh1_hook_inline`, `kh1_hook_mid` (every register readable and writable, via `KH1Context`) and
-`kh1_hook_pointer` install named hooks on top of [SafetyHook](https://github.com/cursey/safetyhook).
-There is no C library; `memcmp`/`memcpy`/`memset`, `kh1_log` and `kh1_persistent_block` (the same block
-Lua gets from `kh1_native.persistent_block`, for state shared with Lua) are provided. Compile errors
-and hook results go to `kh1_native.log`. Installing a hook name twice is a no-op, so script
-reloads are safe, but an edited `.c` file only takes effect after restarting the game. See
-`scripts/io_packages/hooks/` here (the modules install them for you) and KH1-RANDOMIZER's
-`mod/scripts/io_packages/hooks/` for working examples.
+- **Calling a game function**: `helpers/native.lua`'s `call_function(rva, ...)` casts `BASE_ADDR + rva` to a
+  function taking that many `uint64_t` arguments and calls it. It returns `true, result`. `call_evdl_syscall(rva, stack)`
+  does the same for EVDL syscalls, with a dummy script context holding `stack`.
+- **Letting the game call Lua**: `cffi.cast("<function type>", lua_function)` makes a native function pointer that
+  runs the Lua function. It can be written into a function-pointer table (`modules/show_skipped_rewards.lua` swaps
+  two `g_EVSyscallTable` entries this way), passed to the game as a callback (`spawn_enemy`'s file-load callback),
+  or targeted by a redirected `call` (`helpers/call_redirect.lua`, used by `prize_popup` and `spawn_enemy`).
+  Event scripts and LuaBackend's `_OnFrame` run on the same thread, so these callbacks never run at the same time as other Lua.
+- **Memory that outlives a script**: `persistent_block(key, size)` returns the same zeroed block to every script and
+  after every F1 reload, for the life of the game process. The 8-byte slot holding its address is a named file
+  mapping view.
 
 ## Currently shipped features for modders using this project
 All functions below are available on the table returned by `require("kh1_lua_library")`.
@@ -125,6 +105,8 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `get_current_hits` | none | byte | Sora's current combo hit count. |
 | `get_sora_pos` | none | table `{X, Y, Z}` | Sora's current position. |
 | `get_gummi_qty_at_index` | `index` | byte | Gummi item quantity at inventory index (1-based). |
+| `get_btltbl_address` | none | address | Where `btltbl.bin` is loaded in memory. |
+| `is_btltbl_loaded` | none | boolean | Whether `btltbl.bin` has been loaded yet. Check this before calling the btltbl setters. |
 
 ### Setters
 | Function | Arguments | Returns | Description |
@@ -137,6 +119,8 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `set_sora_run_speed` | `run_speed` | none | Sets Sora's run speed. |
 | `set_spell_effectiveness` | `spell, value` | none | Sets a spell's effectiveness by name. |
 | `set_spell_cost` | `spell, value` | none | Sets a spell's cost. Valid values: 15 = 1/2 CP, 30 = 1 CP, 100/200/300 = 1/2/3 MP. |
+| `set_weapon_stats` | `character, weapon_number, stats` | none | Sets a weapon's stats in `btltbl.bin`. `character` is `"Sora"`, `"Donald"`, or `"Goofy"`; `weapon_number` is the weapon's position in that character's list (1-based, game order). `stats` is a table with any of `STR`, `CRR` (crit rate), `CRB` (crit bonus), `REC` (recoil), `MP`. |
+| `set_party_level_up_table` | `party_member, stats, abilities` | none | Overwrites a party member's level-up tables in `btltbl.bin` (1 Donald, 2 Goofy, 3-8 world party members). `stats` and `abilities` are arrays of reward codes, the first entry being LV 2: 1 HP, 2 MP, 3 AP, 4 STR, 5 DEF, 6 item slot, 7 accessory slot, `0x80 + id` an ability. |
 | `set_attack_animation_data` | `index, animation_data` | none | Overwrites an attack animation data entry (byte array). |
 | `set_command_data` | `index, command_data` | none | Overwrites a command menu data entry (byte array). |
 | `set_gummi_qty_at_index` | `index, qty` | none | Sets gummi item quantity at inventory index (capped at 99). |
@@ -149,6 +133,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `calculate_air_combo_limit` | none | integer | What Sora's air combo limit should be, based on equipped Air Combo Plus abilities. |
 | `enable_ability` | `ability` | none | Force-enables an ability by name (e.g. `"Dodge Roll"`, `"Guard"`) even if unowned/unequipped. |
 | `give_sora_ability` | `ability_value` | none | Grants Sora an ability by ID (unequipped). |
+| `give_party_member_ability` | `party_member`, `ability_value` | none | Grants a party member (1 Donald, 2 Goofy, 3+ world party members) an ability by ID (unequipped). |
 | `give_shared_ability` | `shared_ability_value` | none | Grants the party a shared ability by ID (unequipped). |
 | `force_scan` | `on` | none | ASM patch that forces Scan on/off. Credits to KSX. |
 | `force_combo_master` | `on` | none | ASM patch that forces Combo Master on/off. Credits to KSX. |
@@ -161,13 +146,16 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `sora_koed` | none | boolean | True if Sora's current HP is 0. |
 | `ko_sora` | none | none | Triggers the in-game event script that KOs Sora. |
 | `heartless_angel_sora` | none | none | Sets Sora's HP to 1 and MP to 0. |
-| `set_damage_cap` | `mode` | boolean | `"on"`/`true`: normal per-enemy damage caps. `"off"`/`false`: never cap. Integer N: cap every hit at N. |
+| `set_damage_cap` | `enabled` | none | `true`: normal per-enemy damage caps. `false`: never cap. |
 | `spawn_prize` | `item_id` | boolean | Calls the in-game function to spawn a map prize at Sora's position. |
 | `spawn_enemy` | `model_path, x, y, z` | `boolean, reason` | Spawns an enemy by model path.|
 | `play_se2` | `se_id, param_2` | boolean | Plays a sound effect using the in-game function. |
 | `apply_world_set_row` | `world_id, set_index` | none | Applies one row of `allset.set` (the game's pre-authored per-room map states) to a world. |
 | `show_prompt` | `input_title, input_party, duration, colour` | boolean | Shows level-up-style prompts over party members. `input_title` and `input_party` are tables indexed 1-3 (Sora/ally 1/ally 2); each party entry is 1-2 lines of text. |
 | `show_custom_item_popup` | `text` | boolean | Forces a map-prize pickup popup with custom text. |
+| `update_prize_popup` | none | none | Clears the custom popup text once the popup closes. The library's driver script already calls this every frame. |
+| `set_show_skipped_rewards` | `turn_on` | boolean | Ends a cutscene skip right before a gift popup opens, so the reward is shown. |
+| `set_skip_summon_animations` | `turn_on` | boolean | Shortens the summon opener (camera swing, fades and the first three step durations). The entrance itself needs edited `xs_*.dat` event scripts, which the calling mod ships. Returns false if the call sites don't look as expected. |
 | `queue_text_box` | `{text, duration, sound, style, x, y, width, height, tail, auto_width}` | boolean | Queues a notification text box on the shared notification window. Only `text` is required. |
 | `close_text_box` | none | boolean | Closes the notification window. |
 | `update_text_boxes` | none | none | Feeds held messages, plays their sounds and repairs the window after an event script load. The library's driver script already calls this every frame; outside consumers shouldn't need to use this. |

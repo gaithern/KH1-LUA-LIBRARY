@@ -1,6 +1,6 @@
 ---@diagnostic disable: undefined-global
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 
 local NOTIFY_WINDOW = 6
 
@@ -26,6 +26,15 @@ local BOX_CLOSE_FRAMES  = 0x12
 local BOX_DONE_CALLBACK = 0x18
 local BOX_STATE         = 0x20
 local BOX_TEXT          = 0x88
+local BOX_TEXT_HANDLE   = 0xA8
+
+local TEXT_NODE_RESOURCE = 0x08
+local TEXT_NODE_NEXT     = 0x20
+local MAX_TEXT_NODES     = 0x200
+
+local HANDLE_BUCKET_MASK  = 0x7FFFFFFF
+local HANDLE_BUCKET_SHIFT = 25
+local HANDLE_OFFSET_MASK  = 0x1FFFFFF
 
 local TEMPLATE_SIZE              = 0xD0
 local TEMPLATE_CLOSE_SPEED_INDEX = 0xE
@@ -134,21 +143,21 @@ end
 
 local function apply_look(message, string_id)
     if message.style ~= nil then
-        kh1_native.call_evdl_syscall(fnc_005_set_window_type, {NOTIFY_WINDOW, message.style})
+        native.call_evdl_syscall(fnc_005_set_window_type, {NOTIFY_WINDOW, message.style})
     end
     if message.tail ~= nil then
-        kh1_native.call_evdl_syscall(fnc_050_set_window_tail_type, {NOTIFY_WINDOW, message.tail})
+        native.call_evdl_syscall(fnc_050_set_window_tail_type, {NOTIFY_WINDOW, message.tail})
     end
     if message.width ~= nil then
-        kh1_native.call_evdl_syscall(fnc_004_set_window_size, {NOTIFY_WINDOW, message.width, message.height})
+        native.call_evdl_syscall(fnc_004_set_window_size, {NOTIFY_WINDOW, message.width, message.height})
     end
     local can_auto_width = fnc_16D_set_window_width_auto ~= nil
     if message.auto_width and can_auto_width then
         local x = message.x or 0
         local y = message.y or 0
-        kh1_native.call_evdl_syscall(fnc_16D_set_window_width_auto, {NOTIFY_WINDOW, string_id, x, y})
+        native.call_evdl_syscall(fnc_16D_set_window_width_auto, {NOTIFY_WINDOW, string_id, x, y})
     elseif message.x ~= nil then
-        kh1_native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, message.x, message.y})
+        native.call_evdl_syscall(fnc_003_set_window_position, {NOTIFY_WINDOW, message.x, message.y})
     end
 end
 
@@ -158,7 +167,7 @@ local function open_without_width_pad()
         saved_pad = ReadFloat(g_EVWindowWidthPad)
         WriteFloat(g_EVWindowWidthPad, 0)
     end
-    local ok, result = kh1_native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
+    local ok, result = native.call_evdl_syscall(fnc_000_open_window, {NOTIFY_WINDOW})
     if saved_pad ~= nil then
         WriteFloat(g_EVWindowWidthPad, saved_pad)
     end
@@ -169,11 +178,45 @@ local function open_without_width_pad()
 end
 
 local function display(string_id)
-    kh1_native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, string_id})
+    native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, string_id})
+end
+
+local function resolve_handle(handle)
+    local bucket_index = (handle & HANDLE_BUCKET_MASK) >> HANDLE_BUCKET_SHIFT
+    local bucket = ReadLong(g_apResourceHandleBuckets + bucket_index * 8)
+    return bucket | (handle & HANDLE_OFFSET_MASK)
+end
+
+local function is_in_text_list(resource)
+    local node = ReadLong(g_pTextListHead)
+    for _ = 1, MAX_TEXT_NODES do
+        if node == 0 then
+            return false
+        end
+        if ReadLong(node + TEXT_NODE_RESOURCE, true) == resource then
+            return true
+        end
+        node = ReadLong(node + TEXT_NODE_NEXT, true)
+    end
+    return false
+end
+
+local function forget_freed_text(box)
+    local handle_address = get_screen_box_address(box) + BOX_TEXT_HANDLE
+    local handle = ReadInt(handle_address)
+    if handle == 0 or is_in_text_list(resolve_handle(handle)) then
+        return
+    end
+    ConsolePrint("kh1_lua_library: screen box " .. box .. " text was already freed, forgetting it before closing")
+    WriteInt(handle_address, 0)
 end
 
 local function close()
-    return kh1_native.call_evdl_syscall(fnc_002_close_window, {NOTIFY_WINDOW})
+    local box = find_screen_box()
+    if box ~= nil then
+        forget_freed_text(box)
+    end
+    return native.call_evdl_syscall(fnc_002_close_window, {NOTIFY_WINDOW})
 end
 
 local function reset_bookkeeping(box)

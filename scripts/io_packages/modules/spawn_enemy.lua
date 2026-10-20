@@ -1,21 +1,28 @@
 ---@diagnostic disable: undefined-global
 
-local kh1_native = require("kh1_native")
+local cffi = require("cffi")
+local native = require("helpers.native")
+local call_redirect = require("helpers.call_redirect")
 local kh1_creature_data = require("modules.creature_data")
 
-local native_log = kh1_native.log_debug or function(_) end
-local function log(msg) native_log("[spawn_enemy] " .. msg) end
+local function log(msg) native.log_debug("[spawn_enemy] " .. msg) end
+
+cffi.cdef[[
+    typedef uint64_t (*SpawnEnemyReverseBlob)(uint64_t blob, uint64_t second, uint64_t third, uint64_t fourth);
+    typedef void (*SpawnEnemyLoadComplete)(uint32_t size, uint64_t unused, uint64_t destination);
+    uint32_t GetCurrentThreadId(void);
+]]
 
 -- ############################################################ --
 -- # Species-table redirect: persistent control block           # --
 -- ############################################################ --
 
--- The hooks are C in hooks/species_redirect.c; this side registers buffer
--- rows and polls the load-complete fields. Layout must match its Ctrl struct.
-local CTRL_KEY  = "kh1_species_redirect_v2"
+-- Both calls to fnc_reverse_blob_to_slot_ptr are redirected to reverse_blob below, and the game
+-- calls load_complete when a queued file finishes. The block keeps rows alive across F1 reloads.
+local CTRL_KEY  = "kh1_species_redirect_v3"
 local CTRL_SIZE = 0x4000
 
-local OFF_COMP      = 0x10   -- address of the native file-load completion callback
+local OFF_COMP      = 0x10   -- address of the file-load completion callback
 local OFF_REG_COUNT = 0x28
 local OFF_DONE_FLAG = 0x30   -- completion callback sets this to 1
 local OFF_DONE_SIZE = 0x34   -- loaded size (ECX)
@@ -89,10 +96,54 @@ local function rd_poll_done()
     return ReadLong(ctrl + OFF_DONE_DEST, true), ReadInt(ctrl + OFF_DONE_SIZE, true) & 0xFFFFFFFF
 end
 
+local original_reverse_blob = nil
+local load_complete_callback = nil
+local queue_thread_id = 0
+local reported_wrong_thread = false
+
+local function reverse_blob(blob, second, third, fourth)
+    local blob_address = cffi.tonumber(blob)
+    local count = ci(OFF_REG_COUNT)
+    if count > MAX_ROWS then count = MAX_ROWS end
+    for i = 0, count - 1 do
+        local r = row_addr(i)
+        if ReadInt(r + ROW_ACTIVE, true) ~= 0 then
+            local buf_base = ReadLong(r + ROW_BUFBASE, true)
+            local buf_end = ReadLong(r + ROW_BUFEND, true)
+            if blob_address >= buf_base and blob_address < buf_end then
+                return ReadLong(r + ROW_MOTION, true)
+            end
+        end
+    end
+    return original_reverse_blob(blob, second, third, fourth)
+end
+
+local function load_complete(size, unused, destination)
+    WriteLong(ctrl + OFF_DONE_DEST, cffi.tonumber(destination), true)
+    WriteInt(ctrl + OFF_DONE_SIZE, size, true)
+    WriteInt(ctrl + OFF_DONE_FLAG, 1, true)
+    local thread_id = cffi.C.GetCurrentThreadId()
+    if thread_id ~= queue_thread_id and not reported_wrong_thread then
+        reported_wrong_thread = true
+        log(string.format("WARNING load_complete ran on thread %d, loads are queued on thread %d", thread_id, queue_thread_id))
+    end
+end
+
 local function rd_install()
-    ctrl = kh1_native.persistent_block(CTRL_KEY, CTRL_SIZE)
+    if fnc_reverse_blob_to_slot_ptr_call_1 == nil or fnc_reverse_blob_to_slot_ptr_call_2 == nil then
+        return false, "missing call site addresses"
+    end
+    ctrl = native.persistent_block(CTRL_KEY, CTRL_SIZE)
     if ctrl == 0 or ctrl == nil then return false, "persistent_block failed" end
-    if not kh1_native.install_c("hooks/species_redirect.c") then return false, "native install failed" end
+    original_reverse_blob = cffi.cast("SpawnEnemyReverseBlob", BASE_ADDR + fnc_reverse_blob_to_slot_ptr)
+    local call_sites = { fnc_reverse_blob_to_slot_ptr_call_1, fnc_reverse_blob_to_slot_ptr_call_2 }
+    for _, call_site in ipairs(call_sites) do
+        if not call_redirect.redirect_call(call_site, fnc_reverse_blob_to_slot_ptr, "SpawnEnemyReverseBlob", reverse_blob) then
+            return false, string.format("could not redirect call at 0x%X", call_site)
+        end
+    end
+    load_complete_callback = cffi.cast("SpawnEnemyLoadComplete", load_complete)
+    WriteLong(ctrl + OFF_COMP, cffi.tonumber(cffi.cast("uintptr_t", load_complete_callback)), true)
     return true, "installed"
 end
 
@@ -141,7 +192,7 @@ local function arena_carve(need)
         end
     end
     if #arenas >= ARENA_CAP then return nil end
-    local raw = kh1_native.allocate(ARENA_SIZE * 2)
+    local raw = native.allocate(ARENA_SIZE * 2)
     if raw == 0 then return nil end
     local base = (raw + (ARENA_SIZE - 1)) & ~(ARENA_SIZE - 1)
     arenas[#arenas + 1] = { base = base, bump = sz }
@@ -235,7 +286,7 @@ end
 local interned_paths = {}
 local function intern_path(path)
     if interned_paths[path] then return interned_paths[path] end
-    local addr = kh1_native.allocate(#path + 1)
+    local addr = native.allocate(#path + 1)
     if addr == 0 then return 0 end
     WriteArray(addr, {(path .. "\0"):byte(1, -1)}, true)
     interned_paths[path] = addr
@@ -243,7 +294,7 @@ local function intern_path(path)
 end
 
 local function mint_ptr_handle(addr)
-    local ok, handle = kh1_native.call_function(fnc_mint_resource_handle, addr)
+    local ok, handle = native.call_function(fnc_mint_resource_handle, addr)
     if not ok then return nil end
     return handle & 0xFFFFFFFF
 end
@@ -255,10 +306,10 @@ local function splice_placement_record(template, char_id, x, y, z)
     if old_ptr == 0 or old_count <= 0 or old_count > 4096 then return nil end
 
     local new_count = old_count + 1
-    local buffer = kh1_native.allocate(new_count * PLACEMENT_RECORD_SIZE)
+    local buffer = native.allocate(new_count * PLACEMENT_RECORD_SIZE)
     if buffer == 0 then return nil end
-    if not kh1_native.copy_memory(buffer, old_ptr, old_count * PLACEMENT_RECORD_SIZE) then
-        kh1_native.free(buffer)
+    if not native.copy_memory(buffer, old_ptr, old_count * PLACEMENT_RECORD_SIZE) then
+        native.free(buffer)
         return nil
     end
 
@@ -291,9 +342,9 @@ local function rollback_splice(ctx)
 end
 
 -- Blob relocation, replicating exactly what hook1/motion-callback do (same functions, same args),
--- minus the species-slot writes. If any fault, SafeCall returns false and we refuse the spawn.
+-- minus the species-slot writes. A fault inside these game calls crashes the game.
 local function call_ok(fn, arg)
-    return (kh1_native.call_function(fn, arg))
+    return (native.call_function(fn, arg))
 end
 
 local function model_fixup(dest)
@@ -328,8 +379,8 @@ local function construct_entity(ctx, buf)
         log(string.format("REFUSE construct id=0x%X: blob unsafe (%s)", ctx.id, why))
         return nil
     end
-    local ok, entity = kh1_native.call_function(fnc_spawn_world_gimmick_entity, ctx.id)
-    if not ok then log("construct CRASHED (SafeCall caught)"); return nil end
+    local ok, entity = native.call_function(fnc_spawn_world_gimmick_entity, ctx.id)
+    if not ok then log("construct call failed"); return nil end
     if entity == 0 then log("construct returned null (budget?)"); return nil end
     log(string.format("construct OK entity=0x%X", entity))
     return entity
@@ -426,7 +477,8 @@ local function queue_load(filename, dest)
     local fname = intern_path(filename)
     if fname == 0 then return false end
     rd_clear_done()
-    return (kh1_native.call_function(fnc_queue_file_load_to_address, fname, dest, rd_completion_addr(), 0))
+    queue_thread_id = cffi.C.GetCurrentThreadId()
+    return (native.call_function(fnc_queue_file_load_to_address, fname, dest, rd_completion_addr(), 0))
 end
 
 -- Drive a spawn already loading: model -> motion -> construct, one file at a time. The CC driver

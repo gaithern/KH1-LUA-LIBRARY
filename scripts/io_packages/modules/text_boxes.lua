@@ -1,6 +1,6 @@
 ---@diagnostic disable: undefined-global
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 local khscii = require("helpers.khscii")
 local notify_window = require("modules.text_boxes.notify_window")
 local store = require("modules.text_boxes.message_store")
@@ -368,7 +368,7 @@ local function play_sound_for_new_message()
 
     local message = store.read_sent(buffer_index)
     if message.sound ~= nil and fnc_play_se2 ~= nil then
-        kh1_native.call_function(fnc_play_se2, message.sound, 0)
+        native.call_function(fnc_play_se2, message.sound, 0)
     end
 end
 
