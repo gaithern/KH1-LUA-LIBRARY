@@ -438,3 +438,5 @@ g_MainMenuHelpDescriptor = 0x52AD10
 g_MainMenuItemHelpMsgTable = 0x52AFB8
 g_MainMenuCursorRow = 0x2E1F4CC
 g_MenuWindowPool = 0x2E92780
+g_pTextListHead = 0x2B9C280
+g_apResourceHandleBuckets = 0x2EE3980

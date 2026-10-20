@@ -58,6 +58,42 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/level_up_prompt.lua
+- name: scripts/io_packages/modules/menus.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus.lua
+- name: scripts/io_packages/modules/menus/drawing.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/drawing.lua
+- name: scripts/io_packages/modules/menus/game.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/game.lua
+- name: scripts/io_packages/modules/menus/item_menu.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/item_menu.lua
+- name: scripts/io_packages/modules/menus/keyboard.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/keyboard.lua
+- name: scripts/io_packages/modules/menus/list_view.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/list_view.lua
+- name: scripts/io_packages/modules/menus/pause_menu.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/pause_menu.lua
+- name: scripts/io_packages/modules/menus/text.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/text.lua
+- name: scripts/io_packages/modules/menus/windows.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/windows.lua
 - name: scripts/io_packages/modules/prize_popup.lua
   method: copy
   source:

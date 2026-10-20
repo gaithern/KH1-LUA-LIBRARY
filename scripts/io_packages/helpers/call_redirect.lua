@@ -103,6 +103,7 @@ local function redirect_call(call_site, expected_target, function_type, lua_func
 end
 
 return {
+    call_target = call_target,
     redirect_call = redirect_call,
     restore = restore,
 }

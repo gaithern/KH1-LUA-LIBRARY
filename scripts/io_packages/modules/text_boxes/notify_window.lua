@@ -26,6 +26,15 @@ local BOX_CLOSE_FRAMES  = 0x12
 local BOX_DONE_CALLBACK = 0x18
 local BOX_STATE         = 0x20
 local BOX_TEXT          = 0x88
+local BOX_TEXT_HANDLE   = 0xA8
+
+local TEXT_NODE_RESOURCE = 0x08
+local TEXT_NODE_NEXT     = 0x20
+local MAX_TEXT_NODES     = 0x200
+
+local HANDLE_BUCKET_MASK  = 0x7FFFFFFF
+local HANDLE_BUCKET_SHIFT = 25
+local HANDLE_OFFSET_MASK  = 0x1FFFFFF
 
 local TEMPLATE_SIZE              = 0xD0
 local TEMPLATE_CLOSE_SPEED_INDEX = 0xE
@@ -172,7 +181,41 @@ local function display(string_id)
     native.call_evdl_syscall(fnc_001_display_message, {NOTIFY_WINDOW, string_id})
 end
 
+local function resolve_handle(handle)
+    local bucket_index = (handle & HANDLE_BUCKET_MASK) >> HANDLE_BUCKET_SHIFT
+    local bucket = ReadLong(g_apResourceHandleBuckets + bucket_index * 8)
+    return bucket | (handle & HANDLE_OFFSET_MASK)
+end
+
+local function is_in_text_list(resource)
+    local node = ReadLong(g_pTextListHead)
+    for _ = 1, MAX_TEXT_NODES do
+        if node == 0 then
+            return false
+        end
+        if ReadLong(node + TEXT_NODE_RESOURCE, true) == resource then
+            return true
+        end
+        node = ReadLong(node + TEXT_NODE_NEXT, true)
+    end
+    return false
+end
+
+local function forget_freed_text(box)
+    local handle_address = get_screen_box_address(box) + BOX_TEXT_HANDLE
+    local handle = ReadInt(handle_address)
+    if handle == 0 or is_in_text_list(resolve_handle(handle)) then
+        return
+    end
+    ConsolePrint("kh1_lua_library: screen box " .. box .. " text was already freed, forgetting it before closing")
+    WriteInt(handle_address, 0)
+end
+
 local function close()
+    local box = find_screen_box()
+    if box ~= nil then
+        forget_freed_text(box)
+    end
     return native.call_evdl_syscall(fnc_002_close_window, {NOTIFY_WINDOW})
 end
 
