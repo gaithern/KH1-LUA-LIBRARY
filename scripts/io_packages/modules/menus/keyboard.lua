@@ -179,6 +179,10 @@ function keyboard.type_into(value, maximum_length)
     return value_after_backspace_repeat(value)
 end
 
+function keyboard.key_is_down(key)
+    return game_is_foreground() and key_is_down(key)
+end
+
 function keyboard.start_editing()
     editing = true
     for key = FIRST_KEY, LAST_KEY do

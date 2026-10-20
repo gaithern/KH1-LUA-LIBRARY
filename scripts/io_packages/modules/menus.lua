@@ -7,6 +7,7 @@ local keyboard = require("modules.menus.keyboard")
 local list_view = require("modules.menus.list_view")
 local item_menu = require("modules.menus.item_menu")
 local pause_menu = require("modules.menus.pause_menu")
+local title_menu = require("modules.menus.title_menu")
 
 local OWNER_SLOT_NAME = "menus_pause_menu_owner"
 local MAXIMUM_ROWS = 8
@@ -113,8 +114,17 @@ function menus.add_pause_menu_item(definition)
     if not pause_menu.install(definition.label, definition.help, item_menu.header_descriptor(), item_menu.opener_address()) then
         return false, "could not hook the pause menu"
     end
+    if definition.title_screen ~= nil then
+        title_menu.install(definition.title_screen.key)
+    end
     added = true
     return true, nil
+end
+
+function menus.frame()
+    if added then
+        game.run_safely("menus", title_menu.frame)
+    end
 end
 
 return menus

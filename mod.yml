@@ -90,6 +90,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/menus/text.lua
+- name: scripts/io_packages/modules/menus/title_menu.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/menus/title_menu.lua
 - name: scripts/io_packages/modules/menus/windows.lua
   method: copy
   source:

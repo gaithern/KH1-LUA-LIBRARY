@@ -19,6 +19,12 @@ cffi.cdef[[
     typedef void (*MenuPlaySound)(int sound);
     typedef int (*MenuHelpTextSize)(uint64_t object);
     typedef void (*MenuPadWriteButtons)(void* pad, uint32_t buttons);
+    typedef void (*MenuAction)(void);
+    typedef int (*MenuCount)(void);
+    typedef void (*MenuOneNumber)(int value);
+    typedef void (*MenuTwoNumbers)(int first, int second);
+    typedef uint64_t (*MenuAddJob)(int priority, uint64_t job_function);
+    typedef uint64_t (*MenuJob)(uint64_t job);
 ]]
 
 local game = {

@@ -208,6 +208,16 @@ local function opener(header_pointer)
     game.run_safely("menus.item_menu", open_under_header, game.to_integer(header_pointer), 0)
 end
 
+function item_menu.open_without_parent()
+    local header = windows.open_root(header_descriptor)
+    if header == 0 then
+        return false
+    end
+    return_row = 0
+    open_under_header(header, 0)
+    return true
+end
+
 function item_menu.header_descriptor()
     return header_descriptor
 end

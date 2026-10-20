@@ -9,6 +9,7 @@ local DESCRIPTOR_COLUMN_WIDTH = 0x20
 local DESCRIPTOR_ROW_COUNT = 0x26
 local DESCRIPTOR_VISIBLE_ROWS = 0x28
 local WINDOW_LAYER = 6
+local ROOT_WINDOW_LAYER = 0
 local WINDOW_CALLBACK = 0x08
 local WINDOW_FLAGS = 0x68
 local WINDOW_DESCRIPTOR = 0x80
@@ -46,6 +47,10 @@ end
 function windows.set_row_count(descriptor, count)
     WriteShort(descriptor + DESCRIPTOR_ROW_COUNT, count, true)
     WriteShort(descriptor + DESCRIPTOR_VISIBLE_ROWS, count, true)
+end
+
+function windows.open_root(descriptor)
+    return cffi.tonumber(game.create_window(descriptor, ROOT_WINDOW_LAYER))
 end
 
 function windows.open_child(parent, descriptor)
