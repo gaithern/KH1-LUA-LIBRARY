@@ -100,6 +100,14 @@ end
 -- ########### --
 -- # Getters # --
 -- ########### --
+local function get_btltbl_address()
+    return jumpHeights - 0xAC
+end
+
+local function is_btltbl_loaded()
+    return ReadByte(get_btltbl_address()) ~= 0x0
+end
+
 local function get_world()
     -- Get current world
     return ReadByte(world)
@@ -397,7 +405,55 @@ local function set_spell_cost(spell, value)
             WriteShort(memory_location, possible_magic_costs[value])
         end
     end
-end    
+end
+
+local function set_weapon_stats(character, weapon_number, stats)
+    local first_weapon_offset = nil
+        if character == "Sora"   then first_weapon_offset = 0x94F8
+    elseif character == "Donald" then first_weapon_offset = 0x9C88
+    elseif character == "Goofy"  then first_weapon_offset = 0xA208 end
+    if first_weapon_offset == nil then
+        return
+    end
+    local weapon_record_size = 0x58
+    local record_address = get_btltbl_address() + first_weapon_offset + weapon_record_size * (weapon_number - 1)
+    for stat, value in pairs(stats) do
+        local stat_offset = nil
+            if stat == "STR" then stat_offset = 0x30
+        elseif stat == "CRR" then stat_offset = 0x31
+        elseif stat == "CRB" then stat_offset = 0x32
+        elseif stat == "REC" then stat_offset = 0x33
+        elseif stat == "MP"  then stat_offset = 0x38 end
+        if stat_offset ~= nil then
+            WriteByte(record_address + stat_offset, value)
+        end
+    end
+end
+
+local function write_level_up_table(table_address, values)
+    for index, value in ipairs(values) do
+        WriteByte(table_address + index - 1, value)
+    end
+end
+
+local function set_party_level_up_table(party_member, stats, abilities)
+    local stats_offset = nil
+        if party_member == 1 then stats_offset = 0x3EB8
+    elseif party_member == 2 then stats_offset = 0x4050
+    elseif party_member == 3 then stats_offset = 0x41E8
+    elseif party_member == 4 then stats_offset = 0x4380
+    elseif party_member == 5 then stats_offset = 0x4518
+    elseif party_member == 6 then stats_offset = 0x46B0
+    elseif party_member == 7 then stats_offset = 0x4848
+    elseif party_member == 8 then stats_offset = 0x49E0 end
+    if stats_offset == nil then
+        return
+    end
+    local distance_from_stats_to_abilities = 0x68
+    local abilities_offset = stats_offset + distance_from_stats_to_abilities
+    write_level_up_table(get_btltbl_address() + stats_offset, stats)
+    write_level_up_table(get_btltbl_address() + abilities_offset, abilities)
+end
 
 local function set_attack_animation_data(index, animation_data)
     -- Overwrites attack animation data
@@ -720,6 +776,10 @@ return {
     set_sora_run_speed = set_sora_run_speed,
     set_spell_effectiveness = set_spell_effectiveness,
     set_spell_cost = set_spell_cost,
+    set_weapon_stats = set_weapon_stats,
+    set_party_level_up_table = set_party_level_up_table,
+    get_btltbl_address = get_btltbl_address,
+    is_btltbl_loaded = is_btltbl_loaded,
     set_attack_animation_data = set_attack_animation_data,
     set_command_data = set_command_data,
     set_gummi_qty_at_index = set_gummi_qty_at_index,

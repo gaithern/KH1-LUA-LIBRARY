@@ -105,6 +105,8 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `get_current_hits` | none | byte | Sora's current combo hit count. |
 | `get_sora_pos` | none | table `{X, Y, Z}` | Sora's current position. |
 | `get_gummi_qty_at_index` | `index` | byte | Gummi item quantity at inventory index (1-based). |
+| `get_btltbl_address` | none | address | Where `btltbl.bin` is loaded in memory. |
+| `is_btltbl_loaded` | none | boolean | Whether `btltbl.bin` has been loaded yet. Check this before calling the btltbl setters. |
 
 ### Setters
 | Function | Arguments | Returns | Description |
@@ -117,6 +119,8 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `set_sora_run_speed` | `run_speed` | none | Sets Sora's run speed. |
 | `set_spell_effectiveness` | `spell, value` | none | Sets a spell's effectiveness by name. |
 | `set_spell_cost` | `spell, value` | none | Sets a spell's cost. Valid values: 15 = 1/2 CP, 30 = 1 CP, 100/200/300 = 1/2/3 MP. |
+| `set_weapon_stats` | `character, weapon_number, stats` | none | Sets a weapon's stats in `btltbl.bin`. `character` is `"Sora"`, `"Donald"`, or `"Goofy"`; `weapon_number` is the weapon's position in that character's list (1-based, game order). `stats` is a table with any of `STR`, `CRR` (crit rate), `CRB` (crit bonus), `REC` (recoil), `MP`. |
+| `set_party_level_up_table` | `party_member, stats, abilities` | none | Overwrites a party member's level-up tables in `btltbl.bin` (1 Donald, 2 Goofy, 3-8 world party members). `stats` and `abilities` are arrays of reward codes, the first entry being LV 2: 1 HP, 2 MP, 3 AP, 4 STR, 5 DEF, 6 item slot, 7 accessory slot, `0x80 + id` an ability. |
 | `set_attack_animation_data` | `index, animation_data` | none | Overwrites an attack animation data entry (byte array). |
 | `set_command_data` | `index, command_data` | none | Overwrites a command menu data entry (byte array). |
 | `set_gummi_qty_at_index` | `index, qty` | none | Sets gummi item quantity at inventory index (capped at 99). |
