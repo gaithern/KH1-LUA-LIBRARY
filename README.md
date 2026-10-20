@@ -129,6 +129,7 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `calculate_air_combo_limit` | none | integer | What Sora's air combo limit should be, based on equipped Air Combo Plus abilities. |
 | `enable_ability` | `ability` | none | Force-enables an ability by name (e.g. `"Dodge Roll"`, `"Guard"`) even if unowned/unequipped. |
 | `give_sora_ability` | `ability_value` | none | Grants Sora an ability by ID (unequipped). |
+| `give_party_member_ability` | `party_member`, `ability_value` | none | Grants a party member (1 Donald, 2 Goofy, 3+ world party members) an ability by ID (unequipped). |
 | `give_shared_ability` | `shared_ability_value` | none | Grants the party a shared ability by ID (unequipped). |
 | `force_scan` | `on` | none | ASM patch that forces Scan on/off. Credits to KSX. |
 | `force_combo_master` | `on` | none | ASM patch that forces Combo Master on/off. Credits to KSX. |

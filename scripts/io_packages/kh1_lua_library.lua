@@ -606,6 +606,28 @@ local function grant_sora_ability(ability_value)
     end
 end
 
+local function get_party_member_ability_list(party_member)
+    local party_member_record_size = 0x74
+    return soraCurAbilities + party_member * party_member_record_size
+end
+
+local function get_party_member_ability_count(party_member)
+    local ability_list = get_party_member_ability_list(party_member)
+    local count = 0
+    while count < 48 and ReadByte(ability_list + count) ~= 0 do
+        count = count + 1
+    end
+    return count
+end
+
+local function grant_party_member_ability(party_member, ability_value)
+    local ability_list = get_party_member_ability_list(party_member)
+    local count = get_party_member_ability_count(party_member)
+    if count < 48 then
+        WriteByte(ability_list + count, ability_value + 128)
+    end
+end
+
 local function spawn_prize(item_id)
     --Uses the in game function to spawn a map prize
     local pos = get_sora_pos()
@@ -718,6 +740,7 @@ return {
     is_in_gummi = is_in_gummi,
     give_shared_ability = grant_shared_ability,
     give_sora_ability = grant_sora_ability,
+    give_party_member_ability = grant_party_member_ability,
     spawn_prize = spawn_prize,
     spawn_enemy = kh1_spawn_enemy.spawn_enemy,
     show_custom_item_popup = kh1_prize_popup.show_custom_item_popup,
