@@ -21,9 +21,15 @@ local PRIZE_STATE_OFFSET = 0x00
 local PRIZE_ENTITY_OFFSET = 0x08
 local PRIZE_SERIAL_OFFSET = 0x38
 local PRIZE_STATE_PICKED_UP = 2
+local TAGS_KEY = "kh1_one_time_drops_tags_v1"
+local TAG_SIZE = 0x18
+local TAG_FLAG_ADDRESS_OFFSET = 0x00
+local TAG_FLAG_BIT_OFFSET = 0x08
+local TAG_SERIAL_OFFSET = 0x0C
+local TAG_ACTIVE_OFFSET = 0x10
 
 local locations = {}
-local tags = {}
+local tags_block = nil
 local pending_location = nil
 local installed = false
 local original_spawn_enemy_drops = nil
@@ -55,28 +61,59 @@ local function find_location(drop_table)
     return nil
 end
 
-local function flag_mask(location)
-    return 1 << (location.flag_bit - 1)
+local function open_tags()
+    if tags_block == nil then
+        local block = native.persistent_block(TAGS_KEY, TAG_SIZE * PRIZE_SLOT_COUNT)
+        if block ~= 0 then
+            tags_block = block
+        end
+    end
+    return tags_block ~= nil
+end
+
+local function tag_address(slot_index)
+    return tags_block + slot_index * TAG_SIZE
+end
+
+local function tag_is_active(slot_index)
+    return ReadInt(tag_address(slot_index) + TAG_ACTIVE_OFFSET, true) == 1
+end
+
+local function clear_tag(slot_index)
+    WriteInt(tag_address(slot_index) + TAG_ACTIVE_OFFSET, 0, true)
+end
+
+local function write_tag(slot_index, location, serial)
+    local address = tag_address(slot_index)
+    WriteLong(address + TAG_FLAG_ADDRESS_OFFSET, location.flag_address, true)
+    WriteInt(address + TAG_FLAG_BIT_OFFSET, location.flag_bit, true)
+    WriteInt(address + TAG_SERIAL_OFFSET, serial, true)
+    WriteInt(address + TAG_ACTIVE_OFFSET, 1, true)
+end
+
+local function flag_mask(flag_bit)
+    return 1 << (flag_bit - 1)
 end
 
 local function is_collected(location)
     local flags = ReadByte(location.flag_address)
-    return (flags & flag_mask(location)) ~= 0
+    return (flags & flag_mask(location.flag_bit)) ~= 0
 end
 
-local function mark_collected(location)
-    local flags = ReadByte(location.flag_address)
-    WriteByte(location.flag_address, flags | flag_mask(location))
-end
-
-local function same_location(first, second)
-    return first.flag_address == second.flag_address and first.flag_bit == second.flag_bit
+local function mark_collected(flag_address, flag_bit)
+    local flags = ReadByte(flag_address)
+    WriteByte(flag_address, flags | flag_mask(flag_bit))
 end
 
 local function is_on_ground(location)
-    for _, tag in pairs(tags) do
-        if same_location(tag.location, location) then
-            return true
+    for slot_index = 0, PRIZE_SLOT_COUNT - 1 do
+        if tag_is_active(slot_index) then
+            local address = tag_address(slot_index)
+            local flag_address = ReadLong(address + TAG_FLAG_ADDRESS_OFFSET, true)
+            local flag_bit = ReadInt(address + TAG_FLAG_BIT_OFFSET, true)
+            if flag_address == location.flag_address and flag_bit == location.flag_bit then
+                return true
+            end
         end
     end
     return false
@@ -87,18 +124,24 @@ local function prize_slot_address(slot_index)
 end
 
 local function check_pickups()
-    for slot_index, tag in pairs(tags) do
-        local slot_address = prize_slot_address(slot_index)
-        local serial = ReadInt(slot_address + PRIZE_SERIAL_OFFSET)
-        local state = ReadInt(slot_address + PRIZE_STATE_OFFSET)
-        local entity = ReadLong(slot_address + PRIZE_ENTITY_OFFSET)
-        if serial ~= tag.serial then
-            tags[slot_index] = nil
-        elseif state == PRIZE_STATE_PICKED_UP then
-            mark_collected(tag.location)
-            tags[slot_index] = nil
-        elseif entity == 0 then
-            tags[slot_index] = nil
+    if not open_tags() then
+        return
+    end
+    for slot_index = 0, PRIZE_SLOT_COUNT - 1 do
+        if tag_is_active(slot_index) then
+            local address = tag_address(slot_index)
+            local slot_address = prize_slot_address(slot_index)
+            local serial = ReadInt(slot_address + PRIZE_SERIAL_OFFSET)
+            local state = ReadInt(slot_address + PRIZE_STATE_OFFSET)
+            local entity = ReadLong(slot_address + PRIZE_ENTITY_OFFSET)
+            if serial ~= ReadInt(address + TAG_SERIAL_OFFSET, true) then
+                clear_tag(slot_index)
+            elseif state == PRIZE_STATE_PICKED_UP then
+                mark_collected(ReadLong(address + TAG_FLAG_ADDRESS_OFFSET, true), ReadInt(address + TAG_FLAG_BIT_OFFSET, true))
+                clear_tag(slot_index)
+            elseif entity == 0 then
+                clear_tag(slot_index)
+            end
         end
     end
 end
@@ -110,7 +153,7 @@ local function tag_new_prize(location)
         local serial = ReadInt(slot_address + PRIZE_SERIAL_OFFSET)
         local entity = ReadLong(slot_address + PRIZE_ENTITY_OFFSET)
         if serial == new_serial and entity ~= 0 then
-            tags[slot_index] = { location = location, serial = new_serial }
+            write_tag(slot_index, location, new_serial)
             return
         end
     end
@@ -199,6 +242,9 @@ local function install()
     if not addresses_known() then
         return false
     end
+    if not open_tags() then
+        return false
+    end
     original_spawn_enemy_drops = cffi.cast("OneTimeDropsSpawnEnemyDrops", BASE_ADDR + fnc_spawn_enemy_drops)
     original_spawn_prize = cffi.cast("OneTimeDropsSpawnPrize", BASE_ADDR + fnc_spawn_prize)
     local redirected_sites = {}
@@ -230,7 +276,7 @@ local function set_one_time_drops(new_locations)
 end
 
 local function update_one_time_drops()
-    if not installed then
+    if g_prize_pool == nil then
         return
     end
     check_pickups()
