@@ -118,12 +118,6 @@ local function get_room()
     return ReadByte(room)
 end
 
-local function get_equipped_keyblade_number()
-    local equipped_weapon_item_id = ReadByte(soraStats)
-    local kingdom_key_item_id = 0x51
-    return equipped_weapon_item_id - kingdom_key_item_id + 1
-end
-
 local function get_gummi_select()
     -- Get current gummi selection
     return ReadByte(gummiSelect)
@@ -433,23 +427,6 @@ local function set_weapon_stats(character, weapon_number, stats)
         if stat_offset ~= nil then
             WriteByte(record_address + stat_offset, value)
         end
-    end
-end
-
-local function get_sora_weapon_hit_type()
-    local first_hit_parameter_offset = 0x4B78
-    local hit_type_offset = 0x04
-    return ReadByte(get_btltbl_address() + first_hit_parameter_offset + hit_type_offset)
-end
-
-local function set_sora_weapon_hit_type(hit_type)
-    local sora_physical_hit_parameter_offsets = {
-        0x4B78, 0x4BE8, 0x4C58, 0x4CC8, 0x4D38, 0x4DA8, 0x4E18, 0x4E88, 0x5048,
-        0x50B8, 0x5128, 0x52E8, 0x55F8, 0x5668, 0x5A58, 0x5AC8, 0x5B38, 0x5BA8,
-    }
-    local hit_type_offset = 0x04
-    for _, hit_parameter_offset in ipairs(sora_physical_hit_parameter_offsets) do
-        WriteByte(get_btltbl_address() + hit_parameter_offset + hit_type_offset, hit_type)
     end
 end
 
@@ -800,9 +777,6 @@ return {
     set_spell_effectiveness = set_spell_effectiveness,
     set_spell_cost = set_spell_cost,
     set_weapon_stats = set_weapon_stats,
-    get_sora_weapon_hit_type = get_sora_weapon_hit_type,
-    set_sora_weapon_hit_type = set_sora_weapon_hit_type,
-    get_equipped_keyblade_number = get_equipped_keyblade_number,
     set_party_level_up_table = set_party_level_up_table,
     get_btltbl_address = get_btltbl_address,
     is_btltbl_loaded = is_btltbl_loaded,
