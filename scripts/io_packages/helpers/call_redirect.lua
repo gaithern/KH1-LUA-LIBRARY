@@ -1,12 +1,13 @@
 ---@diagnostic disable: undefined-global
 
--- Points one `call` instruction in the game at a Lua function instead of its usual target.
+-- Points one `call` instruction, or one tail-call `jmp`, in the game at a Lua function instead of its usual target.
 -- The called function is left untouched, so the Lua function can still call the original.
 
 local cffi = require("cffi")
 local native = require("helpers.native")
 
 local CALL_OPCODE = 0xE8
+local JUMP_OPCODE = 0xE9
 local CALL_LENGTH = 5
 local JUMP_STUB_LENGTH = 14
 local JUMP_STUB_DESTINATION = 6
@@ -79,7 +80,8 @@ local function redirect_call(call_site, expected_target, function_type, lua_func
     if redirects[call_site] ~= nil then
         return true
     end
-    if ReadByte(call_site) ~= CALL_OPCODE then
+    local opcode = ReadByte(call_site)
+    if opcode ~= CALL_OPCODE and opcode ~= JUMP_OPCODE then
         return false
     end
     local stub_address = stub_for(call_site)

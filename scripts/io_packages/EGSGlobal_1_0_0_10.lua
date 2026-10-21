@@ -305,6 +305,12 @@ battleModeCheck = 0x1AB266
 UK_Word = 0x2E1B660
 
 fnc_spawn_prize = 0x2BDD50
+fnc_spawn_prize_call_enemy_drops = 0x2A9CDF
+fnc_spawn_enemy_drops = 0x2A9AB0
+fnc_spawn_enemy_drops_jump_bd_7a = 0x2BA4CD
+fnc_spawn_enemy_drops_jump_bd_d7 = 0x2BA535
+g_prize_pool = 0x2DE9820
+g_prize_serial = 0x2DE9810
 fnc_update_widget_queue = 0x2A9750
 fnc_spawn_world_gimmick_entity = 0x28EBD0
 placementTablePtr = 0x296C030
