@@ -119,7 +119,7 @@ local function get_room()
 end
 
 local function get_equipped_keyblade_number()
-    local equipped_weapon_item_id = ReadByte(soraStats + 0x19)
+    local equipped_weapon_item_id = ReadByte(soraStats)
     local kingdom_key_item_id = 0x51
     return equipped_weapon_item_id - kingdom_key_item_id + 1
 end
