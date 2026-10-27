@@ -59,7 +59,8 @@ Everything that runs game code is Lua, using [cffi-lua](https://github.com/q66/c
 - **Letting the game call Lua**: `cffi.cast("<function type>", lua_function)` makes a native function pointer that
   runs the Lua function. It can be written into a function-pointer table (`modules/show_skipped_rewards.lua` swaps
   two `g_EVSyscallTable` entries this way), passed to the game as a callback (`spawn_enemy`'s file-load callback),
-  or targeted by a redirected `call` (`helpers/call_redirect.lua`, used by `prize_popup` and `spawn_enemy`).
+  or targeted by a redirected `call` or tail-call `jmp` (`helpers/call_redirect.lua`, used by `prize_popup`,
+  `spawn_enemy` and `one_time_drops`).
   Event scripts and LuaBackend's `_OnFrame` run on the same thread, so these callbacks never run at the same time as other Lua.
 - **Memory that outlives a script**: `persistent_block(key, size)` returns the same zeroed block to every script and
   after every F1 reload, for the life of the game process. The 8-byte slot holding its address is a named file
@@ -156,6 +157,8 @@ All functions below are available on the table returned by `require("kh1_lua_lib
 | `update_prize_popup` | none | none | Clears the custom popup text once the popup closes. The library's driver script already calls this every frame. |
 | `set_show_skipped_rewards` | `turn_on` | boolean | Ends a cutscene skip right before a gift popup opens, so the reward is shown. |
 | `set_skip_summon_animations` | `turn_on` | boolean | Shortens the summon opener (camera swing, fades and the first three step durations). The entrance itself needs edited `xs_*.dat` event scripts, which the calling mod ships. Returns false if the call sites don't look as expected. |
+| `set_one_time_drops` | `locations` | boolean | Makes enemy drop tables into one-time drops. Each location is `{tables = {{bd_name = "ex_2440.bd", offset = 0x4F8}, ...}, flag_address, flag_bit, item}`: while the save bit `flag_bit` (1-8) at game-relative `flag_address` is clear and no copy is on the ground, a kill that rolls any listed table drops `item` guaranteed (written into an empty item slot of the table for that roll only). Picking it up sets the bit. Calling it again replaces the list. Returns false if the hooks can't be installed. |
+| `update_one_time_drops` | none | none | Sets a location's flag bit once its drop is picked up. The library's `kh1_one_time_drops_driver.lua` script already calls this every frame. |
 | `queue_text_box` | `{text, duration, sound, style, x, y, width, height, tail, auto_width}` | boolean | Queues a notification text box on the shared notification window. Only `text` is required. |
 | `close_text_box` | none | boolean | Closes the notification window. |
 | `update_text_boxes` | none | none | Feeds held messages, plays their sounds and repairs the window after an event script load. The library's driver script already calls this every frame; outside consumers shouldn't need to use this. |

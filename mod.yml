@@ -98,6 +98,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/menus/windows.lua
+- name: scripts/io_packages/modules/one_time_drops.lua
+  method: copy
+  source:
+  - name: scripts/io_packages/modules/one_time_drops.lua
 - name: scripts/io_packages/modules/prize_popup.lua
   method: copy
   source:
@@ -126,6 +130,10 @@ assets:
   method: copy
   source:
   - name: scripts/io_packages/modules/text_boxes/notify_window.lua
+- name: scripts/kh1_one_time_drops_driver.lua
+  method: copy
+  source:
+  - name: scripts/kh1_one_time_drops_driver.lua
 - name: scripts/kh1_text_box_driver.lua
   method: copy
   source:
