@@ -470,3 +470,6 @@ g_dwPauseReasonLocked = 0x232DFA8
 g_dwPauseDisabled = 0x232DFBC
 g_dwPauseBlocked = 0x2340744
 fnc_set_objects_paused = 0x1E0C70
+g_dwWorldFadeAlpha = 0x233E804
+g_dwWorldFadeWhite = 0x233E7F0
+fnc_draw_3d_fade = 0x1842A0

@@ -17,6 +17,7 @@ local TITLE_IDLE_STATE = 0x18
 local TITLE_IDLE_TIMER_START = 0x9C9
 local CLEAR_COLOR_COMPONENTS = 4
 local BLACK_CLEAR_COLOR = { 0, 0, 0, 0x80 }
+local FULL_FADE_ALPHA = 0xFF
 local PAD_PRESSED = 0x08
 local PAD_TRIANGLE = 0x1000
 local JOB_PRIORITY = 0x2BFE7
@@ -105,6 +106,16 @@ local function show_title_screen()
     WriteInt(g_nTitleState, TITLE_MENU_STATE)
 end
 
+local function draw_black_background()
+    local saved_alpha = ReadInt(g_dwWorldFadeAlpha)
+    local saved_white = ReadInt(g_dwWorldFadeWhite)
+    WriteInt(g_dwWorldFadeAlpha, FULL_FADE_ALPHA)
+    WriteInt(g_dwWorldFadeWhite, 0)
+    functions.draw_3d_fade()
+    WriteInt(g_dwWorldFadeAlpha, saved_alpha)
+    WriteInt(g_dwWorldFadeWhite, saved_white)
+end
+
 local function finish()
     functions.set_active(0)
     if opened_on_title then
@@ -116,6 +127,9 @@ end
 local function run_job()
     if cffi.tonumber(functions.open_window_count()) ~= 0 then
         functions.pad_replay()
+        if not opened_on_title then
+            draw_black_background()
+        end
         functions.update_windows()
         functions.cursor_draw()
         return JOB_KEEP_RUNNING
@@ -226,6 +240,7 @@ function title_menu.install(key)
     functions.cursor_draw = cast("MenuAction", fnc_menu_cursor_draw)
     if fnc_set_objects_paused ~= nil then
         functions.set_objects_paused = cast("MenuOneNumber", fnc_set_objects_paused)
+        functions.draw_3d_fade = cast("MenuAction", fnc_draw_3d_fade)
     end
     job_callback = cffi.cast("MenuJob", job)
     release_job_when_lua_closes = setmetatable({}, { __gc = release_job })
