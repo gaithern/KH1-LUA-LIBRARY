@@ -25,6 +25,7 @@ menuFunction = 0x2E204F8
 menuItemSlotCount = 0x2E92DF2
 menuMaxButtonCount = 0x2E92DF0
 minitimer = 0x232E000
+minigameTimerState = 0x232E014
 reports = 0x2DEAD20
 room = 0x233FE8C
 saveOpenAddress = 0x232DFA4
