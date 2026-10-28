@@ -7,6 +7,11 @@ local keyboard = require("modules.menus.keyboard")
 local item_menu = require("modules.menus.item_menu")
 
 local APP_MODE_TITLE = 3
+local APP_MODE_FIELD = 5
+local PAUSE_REASON_MENU = 0
+local PAUSE_REASON_BATTLE = 2
+local PAUSE_REASON_NO_MENU = 6
+local PAUSE_STATE_STARTING = 1
 local TITLE_MENU_STATE = 0x1B
 local TITLE_IDLE_STATE = 0x18
 local TITLE_IDLE_TIMER_START = 0x9C9
@@ -31,6 +36,7 @@ local key_was_down = false
 local job_callback = nil
 local job_slot = 0
 local menu_open = false
+local opened_on_title = false
 local release_job_when_lua_closes = nil
 local saved_clear_color = {}
 local functions = {}
@@ -41,6 +47,27 @@ end
 
 local function on_title_menu()
     return ReadInt(g_nAppMode) == APP_MODE_TITLE and ReadInt(g_nTitleState) == TITLE_MENU_STATE
+end
+
+local function can_pause_in_field()
+    if functions.set_objects_paused == nil or ReadInt(g_nAppMode) ~= APP_MODE_FIELD then
+        return false
+    end
+    if ReadInt(g_nPauseState) ~= 0 or ReadInt(g_dwPauseReasonLocked) ~= 0 or ReadInt(g_nMenuActive) ~= 0 then
+        return false
+    end
+    if ReadInt(g_dwPauseDisabled) ~= 0 or ReadInt(g_dwPauseBlocked) ~= 0 then
+        return false
+    end
+    local reason = ReadInt(g_nPauseReason)
+    return reason == PAUSE_REASON_MENU or reason == PAUSE_REASON_BATTLE
+end
+
+local function pause_field()
+    WriteInt(g_nPauseReason, PAUSE_REASON_NO_MENU)
+    WriteInt(g_dwPauseReasonLocked, 1)
+    functions.set_objects_paused(1)
+    WriteInt(g_nPauseState, PAUSE_STATE_STARTING)
 end
 
 local function open_key_pressed()
@@ -80,7 +107,9 @@ end
 
 local function finish()
     functions.set_active(0)
-    show_title_screen()
+    if opened_on_title then
+        show_title_screen()
+    end
     menu_open = false
 end
 
@@ -133,10 +162,12 @@ local function release_job()
         WriteLong(job_slot + JOB_FUNCTION, stub, true)
     end
     WriteInt(g_nMenuActive, 0)
-    show_title_screen()
+    if opened_on_title then
+        show_title_screen()
+    end
 end
 
-local function open()
+local function open(on_title)
     functions.reset_windows()
     functions.set_active(1)
     functions.cursor_init_colors()
@@ -153,7 +184,12 @@ local function open()
         WriteShort(job_slot + JOB_PARAMETER, JOB_NO_PARAMETER, true)
     end
     menu_open = true
-    hide_title_screen()
+    opened_on_title = on_title
+    if on_title then
+        hide_title_screen()
+    else
+        pause_field()
+    end
     game.play_sound(game.SOUND_CONFIRM)
 end
 
@@ -162,11 +198,12 @@ function title_menu.frame()
         return
     end
     local key_pressed = open_key_pressed()
-    if not on_title_menu() then
-        return
-    end
-    if key_pressed or triangle_pressed() then
-        open()
+    if on_title_menu() then
+        if key_pressed or triangle_pressed() then
+            open(true)
+        end
+    elseif key_pressed and can_pause_in_field() then
+        open(false)
     end
 end
 
@@ -187,6 +224,9 @@ function title_menu.install(key)
     functions.cursor_fade_in = cast("MenuOneNumber", fnc_menu_cursor_fade_in)
     functions.cursor_hide = cast("MenuAction", fnc_menu_cursor_hide)
     functions.cursor_draw = cast("MenuAction", fnc_menu_cursor_draw)
+    if fnc_set_objects_paused ~= nil then
+        functions.set_objects_paused = cast("MenuOneNumber", fnc_set_objects_paused)
+    end
     job_callback = cffi.cast("MenuJob", job)
     release_job_when_lua_closes = setmetatable({}, { __gc = release_job })
     return true
