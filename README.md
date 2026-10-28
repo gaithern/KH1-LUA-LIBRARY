@@ -1,7 +1,7 @@
 # KH1 Lua Library
 
 A shared Lua library of helper functions for reading, writing, and manipulating
-Kingdom Hearts 1 Final Mix (PC) memory, for use in [randomizer](https://github.com/tommadness/KH1Randomizer)
+Kingdom Hearts 1 Final Mix (PC) memory, for use in [randomizer](https://github.com/gaithern/KH1-RANDOMIZER)
 and other [LuaBackend](https://github.com/Sirius902/LuaBackend) mods. Supports both the
 Steam and EGS builds.
 
