@@ -156,12 +156,10 @@ local function persistent_block(key, size)
 end
 
 local function find_log_path()
-    local source = debug.getinfo(1, "S").source
-    local helpers_folder = string.match(source, "^@(.*)[/\\]helpers[/\\]native%.lua$")
-    if helpers_folder == nil then
+    if type(SCRIPT_PATH) ~= "string" then
         return LOG_FILE_NAME
     end
-    return helpers_folder .. "/" .. LOG_FILE_NAME
+    return SCRIPT_PATH .. "/io_packages/" .. LOG_FILE_NAME
 end
 
 local function log_debug(message)
