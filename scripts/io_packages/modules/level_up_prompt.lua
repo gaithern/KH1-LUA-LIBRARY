@@ -3,7 +3,7 @@
 -- Level-up prompt feature: shows custom text in the game's level-up box, using its own box queue
 -- so more than one can be on screen at once. Credits to Topaz for the original technique.
 
-local kh1_native = require("kh1_native")
+local native = require("helpers.native")
 local khscii = require("helpers.khscii")
 
 local GetKHSCII = khscii.GetKHSCII
@@ -60,7 +60,7 @@ local function show_prompt(input_title, input_party, duration, colour)
                     line2_ptr = BASE_ADDR + _textAddress + 0x20
                 end
 
-                local ok = kh1_native.call_function(fnc_enqueue_levelup_prompt, actor_ptr, line1_ptr, line2_ptr)
+                local ok = native.call_function(fnc_enqueue_levelup_prompt, actor_ptr, line1_ptr, line2_ptr)
                 if not ok then
                     allOk = false
                 else
