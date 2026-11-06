@@ -251,6 +251,7 @@ continue = 0x2E00960
 cutSceneAspect = 0x4DE242
 deathCheck = 0x299F20
 saveAnywhere = 0x2355254
+settingsMenuAllowed = 0x21AB9F8
 title = 0x2340E38
 titlescreenamvtimer = 0x2EE9954
 titlescreenpicture = 0x2EE9968
