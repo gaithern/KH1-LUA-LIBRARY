@@ -3,9 +3,7 @@
 local cffi = require("cffi")
 local native = require("helpers.native")
 local call_redirect = require("helpers.call_redirect")
-local kh1_creature_data = require("modules.creature_data")
-
-local function log(msg) native.log_debug("[spawn_enemy] " .. msg) end
+local creature_data = require("modules.creature_data")
 
 cffi.cdef[[
     typedef uint64_t (*SpawnEnemyReverseBlob)(uint64_t blob, uint64_t second, uint64_t third, uint64_t fourth);
@@ -13,564 +11,742 @@ cffi.cdef[[
     uint32_t GetCurrentThreadId(void);
 ]]
 
+local function log(message)
+    native.log_debug("[spawn_enemy] " .. message)
+end
+
+local function round_up(value, multiple)
+    return ((value + multiple - 1) // multiple) * multiple
+end
+
 -- ############################################################ --
--- # Species-table redirect: persistent control block           # --
+-- # Buffer registry: which of our buffers holds which motion   # --
 -- ############################################################ --
 
--- Both calls to fnc_reverse_blob_to_slot_ptr are redirected to reverse_blob below, and the game
--- calls load_complete when a queued file finishes. The block keeps rows alive across F1 reloads.
-local CTRL_KEY  = "kh1_species_redirect_v3"
-local CTRL_SIZE = 0x4000
+local REGISTRY_KEY = "kh1_species_redirect_v3"
+local REGISTRY_SIZE = 0x4000
+local REGISTRY_ROW_COUNT_OFFSET = 0x28
+local REGISTRY_FIRST_ROW_OFFSET = 0x100
+local ROW_SIZE = 0x40
+local ROW_BUFFER_START_OFFSET = 0x00
+local ROW_BUFFER_END_OFFSET = 0x08
+local ROW_MOTION_OFFSET = 0x10
+local ROW_IN_USE_OFFSET = 0x18
+local MAX_ROWS = (REGISTRY_SIZE - REGISTRY_FIRST_ROW_OFFSET) // ROW_SIZE
 
-local OFF_COMP      = 0x10   -- address of the file-load completion callback
-local OFF_REG_COUNT = 0x28
-local OFF_DONE_FLAG = 0x30   -- completion callback sets this to 1
-local OFF_DONE_SIZE = 0x34   -- loaded size (ECX)
-local OFF_DONE_DEST = 0x38   -- loaded dest (R8)
+local registry = nil
 
-local ROWS_BASE  = 0x100
-local ROW_STRIDE = 0x40
-local ROW_BUFBASE = 0x00
-local ROW_BUFEND  = 0x08
-local ROW_MOTION  = 0x10   -- motion blob pointer (returned by the reverse-blob hook)
-local ROW_ACTIVE  = 0x18
-local ROW_TAG     = 0x1C
-local MAX_ROWS = (CTRL_SIZE - ROWS_BASE) // ROW_STRIDE
+local function row_address(row)
+    return registry + REGISTRY_FIRST_ROW_OFFSET + row * ROW_SIZE
+end
 
-local ctrl = nil
-
-local function ci(off) return ReadInt(ctrl + off, true) end
-local function wi(off, v) WriteInt(ctrl + off, v, true) end
-local function row_addr(i) return ctrl + ROWS_BASE + i * ROW_STRIDE end
-
-local function rd_claim(buf_base, buf_end, tag)
-    local count = ci(OFF_REG_COUNT)
-    local free = nil
-    for i = 0, count - 1 do
-        if ReadInt(row_addr(i) + ROW_ACTIVE, true) == 0 then free = i break end
+local function row_count()
+    local count = ReadInt(registry + REGISTRY_ROW_COUNT_OFFSET, true)
+    if count > MAX_ROWS then
+        count = MAX_ROWS
     end
-    if not free then
-        if count >= MAX_ROWS then return nil end
-        free = count
-        wi(OFF_REG_COUNT, count + 1)
-    end
-    local r = row_addr(free)
-    WriteLong(r + ROW_BUFBASE, buf_base, true)
-    WriteLong(r + ROW_BUFEND, buf_end, true)
-    WriteLong(r + ROW_MOTION, 0, true)
-    WriteInt(r + ROW_TAG, tag or 0, true)
-    WriteInt(r + ROW_ACTIVE, 1, true)
-    return free
+    return count
 end
 
-local function rd_release(row)
-    if row then WriteInt(row_addr(row) + ROW_ACTIVE, 0, true) end
+local function row_in_use(row)
+    return ReadInt(row_address(row) + ROW_IN_USE_OFFSET, true) ~= 0
 end
 
-local function rd_set_motion(row, ptr)
-    if row then WriteLong(row_addr(row) + ROW_MOTION, ptr, true) end
+local function row_buffer_start(row)
+    return ReadLong(row_address(row) + ROW_BUFFER_START_OFFSET, true)
 end
 
-local function rd_active_rows()
-    local out = {}
-    local count = ci(OFF_REG_COUNT)
-    for i = 0, count - 1 do
-        local r = row_addr(i)
-        if ReadInt(r + ROW_ACTIVE, true) == 1 then
-            out[#out + 1] = {
-                row = i,
-                buf_base = ReadLong(r + ROW_BUFBASE, true),
-                buf_end = ReadLong(r + ROW_BUFEND, true),
-                motion = ReadLong(r + ROW_MOTION, true),
-                tag = ReadInt(r + ROW_TAG, true),
-            }
+local function row_buffer_end(row)
+    return ReadLong(row_address(row) + ROW_BUFFER_END_OFFSET, true)
+end
+
+local function row_motion(row)
+    return ReadLong(row_address(row) + ROW_MOTION_OFFSET, true)
+end
+
+local function set_row_motion(row, motion_address)
+    WriteLong(row_address(row) + ROW_MOTION_OFFSET, motion_address, true)
+end
+
+local function claim_row(buffer_start, buffer_end)
+    local count = row_count()
+    local free_row = nil
+    for row = 0, count - 1 do
+        if not row_in_use(row) then
+            free_row = row
+            break
         end
     end
-    return out
+    if free_row == nil then
+        if count >= MAX_ROWS then
+            return nil
+        end
+        free_row = count
+        WriteInt(registry + REGISTRY_ROW_COUNT_OFFSET, count + 1, true)
+    end
+    local address = row_address(free_row)
+    WriteLong(address + ROW_BUFFER_START_OFFSET, buffer_start, true)
+    WriteLong(address + ROW_BUFFER_END_OFFSET, buffer_end, true)
+    WriteLong(address + ROW_MOTION_OFFSET, 0, true)
+    WriteInt(address + ROW_IN_USE_OFFSET, 1, true)
+    return free_row
 end
 
-local function rd_completion_addr() return ReadLong(ctrl + OFF_COMP, true) end
-local function rd_clear_done() wi(OFF_DONE_FLAG, 0) end
-local function rd_poll_done()
-    if ci(OFF_DONE_FLAG) == 0 then return nil end
-    return ReadLong(ctrl + OFF_DONE_DEST, true), ReadInt(ctrl + OFF_DONE_SIZE, true) & 0xFFFFFFFF
+local function release_row(row)
+    if row ~= nil then
+        WriteInt(row_address(row) + ROW_IN_USE_OFFSET, 0, true)
+    end
 end
+
+local function rows_in_use()
+    local rows = {}
+    for row = 0, row_count() - 1 do
+        if row_in_use(row) then
+            table.insert(rows, row)
+        end
+    end
+    return rows
+end
+
+local function row_containing(address)
+    for row = 0, row_count() - 1 do
+        if row_in_use(row) then
+            if address >= row_buffer_start(row) and address < row_buffer_end(row) then
+                return row
+            end
+        end
+    end
+    return nil
+end
+
+-- ############################################################ --
+-- # Game hooks: motion lookup and file-load finished           # --
+-- ############################################################ --
 
 local original_reverse_blob = nil
 local load_complete_callback = nil
-local queue_thread_id = 0
-local reported_wrong_thread = false
+local load_complete_address = 0
+local finished_loads = {}
+local load_thread_id = 0
+local warned_about_thread = false
+local installed = false
 
 local function reverse_blob(blob, second, third, fourth)
-    local blob_address = cffi.tonumber(blob)
-    local count = ci(OFF_REG_COUNT)
-    if count > MAX_ROWS then count = MAX_ROWS end
-    for i = 0, count - 1 do
-        local r = row_addr(i)
-        if ReadInt(r + ROW_ACTIVE, true) ~= 0 then
-            local buf_base = ReadLong(r + ROW_BUFBASE, true)
-            local buf_end = ReadLong(r + ROW_BUFEND, true)
-            if blob_address >= buf_base and blob_address < buf_end then
-                return ReadLong(r + ROW_MOTION, true)
-            end
-        end
+    local row = row_containing(cffi.tonumber(blob))
+    if row ~= nil then
+        return row_motion(row)
     end
     return original_reverse_blob(blob, second, third, fourth)
 end
 
-local function load_complete(size, unused, destination)
-    WriteLong(ctrl + OFF_DONE_DEST, cffi.tonumber(destination), true)
-    WriteInt(ctrl + OFF_DONE_SIZE, size, true)
-    WriteInt(ctrl + OFF_DONE_FLAG, 1, true)
+local function on_file_loaded(size, unused, destination)
+    finished_loads[cffi.tonumber(destination)] = size
     local thread_id = cffi.C.GetCurrentThreadId()
-    if thread_id ~= queue_thread_id and not reported_wrong_thread then
-        reported_wrong_thread = true
-        log(string.format("WARNING load_complete ran on thread %d, loads are queued on thread %d", thread_id, queue_thread_id))
+    if thread_id ~= load_thread_id and not warned_about_thread then
+        warned_about_thread = true
+        log(string.format("WARNING file load finished on thread %d, it was queued on thread %d", thread_id, load_thread_id))
     end
 end
 
-local function rd_install()
-    if fnc_reverse_blob_to_slot_ptr_call_1 == nil or fnc_reverse_blob_to_slot_ptr_call_2 == nil then
-        return false, "missing call site addresses"
+local function install()
+    if installed then
+        return true
     end
-    ctrl = native.persistent_block(CTRL_KEY, CTRL_SIZE)
-    if ctrl == 0 or ctrl == nil then return false, "persistent_block failed" end
+    if fnc_reverse_blob_to_slot_ptr_call_1 == nil or fnc_reverse_blob_to_slot_ptr_call_2 == nil then
+        log("install failed: missing call site addresses")
+        return false
+    end
+    registry = native.persistent_block(REGISTRY_KEY, REGISTRY_SIZE)
+    if registry == nil or registry == 0 then
+        log("install failed: persistent_block failed")
+        return false
+    end
     original_reverse_blob = cffi.cast("SpawnEnemyReverseBlob", BASE_ADDR + fnc_reverse_blob_to_slot_ptr)
     local call_sites = { fnc_reverse_blob_to_slot_ptr_call_1, fnc_reverse_blob_to_slot_ptr_call_2 }
     for _, call_site in ipairs(call_sites) do
-        if not call_redirect.redirect_call(call_site, fnc_reverse_blob_to_slot_ptr, "SpawnEnemyReverseBlob", reverse_blob) then
-            return false, string.format("could not redirect call at 0x%X", call_site)
+        local redirected = call_redirect.redirect_call(call_site, fnc_reverse_blob_to_slot_ptr, "SpawnEnemyReverseBlob", reverse_blob)
+        if not redirected then
+            log(string.format("install failed: could not redirect call at 0x%X", call_site))
+            return false
         end
     end
-    load_complete_callback = cffi.cast("SpawnEnemyLoadComplete", load_complete)
-    WriteLong(ctrl + OFF_COMP, cffi.tonumber(cffi.cast("uintptr_t", load_complete_callback)), true)
-    return true, "installed"
-end
-
--- ############################################################ --
--- # Spawn driver                                             # --
--- ############################################################ --
-
-local PLACEMENT_RECORD_SIZE       = 0x78
-local PLACEMENT_ID_OFF            = 0x00
-local PLACEMENT_HANDLE_OFF        = 0x08
-local PLACEMENT_POS_X_OFF         = 0x1C
-local PLACEMENT_POS_Y_OFF         = 0x20
-local PLACEMENT_POS_Z_OFF         = 0x24
-local PLACEMENT_CHARID_OFF        = 0x4C
-local PLACEMENT_SPECIES_OFF       = 0x55
-local PLACEMENT_RUNLEN_OFF        = 0x56
-local PLACEMENT_WEIGHT_OFF        = 0x59
-local PLACEMENT_MODEL_HANDLE_OFF  = 0x60
-local PLACEMENT_MOTION_HANDLE_OFF = 0x64
-local RECORD_CATEGORY_ACTOR       = 3
-
-local RESOURCE_BLOB_SIZE          = 0x40000
-local BLOB_HEADER_FIRST_SECTION   = 128
-local SPAWN_LOAD_TIMEOUT          = 5.0
-local SPAWN_WEIGHT                = 1  -- low weight so the room's concurrent-enemy budget fits many
-
-local pending_spawns = {}
-local installed = false
-
--- Handle-bucket-bounded arena allocator: every buffer is carved from a few 32MB-aligned arenas so
--- all buffers in one arena share ONE handle bucket (the game never frees buckets).
-local ARENA_SIZE = 0x2000000
-local ARENA_CELL = RESOURCE_BLOB_SIZE
-local ARENA_CAP  = 6
-local arenas = {}
-local buffer_pool = {}
-
-local function arena_carve(need)
-    local sz = (need + (ARENA_CELL - 1)) & ~(ARENA_CELL - 1)
-    if sz > ARENA_SIZE then return nil end
-    for _, a in ipairs(arenas) do
-        if a.bump + sz <= ARENA_SIZE then
-            local addr = a.base + a.bump
-            a.bump = a.bump + sz
-            return addr, sz
-        end
-    end
-    if #arenas >= ARENA_CAP then return nil end
-    local raw = native.allocate(ARENA_SIZE * 2)
-    if raw == 0 then return nil end
-    local base = (raw + (ARENA_SIZE - 1)) & ~(ARENA_SIZE - 1)
-    arenas[#arenas + 1] = { base = base, bump = sz }
-    log(string.format("arena %d: base=0x%X (1 handle bucket)", #arenas, base))
-    return base, sz
-end
-
-local function acquire_buffer(need_size)
-    local best_i, best
-    for i = #buffer_pool, 1, -1 do
-        local b = buffer_pool[i]
-        if b.size >= need_size and (not best or b.size < best.size) then best_i, best = i, b end
-    end
-    if best then
-        table.remove(buffer_pool, best_i)
-        return best.addr, best.size, true
-    end
-    local addr, sz = arena_carve(need_size)
-    if not addr then return nil end
-    return addr, sz, false
-end
-
-local function pool_buffer(addr, size)
-    if addr and addr ~= 0 and size and size > 0 then
-        buffer_pool[#buffer_pool + 1] = { addr = addr, size = size }
-    end
-end
-
-local function ensure_installed()
-    if installed then return true end
-    local ok, why = rd_install()
-    if not ok then log("redirect install failed: " .. tostring(why)); return false end
+    load_complete_callback = cffi.cast("SpawnEnemyLoadComplete", on_file_loaded)
+    load_complete_address = cffi.tonumber(cffi.cast("uintptr_t", load_complete_callback))
     installed = true
     return true
 end
 
-local function model_hash(path)
-    local h = 2166136261
-    for i = 1, #path do
-        h = (h ~ string.byte(path, i)) & 0xFFFFFFFF
-        h = (h * 16777619) & 0xFFFFFFFF
+-- ############################################################ --
+-- # Buffers: carved from a few 32MB arenas, then reused        # --
+-- ############################################################ --
+
+local BLOB_SIZE = 0x40000
+local ARENA_SIZE = 0x2000000
+local MAX_ARENAS = 6
+
+local arenas = {}
+local spare_buffers = {}
+
+-- One 32MB-aligned arena uses one handle bucket, and the game never frees buckets.
+local function carve_from_arenas(size_needed)
+    local size = round_up(size_needed, BLOB_SIZE)
+    if size > ARENA_SIZE then
+        return nil
     end
-    return h
-end
-
-local function get_creature_data(model_path)
-    return model_path and kh1_creature_data[model_path] or nil
-end
-
-local function sora_position()
-    local sora = g_SoraObjPtr and GetPointer(g_SoraObjPtr) or 0
-    if sora == 0 then return 0.0, 0.0, 0.0 end
-    return ReadFloat(sora + 0x10, true), ReadFloat(sora + 0x14, true), ReadFloat(sora + 0x18, true)
-end
-
-local function boss_slowdown_active()
-    if not g_GameSpeed then return false end
-    local speed = ReadFloat(g_GameSpeed)
-    return speed > 0.0 and speed < 0.9
-end
-
-local HANDLE_BUCKET_COUNT = 64
-local HANDLE_BUCKET_HEADROOM = 6
-
-local function handle_buckets_full()
-    if not resource_handle_bucket_table then return false end
-    local claimed = 0
-    for i = 0, HANDLE_BUCKET_COUNT - 1 do
-        local addr = resource_handle_bucket_table + i * 8
-        local lo = ReadInt(addr) & 0xFFFFFFFF
-        local hi = ReadInt(addr + 4) & 0xFFFFFFFF
-        if not (lo == 0xFFFFFFFF and hi == 0xFFFFFFFF) then claimed = claimed + 1 end
+    for _, arena in ipairs(arenas) do
+        if arena.used + size <= ARENA_SIZE then
+            local address = arena.base + arena.used
+            arena.used = arena.used + size
+            return address, size
+        end
     end
-    return claimed >= HANDLE_BUCKET_COUNT - HANDLE_BUCKET_HEADROOM
-end
-
--- Blob header sanity: first section marker present and section offsets monotonic. This is our
--- readiness gate now that no species slot tracks load state.
-local function blob_construct_safe(buf)
-    local s = {}
-    for i = 0, 4 do s[i] = ReadInt(buf + 4 + i * 4, true) end
-    if s[0] ~= BLOB_HEADER_FIRST_SECTION then return false, string.format("hdr sec0=%d", s[0]) end
-    local prev = 0
-    for i = 0, 4 do
-        if s[i] < 0 or s[i] < prev then return false, string.format("hdr not monotonic at %d", i) end
-        prev = s[i]
+    if #arenas >= MAX_ARENAS then
+        return nil
     end
-    return true
+    local raw_address = native.allocate(ARENA_SIZE * 2)
+    if raw_address == 0 then
+        return nil
+    end
+    local base = round_up(raw_address, ARENA_SIZE)
+    table.insert(arenas, { base = base, used = size })
+    log(string.format("arena %d: base=0x%X", #arenas, base))
+    return base, size
 end
 
-local interned_paths = {}
-local function intern_path(path)
-    if interned_paths[path] then return interned_paths[path] end
-    local addr = native.allocate(#path + 1)
-    if addr == 0 then return 0 end
-    WriteArray(addr, {(path .. "\0"):byte(1, -1)}, true)
-    interned_paths[path] = addr
-    return addr
+local function get_buffer(size_needed)
+    local best_index = nil
+    for index, buffer in ipairs(spare_buffers) do
+        if buffer.size >= size_needed then
+            if best_index == nil or buffer.size < spare_buffers[best_index].size then
+                best_index = index
+            end
+        end
+    end
+    if best_index ~= nil then
+        local buffer = table.remove(spare_buffers, best_index)
+        return buffer.address, buffer.size
+    end
+    return carve_from_arenas(size_needed)
 end
 
-local function mint_ptr_handle(addr)
-    local ok, handle = native.call_function(fnc_mint_resource_handle, addr)
-    if not ok then return nil end
-    return handle & 0xFFFFFFFF
+local function give_back_buffer(address, size)
+    if address == nil or address == 0 or size == nil or size <= 0 then
+        return
+    end
+    table.insert(spare_buffers, { address = address, size = size })
 end
 
-local function splice_placement_record(template, char_id, x, y, z)
-    if not template or #template ~= PLACEMENT_RECORD_SIZE then return nil end
-    local old_ptr = GetPointer(placementTablePtr)
+local function give_back_row_and_buffer(row)
+    give_back_buffer(row_buffer_start(row), row_buffer_end(row) - row_buffer_start(row))
+    release_row(row)
+end
+
+-- ############################################################ --
+-- # Placement record: the room-table entry the game builds from # --
+-- ############################################################ --
+
+local RECORD_SIZE = 0x78
+local RECORD_ID_OFFSET = 0x00
+local RECORD_BLOB_HANDLE_OFFSET = 0x08
+local RECORD_X_OFFSET = 0x1C
+local RECORD_Y_OFFSET = 0x20
+local RECORD_Z_OFFSET = 0x24
+local RECORD_CHAR_ID_OFFSET = 0x4C
+local RECORD_SPECIES_OFFSET = 0x55
+local RECORD_RUN_LENGTH_OFFSET = 0x56
+local RECORD_WEIGHT_OFFSET = 0x59
+local RECORD_MODEL_HANDLE_OFFSET = 0x60
+local RECORD_MOTION_HANDLE_OFFSET = 0x64
+local RECORD_CATEGORY_ACTOR = 3
+local SPAWN_WEIGHT = 1
+
+local function template_run_length(template)
+    local run_length = string.byte(template, RECORD_RUN_LENGTH_OFFSET + 1)
+    if run_length == nil or run_length < 1 then
+        return 1
+    end
+    return run_length
+end
+
+local function add_placement_record(template, char_id, x, y, z)
+    if template == nil or #template ~= RECORD_SIZE then
+        return nil
+    end
+    local old_table = GetPointer(placementTablePtr)
     local old_count = ReadInt(placementTableCount)
-    if old_ptr == 0 or old_count <= 0 or old_count > 4096 then return nil end
-
-    local new_count = old_count + 1
-    local buffer = native.allocate(new_count * PLACEMENT_RECORD_SIZE)
-    if buffer == 0 then return nil end
-    if not native.copy_memory(buffer, old_ptr, old_count * PLACEMENT_RECORD_SIZE) then
-        native.free(buffer)
+    if old_table == 0 or old_count <= 0 or old_count > 4096 then
         return nil
     end
 
-    local record = buffer + old_count * PLACEMENT_RECORD_SIZE
-    WriteArray(record, {template:byte(1, -1)}, true)
-
-    local id = (RECORD_CATEGORY_ACTOR << 16) | (old_count & 0xFFFF)
-    WriteInt(record + PLACEMENT_ID_OFF, id, true)
-    WriteInt(record + PLACEMENT_HANDLE_OFF, 0, true)
-    WriteFloat(record + PLACEMENT_POS_X_OFF, x, true)
-    WriteFloat(record + PLACEMENT_POS_Y_OFF, y, true)
-    WriteFloat(record + PLACEMENT_POS_Z_OFF, z, true)
-    WriteShort(record + PLACEMENT_CHARID_OFF, char_id, true)
-    WriteByte(record + PLACEMENT_SPECIES_OFF, 0, true)   -- ignored: constructor uses record+0x08
-    WriteByte(record + PLACEMENT_RUNLEN_OFF, 1, true)
-    WriteByte(record + PLACEMENT_WEIGHT_OFF, SPAWN_WEIGHT, true)
-    WriteInt(record + PLACEMENT_MODEL_HANDLE_OFF, 0, true)
-    WriteInt(record + PLACEMENT_MOTION_HANDLE_OFF, 0, true)
-
-    WriteLong(placementTablePtr, buffer)
-    WriteInt(placementTableCount, new_count)
-
-    return { buffer = buffer, record = record, id = id, old_ptr = old_ptr, old_count = old_count }
-end
-
-local function rollback_splice(ctx)
-    if not ctx then return end
-    WriteLong(placementTablePtr, ctx.old_ptr)
-    WriteInt(placementTableCount, ctx.old_count)
-end
-
--- Blob relocation, replicating exactly what hook1/motion-callback do (same functions, same args),
--- minus the species-slot writes. A fault inside these game calls crashes the game.
-local function call_ok(fn, arg)
-    return (native.call_function(fn, arg))
-end
-
-local function model_fixup(dest)
-    if not call_ok(fnc_blob_reloc, dest + ReadInt(dest + 4, true)) then return false end
-    if ReadInt(dest + 0xC, true) - ReadInt(dest + 8, true) > 0 then
-        if not call_ok(fnc_blob_fixup_a, dest + ReadInt(dest + 8, true)) then return false end
+    local new_table = native.allocate((old_count + 1) * RECORD_SIZE)
+    if new_table == 0 then
+        return nil
     end
-    if ReadInt(dest + 0x18, true) - ReadInt(dest + 0x14, true) > 0 then
-        if not call_ok(fnc_blob_fixup_b, dest + ReadInt(dest + 0x14, true)) then return false end
+    if not native.copy_memory(new_table, old_table, old_count * RECORD_SIZE) then
+        native.free(new_table)
+        return nil
+    end
+
+    local record = new_table + old_count * RECORD_SIZE
+    local id = (RECORD_CATEGORY_ACTOR << 16) | (old_count & 0xFFFF)
+    WriteArray(record, { template:byte(1, -1) }, true)
+    WriteInt(record + RECORD_ID_OFFSET, id, true)
+    WriteInt(record + RECORD_BLOB_HANDLE_OFFSET, 0, true)
+    WriteFloat(record + RECORD_X_OFFSET, x, true)
+    WriteFloat(record + RECORD_Y_OFFSET, y, true)
+    WriteFloat(record + RECORD_Z_OFFSET, z, true)
+    WriteShort(record + RECORD_CHAR_ID_OFFSET, char_id, true)
+    WriteByte(record + RECORD_SPECIES_OFFSET, 0, true)
+    WriteByte(record + RECORD_RUN_LENGTH_OFFSET, 1, true)
+    WriteByte(record + RECORD_WEIGHT_OFFSET, SPAWN_WEIGHT, true)
+    WriteInt(record + RECORD_MODEL_HANDLE_OFFSET, 0, true)
+    WriteInt(record + RECORD_MOTION_HANDLE_OFFSET, 0, true)
+
+    WriteLong(placementTablePtr, new_table)
+    WriteInt(placementTableCount, old_count + 1)
+
+    return { record = record, id = id, old_table = old_table, old_count = old_count }
+end
+
+local function remove_placement_record(placement)
+    if placement == nil then
+        return
+    end
+    WriteLong(placementTablePtr, placement.old_table)
+    WriteInt(placementTableCount, placement.old_count)
+end
+
+-- ############################################################ --
+-- # Loading files and fixing them up the way the game does     # --
+-- ############################################################ --
+
+local LOAD_TIMEOUT_SECONDS = 5.0
+local MOTION_ALIGNMENT = 0x80
+
+local permanent_strings = {}
+
+local function permanent_string(text)
+    if permanent_strings[text] ~= nil then
+        return permanent_strings[text]
+    end
+    local address = native.allocate(#text + 1)
+    if address == 0 then
+        return 0
+    end
+    WriteArray(address, { (text .. "\0"):byte(1, -1) }, true)
+    permanent_strings[text] = address
+    return address
+end
+
+local function queue_file_load(filename, destination)
+    local filename_address = permanent_string(filename)
+    if filename_address == 0 then
+        return false
+    end
+    finished_loads[destination] = nil
+    load_thread_id = cffi.C.GetCurrentThreadId()
+    local ok = native.call_function(fnc_queue_file_load_to_address, filename_address, destination, load_complete_address, 0)
+    return ok
+end
+
+local function take_finished_load(destination)
+    local size = finished_loads[destination]
+    finished_loads[destination] = nil
+    return size
+end
+
+local function call_game(function_address, argument)
+    local ok = native.call_function(function_address, argument)
+    return ok
+end
+
+local function blob_int(blob, offset)
+    return ReadInt(blob + offset, true)
+end
+
+local function fix_up_model(blob)
+    if not call_game(fnc_blob_reloc, blob + blob_int(blob, 0x04)) then
+        return false
+    end
+    if blob_int(blob, 0x0C) > blob_int(blob, 0x08) then
+        if not call_game(fnc_blob_fixup_a, blob + blob_int(blob, 0x08)) then
+            return false
+        end
+    end
+    if blob_int(blob, 0x18) > blob_int(blob, 0x14) then
+        if not call_game(fnc_blob_fixup_b, blob + blob_int(blob, 0x14)) then
+            return false
+        end
     end
     return true
 end
 
-local function motion_fixup(dest)
-    if not call_ok(fnc_blob_reloc, dest + ReadInt(dest + 4, true)) then return false end
-    if ReadInt(dest + 0x10, true) - ReadInt(dest + 0xC, true) > 0 then
-        local base2 = dest + ReadInt(dest + 0xC, true)
-        for k = 0, 9 do
-            local lo = ReadInt(base2 + 4 + k * 4, true)
-            local hi = ReadInt(base2 + 8 + k * 4, true)
-            if hi - lo > 0 then
-                if not call_ok(fnc_motion_fixup, base2 + lo) then return false end
+local function fix_up_motion(blob)
+    if not call_game(fnc_blob_reloc, blob + blob_int(blob, 0x04)) then
+        return false
+    end
+    if blob_int(blob, 0x10) <= blob_int(blob, 0x0C) then
+        return true
+    end
+    local section_table = blob + blob_int(blob, 0x0C)
+    for index = 0, 9 do
+        local section_start = blob_int(section_table, 4 + index * 4)
+        local section_end = blob_int(section_table, 8 + index * 4)
+        if section_end > section_start then
+            if not call_game(fnc_motion_fixup, section_table + section_start) then
+                return false
             end
         end
     end
     return true
 end
 
-local function construct_entity(ctx, buf)
-    local safe, why = blob_construct_safe(buf)
-    if not safe then
-        log(string.format("REFUSE construct id=0x%X: blob unsafe (%s)", ctx.id, why))
+local function blob_header_looks_valid(blob)
+    local previous_section = 0
+    for index = 0, 4 do
+        local section = blob_int(blob, 4 + index * 4)
+        if index == 0 and section ~= 128 then
+            return false
+        end
+        if section < previous_section then
+            return false
+        end
+        previous_section = section
+    end
+    return true
+end
+
+-- ############################################################ --
+-- # Game state checks                                          # --
+-- ############################################################ --
+
+local HANDLE_BUCKET_COUNT = 64
+local HANDLE_BUCKET_HEADROOM = 6
+local ENTITY_SIZE = 0x4B0
+local ENTITY_COUNT = 96
+local ENTITY_FLAGS_OFFSET = 0x374
+local ENTITY_BLOB_HANDLE_OFFSETS = { 0x68, 0x134, 0x138, 0x13c, 0x154, 0x1d0, 0x1d4 }
+
+local function sora_position()
+    local sora = 0
+    if g_SoraObjPtr then
+        sora = GetPointer(g_SoraObjPtr)
+    end
+    if sora == 0 then
+        return 0.0, 0.0, 0.0
+    end
+    return ReadFloat(sora + 0x10, true), ReadFloat(sora + 0x14, true), ReadFloat(sora + 0x18, true)
+end
+
+local function in_cutscene()
+    return inCutscene ~= nil and ReadInt(inCutscene) ~= 0
+end
+
+local function boss_slowdown_active()
+    if not g_GameSpeed then
+        return false
+    end
+    local speed = ReadFloat(g_GameSpeed)
+    return speed > 0.0 and speed < 0.9
+end
+
+local function handle_bucket_base(index)
+    local address = resource_handle_bucket_table + index * 8
+    local low = ReadInt(address) & 0xFFFFFFFF
+    local high = ReadInt(address + 4) & 0xFFFFFFFF
+    if low == 0xFFFFFFFF and high == 0xFFFFFFFF then
         return nil
     end
-    local ok, entity = native.call_function(fnc_spawn_world_gimmick_entity, ctx.id)
-    if not ok then log("construct call failed"); return nil end
-    if entity == 0 then log("construct returned null (budget?)"); return nil end
-    log(string.format("construct OK entity=0x%X", entity))
-    return entity
+    return (high << 32) | low
 end
 
-local ENTITY_POOL_STRIDE = 0x4B0
-local ENTITY_POOL_COUNT = 96
-local ENTITY_OCC_FLAG_OFF = 0x374
-local ENTITY_BLOB_HND_OFFS = { 0x68, 0x134, 0x138, 0x13c, 0x154, 0x1d0, 0x1d4 }
-local RECLAIM_GRACE = 2
-local dead_streak = {}
-
-local function resolve_handle(h)
-    if h == 0 then return 0 end
-    h = h & 0x7FFFFFFF
-    local addr = resource_handle_bucket_table + (h >> 25) * 8
-    local lo = ReadInt(addr) & 0xFFFFFFFF
-    local hi = ReadInt(addr + 4) & 0xFFFFFFFF
-    if lo == 0xFFFFFFFF and hi == 0xFFFFFFFF then return 0 end
-    return ((hi << 32) | lo) | (h & 0x1FFFFFF)
+local function handle_buckets_full()
+    if not resource_handle_bucket_table then
+        return false
+    end
+    local claimed = 0
+    for index = 0, HANDLE_BUCKET_COUNT - 1 do
+        if handle_bucket_base(index) ~= nil then
+            claimed = claimed + 1
+        end
+    end
+    return claimed >= HANDLE_BUCKET_COUNT - HANDLE_BUCKET_HEADROOM
 end
 
-local function live_rows(rows)
-    local alive = {}
-    for i = 0, ENTITY_POOL_COUNT - 1 do
-        local e = entityPoolBase + i * ENTITY_POOL_STRIDE
-        if (ReadInt(e + ENTITY_OCC_FLAG_OFF) & 1) ~= 0 then
-            for _, off in ipairs(ENTITY_BLOB_HND_OFFS) do
-                local resolved = resolve_handle(ReadInt(e + off) & 0xFFFFFFFF)
-                if resolved ~= 0 then
-                    for _, r in ipairs(rows) do
-                        if resolved >= r.buf_base and resolved < r.buf_end then alive[r.row] = true break end
+local function resolve_handle(handle)
+    if handle == 0 then
+        return 0
+    end
+    handle = handle & 0x7FFFFFFF
+    local bucket_base = handle_bucket_base(handle >> 25)
+    if bucket_base == nil then
+        return 0
+    end
+    return bucket_base | (handle & 0x1FFFFFF)
+end
+
+local function make_handle(address)
+    local ok, handle = native.call_function(fnc_mint_resource_handle, address)
+    if not ok then
+        return nil
+    end
+    return handle & 0xFFFFFFFF
+end
+
+local function rows_used_by_live_entities()
+    local used = {}
+    for index = 0, ENTITY_COUNT - 1 do
+        local entity = entityPoolBase + index * ENTITY_SIZE
+        local occupied = (ReadInt(entity + ENTITY_FLAGS_OFFSET) & 1) ~= 0
+        if occupied then
+            for _, offset in ipairs(ENTITY_BLOB_HANDLE_OFFSETS) do
+                local address = resolve_handle(ReadInt(entity + offset) & 0xFFFFFFFF)
+                if address ~= 0 then
+                    local row = row_containing(address)
+                    if row ~= nil then
+                        used[row] = true
                     end
                 end
             end
         end
     end
-    return alive
+    return used
 end
 
-local function cleanup_pending(model_path, p)
-    rollback_splice(p.ctx)
-    rd_release(p.row)
-    pool_buffer(p.buf, p.size)
-    pending_spawns[model_path] = nil
+-- ############################################################ --
+-- # Spawns in progress                                         # --
+-- ############################################################ --
+
+local ABANDONED_SPAWN_GRACE_SECONDS = 2.0
+local DEAD_CHECKS_BEFORE_FREEING = 2
+
+local spawns_in_progress = {}
+local dead_checks = {}
+local current_room = nil
+
+local function cancel_spawn(spawn)
+    remove_placement_record(spawn.placement)
+    release_row(spawn.row)
+    give_back_buffer(spawn.buffer, spawn.buffer_size)
+    spawns_in_progress[spawn.model_path] = nil
 end
 
-local function reclaim_dead_rows()
-    local now_c = os.clock()
-    for model, p in pairs(pending_spawns) do
-        if now_c >= p.deadline + 2.0 then
-            rollback_splice(p.ctx)
-            rd_release(p.row)
-            pool_buffer(p.buf, p.size)
-            pending_spawns[model] = nil
-            log("swept stale load " .. model)
+local function cancel_abandoned_spawns()
+    local now = os.clock()
+    for model_path, spawn in pairs(spawns_in_progress) do
+        if now >= spawn.deadline + ABANDONED_SPAWN_GRACE_SECONDS then
+            cancel_spawn(spawn)
+            log("cancelled abandoned spawn " .. model_path)
         end
     end
-    local rows = rd_active_rows()
-    if #rows == 0 then return end
-    local pending_rows = {}
-    for _, p in pairs(pending_spawns) do pending_rows[p.row] = true end
-    local alive = live_rows(rows)
-    for _, r in ipairs(rows) do
-        if pending_rows[r.row] or alive[r.row] then
-            dead_streak[r.row] = 0
-        elseif (dead_streak[r.row] or 0) + 1 >= RECLAIM_GRACE then
-            pool_buffer(r.buf_base, r.buf_end - r.buf_base)
-            rd_release(r.row)
-            dead_streak[r.row] = nil
+end
+
+local function free_rows_of_dead_enemies()
+    local rows = rows_in_use()
+    if #rows == 0 then
+        return
+    end
+    local rows_still_loading = {}
+    for _, spawn in pairs(spawns_in_progress) do
+        rows_still_loading[spawn.row] = true
+    end
+    local rows_with_live_enemy = rows_used_by_live_entities()
+    for _, row in ipairs(rows) do
+        if rows_still_loading[row] or rows_with_live_enemy[row] then
+            dead_checks[row] = 0
         else
-            dead_streak[r.row] = (dead_streak[r.row] or 0) + 1
+            local checks = (dead_checks[row] or 0) + 1
+            if checks >= DEAD_CHECKS_BEFORE_FREEING then
+                give_back_row_and_buffer(row)
+                dead_checks[row] = nil
+            else
+                dead_checks[row] = checks
+            end
         end
     end
 end
 
-local last_room_world, last_room_area, last_room_set = nil, nil, nil
-
-local function release_all_on_room_change()
-    if not g_WorldNumber or not g_AreaNumber or not g_SetNumber then return end
-    local w, a, s = ReadInt(g_WorldNumber), ReadInt(g_AreaNumber), ReadInt(g_SetNumber)
-    if w == last_room_world and a == last_room_area and s == last_room_set then return end
-    last_room_world, last_room_area, last_room_set = w, a, s
-    local rows = rd_active_rows()
-    for _, r in ipairs(rows) do
-        pool_buffer(r.buf_base, r.buf_end - r.buf_base)
-        rd_release(r.row)
+local function free_everything_if_room_changed()
+    if not g_WorldNumber or not g_AreaNumber or not g_SetNumber then
+        return
     end
-    if #rows > 0 then log(string.format("room change: released %d row(s)", #rows)) end
-    pending_spawns = {}
+    local room = ReadInt(g_WorldNumber) .. "-" .. ReadInt(g_AreaNumber) .. "-" .. ReadInt(g_SetNumber)
+    if room == current_room then
+        return
+    end
+    local first_check = current_room == nil
+    current_room = room
+    if first_check then
+        return
+    end
+    local rows = rows_in_use()
+    for _, row in ipairs(rows) do
+        give_back_row_and_buffer(row)
+    end
+    if #rows > 0 then
+        log(string.format("room change: freed %d row(s)", #rows))
+    end
+    spawns_in_progress = {}
+    dead_checks = {}
 end
 
-local function queue_load(filename, dest)
-    local fname = intern_path(filename)
-    if fname == 0 then return false end
-    rd_clear_done()
-    queue_thread_id = cffi.C.GetCurrentThreadId()
-    return (native.call_function(fnc_queue_file_load_to_address, fname, dest, rd_completion_addr(), 0))
+local function keep_waiting(spawn)
+    if os.clock() >= spawn.deadline then
+        cancel_spawn(spawn)
+        return false, "timeout"
+    end
+    return false, "loading"
 end
 
--- Drive a spawn already loading: model -> motion -> construct, one file at a time. The CC driver
--- polls the same request every frame until it succeeds/fails, so only one load is ever in flight.
-local function drive_pending(model_path, p)
-    local dest = rd_poll_done()
-    if p.stage == 0 then
-        if dest ~= p.buf then
-            if dest then rd_clear_done() end                       -- stale completion, ignore
-            if os.clock() >= p.deadline then cleanup_pending(model_path, p); return false, "timeout" end
-            return false, "loading"
-        end
-        local _, size = rd_poll_done()
-        rd_clear_done()
-        if not model_fixup(p.buf) then cleanup_pending(model_path, p); return false, "load_failed" end
-        local motion_dest = p.buf + ((size + 0x7F) & ~0x7F)
-        if motion_dest + RESOURCE_BLOB_SIZE > p.buf + p.size then
-            cleanup_pending(model_path, p); return false, "buf_alloc_failed"
-        end
-        p.motion_dest = motion_dest
-        rd_set_motion(p.row, motion_dest)
-        if not queue_load(p.motion_path, motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
-        p.stage = 1
-        p.deadline = os.clock() + SPAWN_LOAD_TIMEOUT
-        return false, "loading"
-    elseif p.stage == 1 then
-        if dest ~= p.motion_dest then
-            if dest then rd_clear_done() end
-            if os.clock() >= p.deadline then cleanup_pending(model_path, p); return false, "timeout" end
-            return false, "loading"
-        end
-        rd_clear_done()
-        if not motion_fixup(p.motion_dest) then cleanup_pending(model_path, p); return false, "load_failed" end
-        p.stage = 2
+local function start_spawn(model_path, data, x, y, z)
+    local spawn = { model_path = model_path, motion_path = data.motionPath }
+
+    local size_needed = (template_run_length(data.template) + 2) * BLOB_SIZE
+    spawn.buffer, spawn.buffer_size = get_buffer(size_needed)
+    if spawn.buffer == nil then
+        return false, "buf_alloc_failed"
     end
-    -- stage 2: construct (motion resolves through the reverse-blob hook -> row.motion)
-    local entity = construct_entity(p.ctx, p.buf)
-    pending_spawns[model_path] = nil
-    if entity then return true, entity end
-    rollback_splice(p.ctx); rd_release(p.row); pool_buffer(p.buf, p.size)
-    return false, "ctor_failed"
+
+    spawn.row = claim_row(spawn.buffer, spawn.buffer + spawn.buffer_size)
+    if spawn.row == nil then
+        cancel_spawn(spawn)
+        return false, "registry_full"
+    end
+
+    spawn.placement = add_placement_record(data.template, data.charId, x, y, z)
+    if spawn.placement == nil then
+        cancel_spawn(spawn)
+        return false, "splice_failed"
+    end
+
+    local buffer_handle = make_handle(spawn.buffer)
+    if buffer_handle == nil then
+        cancel_spawn(spawn)
+        return false, "mint_failed"
+    end
+    WriteInt(spawn.placement.record + RECORD_BLOB_HANDLE_OFFSET, buffer_handle, true)
+
+    if not queue_file_load(model_path, spawn.buffer) then
+        cancel_spawn(spawn)
+        return false, "load_failed"
+    end
+
+    spawn.step = "loading model"
+    spawn.deadline = os.clock() + LOAD_TIMEOUT_SECONDS
+    spawns_in_progress[model_path] = spawn
+    log(string.format("%s -> buffer=0x%X size=0x%X row=%d (loading)", model_path, spawn.buffer, spawn.buffer_size, spawn.row))
+    return false, "loading"
+end
+
+local function build_enemy(spawn)
+    if not blob_header_looks_valid(spawn.buffer) then
+        log("refusing to build: model header looks wrong")
+        cancel_spawn(spawn)
+        return false, "ctor_failed"
+    end
+    local ok, entity = native.call_function(fnc_spawn_world_gimmick_entity, spawn.placement.id)
+    if not ok or entity == 0 then
+        cancel_spawn(spawn)
+        return false, "ctor_failed"
+    end
+    spawns_in_progress[spawn.model_path] = nil
+    log(string.format("built entity=0x%X", entity))
+    return true, entity
+end
+
+local function continue_after_model_loaded(spawn, model_size)
+    if not fix_up_model(spawn.buffer) then
+        cancel_spawn(spawn)
+        return false, "load_failed"
+    end
+    spawn.motion_address = spawn.buffer + round_up(model_size, MOTION_ALIGNMENT)
+    if spawn.motion_address + BLOB_SIZE > spawn.buffer + spawn.buffer_size then
+        cancel_spawn(spawn)
+        return false, "buf_alloc_failed"
+    end
+    set_row_motion(spawn.row, spawn.motion_address)
+    if not queue_file_load(spawn.motion_path, spawn.motion_address) then
+        cancel_spawn(spawn)
+        return false, "load_failed"
+    end
+    spawn.step = "loading motion"
+    spawn.deadline = os.clock() + LOAD_TIMEOUT_SECONDS
+    return false, "loading"
+end
+
+local function continue_after_motion_loaded(spawn)
+    if not fix_up_motion(spawn.motion_address) then
+        cancel_spawn(spawn)
+        return false, "load_failed"
+    end
+    return build_enemy(spawn)
+end
+
+local function continue_spawn(spawn)
+    if spawn.step == "loading model" then
+        local model_size = take_finished_load(spawn.buffer)
+        if model_size == nil then
+            return keep_waiting(spawn)
+        end
+        return continue_after_model_loaded(spawn, model_size)
+    end
+    local motion_size = take_finished_load(spawn.motion_address)
+    if motion_size == nil then
+        return keep_waiting(spawn)
+    end
+    return continue_after_motion_loaded(spawn)
+end
+
+-- ############################################################ --
+-- # Public entry point                                         # --
+-- ############################################################ --
+
+local function try_spawn_enemy(model_path, x, y, z)
+    if in_cutscene() then
+        return false, "cutscene"
+    end
+    if boss_slowdown_active() then
+        return false, "boss_slowdown"
+    end
+    if not install() then
+        return false, "install_failed"
+    end
+    local data = creature_data[model_path]
+    if data == nil then
+        return false, "no_data"
+    end
+
+    free_everything_if_room_changed()
+    cancel_abandoned_spawns()
+    free_rows_of_dead_enemies()
+
+    local spawn = spawns_in_progress[model_path]
+    if spawn ~= nil then
+        return continue_spawn(spawn)
+    end
+
+    if handle_buckets_full() then
+        return false, "handles_full"
+    end
+    if x == nil or y == nil or z == nil then
+        local sora_x, sora_y, sora_z = sora_position()
+        x = x or sora_x
+        y = y or sora_y
+        z = z or sora_z
+    end
+    return start_spawn(model_path, data, x, y, z)
 end
 
 local function spawn_enemy(model_path, x, y, z)
-    if not model_path then log("called with nil model"); return false, "bad_args" end
-    local function fail(reason) log(model_path .. " FAIL: " .. reason); return false, reason end
-    if inCutscene and ReadInt(inCutscene) ~= 0 then return fail("cutscene") end
-    if boss_slowdown_active() then return fail("boss_slowdown") end
-    if not ensure_installed() then return fail("install_failed") end
-
-    local data = get_creature_data(model_path)
-    if not data then return fail("no_data") end
-
-    release_all_on_room_change()
-    reclaim_dead_rows()
-
-    if x == nil or y == nil or z == nil then
-        local sx, sy, sz = sora_position()
-        x, y, z = x or sx, y or sy, z or sz
+    if model_path == nil then
+        log("called with nil model")
+        return false, "bad_args"
     end
-
-    local p = pending_spawns[model_path]
-    if p then return drive_pending(model_path, p) end
-
-    if handle_buckets_full() then return fail("handles_full") end
-
-    local run_len = string.byte(data.template, PLACEMENT_RUNLEN_OFF + 1) or 1
-    if run_len < 1 then run_len = 1 end
-    local buf_size = (run_len + 2) * RESOURCE_BLOB_SIZE
-
-    local buf, buf_actual = acquire_buffer(buf_size)
-    if not buf then return fail("buf_alloc_failed") end
-    local hash = model_hash(model_path)
-    local row = rd_claim(buf, buf + buf_actual, hash)
-    if not row then pool_buffer(buf, buf_actual); return fail("registry_full") end
-
-    local ctx = splice_placement_record(data.template, data.charId, x, y, z)
-    if not ctx then rd_release(row); pool_buffer(buf, buf_actual); return fail("splice_failed") end
-
-    local buf_handle = mint_ptr_handle(buf)
-    if not buf_handle then
-        rollback_splice(ctx); rd_release(row); pool_buffer(buf, buf_actual); return fail("mint_failed")
+    local ok, result = try_spawn_enemy(model_path, x, y, z)
+    if not ok and result ~= "loading" then
+        log(model_path .. " FAIL: " .. tostring(result))
     end
-    WriteInt(ctx.record + PLACEMENT_HANDLE_OFF, buf_handle, true)
-
-    if not queue_load(model_path, buf) then
-        rollback_splice(ctx); rd_release(row); pool_buffer(buf, buf_actual); return fail("load_failed")
-    end
-    log(string.format("%s -> buf=0x%X size=0x%X row=%d (loading)", model_path, buf, buf_actual, row))
-    pending_spawns[model_path] = { ctx = ctx, buf = buf, size = buf_actual, row = row,
-        stage = 0, motion_path = data.motionPath, deadline = os.clock() + SPAWN_LOAD_TIMEOUT }
-    return false, "loading"
+    return ok, result
 end
 
 return {
